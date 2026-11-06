@@ -213,6 +213,7 @@ type NaabuSettings struct {
 	Workers          string
 	ResponseTimeout  string
 	OverallTimeout   string
+	Concurrency      string
 	ScanType         string
 	ExcludePorts     string
 	Interface        string
@@ -238,6 +239,7 @@ func (r *Runner) naabuSettings() NaabuSettings {
 		Workers:          r.setting("naabu_workers", "25"),
 		ResponseTimeout:  r.setting("naabu_timeout", "1s"),
 		OverallTimeout:   r.setting("scan_timeout_min", "60"),
+		Concurrency:      r.setting("scan_concurrency", "3"),
 		ScanType:         strings.ToLower(r.setting("naabu_scan_type", "c")),
 		ExcludePorts:     r.setting("naabu_exclude_ports", ""),
 		Interface:        r.setting("naabu_interface", ""),
@@ -327,6 +329,11 @@ func (s NaabuSettings) Validate() error {
 			return err
 		}
 	}
+	if s.Concurrency != "" {
+		if err := validateInteger("扫描并发度（同时运行的 naabu 批次数）", s.Concurrency, 1, 16); err != nil {
+			return err
+		}
+	}
 	responseTimeout, err := time.ParseDuration(s.ResponseTimeout)
 	if err != nil || responseTimeout <= 0 || responseTimeout > 10*time.Minute {
 		return fmt.Errorf("响应等待时间格式错误：%q；请使用 500ms、1s、2s 等时长，且不超过 10m", s.ResponseTimeout)
@@ -346,6 +353,18 @@ func (s NaabuSettings) Validate() error {
 func (s NaabuSettings) overallTimeout() time.Duration {
 	minutes, _ := strconv.Atoi(s.OverallTimeout)
 	return time.Duration(minutes) * time.Minute
+}
+
+// concurrency 返回并行执行的 naabu 批次数（1-16）；非法或缺省回退为 1（等价旧的串行行为）。
+func (s NaabuSettings) concurrency() int {
+	n, err := strconv.Atoi(strings.TrimSpace(s.Concurrency))
+	if err != nil || n < 1 {
+		return 1
+	}
+	if n > 16 {
+		return 16
+	}
+	return n
 }
 
 func (s NaabuSettings) args(targetsFile, outFile, mode, customPorts string) []string {

@@ -82,6 +82,7 @@
     <label class="field">发包速率（pps）<input type="number" name="naabu_rate" min="1" max="1000000" value="{{.NaabuRate}}" required><span class="field-help">每秒发包数。过高容易丢包或触发网络限流。</span></label>
     <label class="field">重试次数<input type="number" name="naabu_retries" min="0" max="10" value="{{.NaabuRetries}}" required><span class="field-help">无响应端口的重试次数；增加后更稳，但扫描更慢。</span></label>
     <label class="field">任务总超时（分钟）<input type="number" name="scan_timeout_min" min="1" max="1440" value="{{.ScanTimeout}}" required><span class="field-help">整个任务的有效扫描时间；暂停时长不计入，超时后终止并保留已输出结果。</span></label>
+    <label class="field">扫描并发度（并行 naabu 批次数）<input type="number" name="scan_concurrency" min="1" max="16" value="{{.ScanConcurrency}}" required><span class="field-help">同时运行的 naabu 批次数，越大总吞吐越高（≈并发度×发包速率）但 CPU/内存/网络占用上升；填 1 为串行。默认 3。</span></label>
     <label class="field">扫描方式
       <select name="naabu_scan_type"><option value="c" {{if eq .NaabuScanType "c"}}selected{{end}}>CONNECT（默认）</option><option value="s" {{if eq .NaabuScanType "s"}}selected{{end}}>SYN</option></select>
       <span class="field-help">CONNECT 权限要求低；SYN 通常更快，但需要 root 或 CAP_NET_RAW。</span>

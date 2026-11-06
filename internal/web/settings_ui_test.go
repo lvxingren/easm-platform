@@ -22,7 +22,7 @@ func TestSettingsPanelsAndSectionHeading(t *testing.T) {
 	body := scanLiveRequest(server, http.MethodGet, "/settings", "admin").Body.String()
 	for _, want := range []string{
 		`id="set-network"`, `id="set-cert"`, `id="set-notify"`, `id="set-naabu"`, `id="set-ai"`, `id="set-help"`,
-		`class="subnav"`, "通知与告警", "naabu 扫描参数", "AI 分析",
+		`class="subnav"`, "通知与告警", "naabu 扫描参数", "AI 分析", `name="scan_concurrency"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("设置页缺少元素 %q", want)
@@ -63,11 +63,15 @@ func TestSettingsPartialSavePreservesOtherCategories(t *testing.T) {
 	naabuForm.Set("naabu_timeout", "1s")
 	naabuForm.Set("scan_timeout_min", "60")
 	naabuForm.Set("naabu_scan_type", "c")
+	naabuForm.Set("scan_concurrency", "5")
 	if rec := scanFormRequest(server, "/api/settings", "admin", naabuForm); rec.Code != http.StatusOK {
 		t.Fatalf("保存 naabu 配置状态=%d 响应=%s", rec.Code, rec.Body.String())
 	}
 	if got := st.Setting("naabu_rate"); got != "1500" {
 		t.Fatalf("naabu_rate 未保存: %q", got)
+	}
+	if got := st.Setting("scan_concurrency"); got != "5" {
+		t.Fatalf("scan_concurrency 未保存: %q", got)
 	}
 
 	// ② 只保存通知类，naabu 应保持不变

@@ -4,7 +4,9 @@ package scanner
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -124,8 +126,17 @@ func TestStopKillsProcessGroupAndKeepsResults(t *testing.T) {
 	waitForFile(t, "started")
 	waitForResultCount(t, st, scanID, 1)
 	runner.mu.Lock()
-	pid := runner.active.cmd.Process.Pid
+	var pid int
+	for cmd := range runner.active.cmds {
+		if cmd.Process != nil {
+			pid = cmd.Process.Pid
+			break
+		}
+	}
 	runner.mu.Unlock()
+	if pid == 0 {
+		t.Fatal("未捕获到活跃 naabu 进程")
+	}
 	if err := runner.Stop(scanID); err != nil {
 		t.Fatal(err)
 	}
@@ -198,4 +209,70 @@ func waitForRunnerIdle(t *testing.T, runner *Runner) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("扫描运行锁未释放")
+}
+
+// parallelScript 读 -list 目标文件，为每个目标输出 <ip>:80（同时写 stdout 与 -o 文件），
+// 末尾短暂 sleep 以制造多批次时间重叠，充分 exercise 并行共享状态。
+const parallelScript = `#!/bin/sh
+if [ "${1:-}" = "-version" ]; then echo 'naabu test'; exit 0; fi
+out=''; list=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2;;
+    -list) list="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+: > "$out"
+while IFS= read -r ip; do
+  [ -z "$ip" ] && continue
+  printf '%s:80\n' "$ip" >> "$out"
+  printf '%s:80\n' "$ip"
+done < "$list"
+sleep 0.2
+`
+
+// TestParallelBatchesAggregateResults 验证并发度>1 时多批 naabu 并行执行，
+// 共享状态（去重集/开放端口/已处理）在加锁下正确聚合，无重复计数。
+func TestParallelBatchesAggregateResults(t *testing.T) {
+	runner, st, _ := newControlledRunner(t, parallelScript)
+	if err := st.SaveSettings(map[string]string{"scan_concurrency": "3"}); err != nil {
+		t.Fatal(err)
+	}
+	ips := make([]string, 0, 45)
+	for i := 1; i <= 45; i++ {
+		ips = append(ips, fmt.Sprintf("192.0.2.%d", i))
+	}
+	taskID, err := st.CreateScanTask(store.ScanTask{Name: "并行测试", Mode: "top", TargetType: "manual", IPs: strings.Join(ips, "\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := runner.StartTask(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForScanStatus(t, st, scanID, "done")
+	waitForRunnerIdle(t, runner)
+
+	scan, _ := st.Scan(scanID)
+	if scan == nil {
+		t.Fatal("扫描记录不存在")
+	}
+	if scan.OpenPorts != 45 {
+		t.Fatalf("并行聚合开放端口=%d，期望 45", scan.OpenPorts)
+	}
+	if scan.ProcessedTargets != 45 {
+		t.Fatalf("已处理目标=%d，期望 45", scan.ProcessedTargets)
+	}
+	results, err := st.ResultsByScan(scanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uniq := map[string]bool{}
+	for _, r := range results {
+		uniq[r.IP] = true
+	}
+	if len(results) != 45 || len(uniq) != 45 {
+		t.Fatalf("结果条数=%d 唯一IP=%d，期望均为 45（stdout 与文件双路径应去重）", len(results), len(uniq))
+	}
 }

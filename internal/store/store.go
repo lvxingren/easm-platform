@@ -216,14 +216,18 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout 是「按连接」生效的 PRAGMA：仅用 db.Exec 设置只作用于连接池中的单个连接，
+	// 并行扫描触发连接池新开连接时，那些连接 busy_timeout=0 会立即报 SQLITE_BUSY。
+	// 通过 DSN 的 _pragma 选项让池中每个连接建立时都带上 busy_timeout 与 WAL。
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	// 兜底：对首个连接再显式设置一次（journal_mode 为库级持久化；busy_timeout 已由 DSN 覆盖全连接）。
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
 		return nil, err
 	}
-	// 并发写入（如后台清库与运行中服务同时访问）时等待锁而不是立即报 SQLITE_BUSY。
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
 		return nil, err
 	}

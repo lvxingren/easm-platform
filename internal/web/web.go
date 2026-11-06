@@ -623,6 +623,7 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		NaabuInterface    string
 		NaabuVerify       bool
 		ScanTimeout       string
+		ScanConcurrency   string
 		RealertDays       string
 		AlertOutOfScope   bool
 		ResourceMonitor   bool
@@ -657,6 +658,7 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		NaabuInterface:    get("naabu_interface", ""),
 		NaabuVerify:       get("naabu_verify", "0") == "1",
 		ScanTimeout:       get("scan_timeout_min", "60"),
+		ScanConcurrency:   get("scan_concurrency", "3"),
 		RealertDays:       get("realert_days", strconv.Itoa(s.cfg.RealertDays)),
 		AlertOutOfScope:   get("alert_out_of_scope", "1") == "1",
 		ResourceMonitor:   get("resource_monitor", "1") == "1",
@@ -1239,7 +1241,8 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 		settings := scanner.NaabuSettings{
 			Path: val("naabu_path"), Rate: val("naabu_rate"), Retries: val("naabu_retries"),
 			Workers: val("naabu_workers"), ResponseTimeout: val("naabu_timeout"), OverallTimeout: val("scan_timeout_min"),
-			ScanType: strings.ToLower(val("naabu_scan_type")), ExcludePorts: val("naabu_exclude_ports"), Interface: val("naabu_interface"),
+			Concurrency: val("scan_concurrency"),
+			ScanType:    strings.ToLower(val("naabu_scan_type")), ExcludePorts: val("naabu_exclude_ports"), Interface: val("naabu_interface"),
 			Verify:          r.PostFormValue("naabu_verify") == "on",
 			ResourceMonitor: r.PostFormValue("resource_monitor") == "on", ResourceCPU: val("resource_cpu_percent"),
 			ResourceMemory: val("resource_memory_mb"), ResourceDuration: val("resource_duration_sec"),
@@ -1254,6 +1257,7 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 		pairs["naabu_workers"] = settings.Workers
 		pairs["naabu_timeout"] = settings.ResponseTimeout
 		pairs["scan_timeout_min"] = settings.OverallTimeout
+		pairs["scan_concurrency"] = settings.Concurrency
 		pairs["naabu_scan_type"] = settings.ScanType
 		pairs["naabu_exclude_ports"] = settings.ExcludePorts
 		pairs["naabu_interface"] = settings.Interface

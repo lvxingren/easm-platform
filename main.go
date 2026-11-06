@@ -54,6 +54,7 @@ func main() {
 		"naabu_scan_type":       "c",
 		"naabu_verify":          "0",
 		"scan_timeout_min":      "60",
+		"scan_concurrency":      "3",
 		"resource_monitor":      "1",
 		"resource_cpu_percent":  "90",
 		"resource_memory_mb":    "1024",

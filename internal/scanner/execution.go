@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"easm-platform/internal/engine"
@@ -25,6 +26,83 @@ type batchOutcome struct {
 	results   int
 	stdout    string
 	stderr    string
+}
+
+// scanProgress 是并行多批次共享的执行状态，所有字段访问均由 mu 保护。
+// seen 用于跨批次端口去重；openPorts/processed/failed/completed 为累加计数；messages 收集异常说明。
+type scanProgress struct {
+	mu        sync.Mutex
+	seen      map[string]struct{}
+	openPorts int
+	processed int
+	failed    int
+	completed int
+	messages  []string
+}
+
+type progressSnapshot struct {
+	processed int
+	failed    int
+	completed int
+	openPorts int
+}
+
+func (p *scanProgress) addMessage(m string) {
+	p.mu.Lock()
+	p.messages = append(p.messages, m)
+	p.mu.Unlock()
+}
+
+func (p *scanProgress) addProcessed(n int) {
+	p.mu.Lock()
+	p.processed += n
+	p.mu.Unlock()
+}
+
+func (p *scanProgress) addFailed(n int) {
+	p.mu.Lock()
+	p.failed += n
+	p.mu.Unlock()
+}
+
+func (p *scanProgress) completeBatch() {
+	p.mu.Lock()
+	p.completed++
+	p.mu.Unlock()
+}
+
+func (p *scanProgress) snapshot() progressSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return progressSnapshot{processed: p.processed, failed: p.failed, completed: p.completed, openPorts: p.openPorts}
+}
+
+func (p *scanProgress) finalMessages() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.messages...)
+}
+
+// hasSeen 判断端口结果是否已在其他批次入过库（跨批次去重）。
+func (p *scanProgress) hasSeen(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.seen[key]
+	return ok
+}
+
+// markSeen 将一批结果键计入全局去重集，返回本批真正新增数与累计开放端口总数（避免并行重复计数）。
+func (p *scanProgress) markSeen(keys []string) (added int, total int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, k := range keys {
+		if _, ok := p.seen[k]; !ok {
+			p.seen[k] = struct{}{}
+			added++
+		}
+	}
+	p.openPorts += added
+	return added, p.openPorts
 }
 
 func (r *Runner) run(scanID int64, mode string, customPorts string, specs []store.TargetSpec) {
@@ -64,77 +142,48 @@ func (r *Runner) run(scanID int64, mode string, customPorts string, specs []stor
 		return
 	}
 
-	processed, failedTargets, openPorts := 0, 0, 0
-	seenResults := make(map[string]struct{})
-	messages := make([]string, 0)
-	for batchIndex := 0; batchIndex < totalBatches; batchIndex++ {
-		batchNumber := batchIndex + 1
-		paused, stopped, deadline := r.controlSnapshot(scanID)
-		if stopped {
-			break
-		}
-		if !paused && !deadline.IsZero() && time.Now().After(deadline) {
-			messages = append(messages, fmt.Sprintf("任务有效扫描总超时 %s，剩余 %d 个目标规格未开始处理（暂停时间不计入）", timeout, len(specs)-processed))
-			break
-		}
-		end := (batchIndex + 1) * scanBatchSize
-		if end > len(specs) {
-			end = len(specs)
-		}
-		batch := specs[batchIndex*scanBatchSize : end]
-		targetsFile := filepath.Join(dataDir, fmt.Sprintf("batch_%04d_targets.txt", batchNumber))
-		outFile := filepath.Join(dataDir, fmt.Sprintf("batch_%04d.out", batchNumber))
-		if err := writeTargets(targetsFile, batch); err != nil {
-			messages = append(messages, fmt.Sprintf("批次 %d 写入目标文件 %q 失败：%v；本批及剩余目标未处理，请检查目录权限和磁盘空间", batchNumber, targetsFile, err))
-			break
-		}
-
-		args := settings.args(targetsFile, outFile, mode, customPorts)
-		commandText := strings.Join(append([]string{settings.Path}, args...), " ")
-		if err := r.st.UpdateScanProgress(scanID, processed, failedTargets, batchNumber, openPorts, commandText); err != nil {
-			messages = append(messages, fmt.Sprintf("批次 %d 保存进度失败，扫描中止：%v", batchNumber, err))
-			break
-		}
-		log.Printf("扫描 %d 批次 %d/%d 启动(%d 个目标): %s", scanID, batchNumber, totalBatches, len(batch), commandText)
-
-		outcome := r.runBatch(scanID, settings, args, outFile, seenResults, &openPorts)
-		stopped = r.isStopped(scanID)
-		if stopped && outcome.runErr != nil {
-			// 用户终止的当前批次不伪记为全部处理完成，已实时保存的结果不受影响。
-			break
-		}
-		if outcome.storeErr != nil {
-			messages = append(messages, fmt.Sprintf("批次 %d 实时保存扫描结果失败：%v；原始输出保留在 %s，后续批次已停止", batchNumber, outcome.storeErr, outFile))
-			break
-		}
-
-		processed += len(batch)
-		if outcome.runErr != nil || outcome.parseErr != nil || outcome.streamErr != nil || outcome.timedOut {
-			failedTargets += len(batch)
-		}
-		if outcome.timedOut {
-			messages = append(messages, fmt.Sprintf("批次 %d 达到任务有效扫描总超时 %s，naabu 进程组已强制终止；本批新增 %d 条结果，暂停时间不计入超时", batchNumber, timeout, outcome.results))
-		} else if outcome.runErr != nil {
-			messages = append(messages, fmt.Sprintf("批次 %d naabu 进程异常退出：%v\n标准输出：%s\n错误输出：%s", batchNumber, outcome.runErr, limitedOutput(outcome.stdout), limitedOutput(outcome.stderr)))
-		}
-		if outcome.streamErr != nil {
-			messages = append(messages, fmt.Sprintf("批次 %d 读取 naabu 实时输出失败：%v；已保存实时结果，并继续从输出文件去重补齐", batchNumber, outcome.streamErr))
-		}
-		if outcome.parseErr != nil {
-			messages = append(messages, fmt.Sprintf("批次 %d 读取输出文件 %q 不完整：%v；本批实时及文件去重后新增 %d 条结果", batchNumber, outFile, outcome.parseErr, outcome.results))
-		}
-		if err := r.st.UpdateScanProgress(scanID, processed, failedTargets, batchNumber, openPorts, commandText); err != nil {
-			messages = append(messages, fmt.Sprintf("批次 %d 完成后保存进度失败，扫描中止：%v", batchNumber, err))
-			break
-		}
-		log.Printf("扫描 %d 批次 %d/%d 已处理，累计 %d 条开放端口", scanID, batchNumber, totalBatches, openPorts)
-		if stopped || outcome.timedOut {
-			break
-		}
+	prog := &scanProgress{seen: make(map[string]struct{})}
+	concurrency := settings.concurrency()
+	if concurrency > totalBatches {
+		concurrency = totalBatches
 	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	log.Printf("扫描 %d 启动：%d 个目标规格分 %d 批，并发度 %d", scanID, len(specs), totalBatches, concurrency)
+
+	// 预填批次队列（缓冲，避免暂停时喂入阻塞）；concurrency 个 worker 并行消费，
+	// 每个 worker 独立启动一个 naabu 进程扫一批，总发包吞吐≈并发度×rate。
+	batchQueue := make(chan int, totalBatches)
+	for batchIndex := 0; batchIndex < totalBatches; batchIndex++ {
+		batchQueue <- batchIndex
+	}
+	close(batchQueue)
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batchIndex := range batchQueue {
+				if r.isStopped(scanID) {
+					continue // 已终止：排空队列，不再启动新批次
+				}
+				if r.waitWhilePaused(scanID) {
+					continue // 暂停期间不启动新批次；恢复后继续，若已终止则跳过
+				}
+				if _, stopped, deadline := r.controlSnapshot(scanID); !stopped && !deadline.IsZero() && time.Now().After(deadline) {
+					prog.addMessage(fmt.Sprintf("任务有效扫描总超时 %s，部分目标规格未开始处理（暂停时间不计入）", timeout))
+					continue
+				}
+				r.processBatch(scanID, settings, mode, customPorts, specs, batchIndex, totalBatches, dataDir, timeout, prog)
+			}
+		}()
+	}
+	wg.Wait()
 
 	elapsed := time.Since(start).Round(time.Second)
-	message := strings.Join(messages, "\n\n")
+	snap := prog.snapshot()
+	message := strings.Join(prog.finalMessages(), "\n\n")
 	status := "done"
 	if r.isStopped(scanID) {
 		status = "stopped"
@@ -144,16 +193,16 @@ func (r *Runner) run(scanID int64, mode string, customPorts string, specs []stor
 		message += "扫描已由用户或平台停止，当前展示的是停止前已发现的结果；不执行白名单比对和端口风险告警。"
 	} else if message != "" {
 		status = "failed"
-		if openPorts > 0 {
+		if snap.openPorts > 0 {
 			status = "partial"
 		}
 		message += "\n\n不完整结果不会执行白名单比对和告警。"
 	}
-	if err := r.st.FinishScanStatus(scanID, status, openPorts, message); err != nil {
+	if err := r.st.FinishScanStatus(scanID, status, snap.openPorts, message); err != nil {
 		log.Printf("更新扫描状态失败: %v", err)
 	}
 	log.Printf("扫描 %d 结束(%s): 已处理 %d/%d 个目标，异常目标 %d 个，开放端口 %d 条，耗时 %s",
-		scanID, status, processed, len(specs), failedTargets, openPorts, elapsed)
+		scanID, status, snap.processed, len(specs), snap.failed, snap.openPorts, elapsed)
 	// 任务结束时无论成败只发一条飞书汇总；仅完整完成的执行才比对白名单并生成端口风险告警。
 	var newAlerts []store.Alert
 	if status == "done" {
@@ -162,7 +211,86 @@ func (r *Runner) run(scanID int64, mode string, customPorts string, specs []stor
 	r.eng.NotifyScanSummary(scanID, status, newAlerts)
 }
 
-func (r *Runner) runBatch(scanID int64, settings NaabuSettings, args []string, outFile string, seen map[string]struct{}, openPorts *int) batchOutcome {
+// processBatch 处理单个批次：写目标文件 → 启动 naabu（runBatch 流式入库）→ 累计进度与异常。
+// 由并行 worker 调用，共享状态经 prog 加锁；DB 写入依赖 WAL+busy_timeout 并发安全。
+func (r *Runner) processBatch(scanID int64, settings NaabuSettings, mode, customPorts string, specs []store.TargetSpec, batchIndex, totalBatches int, dataDir string, timeout time.Duration, prog *scanProgress) {
+	batchNumber := batchIndex + 1
+	end := (batchIndex + 1) * scanBatchSize
+	if end > len(specs) {
+		end = len(specs)
+	}
+	batch := specs[batchIndex*scanBatchSize : end]
+	targetsFile := filepath.Join(dataDir, fmt.Sprintf("batch_%04d_targets.txt", batchNumber))
+	outFile := filepath.Join(dataDir, fmt.Sprintf("batch_%04d.out", batchNumber))
+	if err := writeTargets(targetsFile, batch); err != nil {
+		prog.addMessage(fmt.Sprintf("批次 %d 写入目标文件 %q 失败：%v；本批目标未处理，请检查目录权限和磁盘空间", batchNumber, targetsFile, err))
+		prog.addFailed(len(batch))
+		prog.completeBatch()
+		return
+	}
+	args := settings.args(targetsFile, outFile, mode, customPorts)
+	commandText := strings.Join(append([]string{settings.Path}, args...), " ")
+	log.Printf("扫描 %d 批次 %d/%d 启动(%d 个目标): %s", scanID, batchNumber, totalBatches, len(batch), commandText)
+
+	outcome := r.runBatch(scanID, settings, args, outFile, prog)
+	stopped := r.isStopped(scanID)
+
+	// 用户终止导致的批次中断不计入已处理（已实时入库的结果保留）；存储失败的批次也不计已处理。
+	if !(stopped && outcome.runErr != nil) && outcome.storeErr == nil {
+		prog.addProcessed(len(batch))
+	}
+	if outcome.runErr != nil || outcome.parseErr != nil || outcome.streamErr != nil || outcome.timedOut || outcome.storeErr != nil {
+		prog.addFailed(len(batch))
+	}
+	if outcome.storeErr != nil {
+		prog.addMessage(fmt.Sprintf("批次 %d 实时保存扫描结果失败：%v；原始输出保留在 %s", batchNumber, outcome.storeErr, outFile))
+	}
+	if outcome.timedOut {
+		prog.addMessage(fmt.Sprintf("批次 %d 达到任务有效扫描总超时 %s，naabu 进程组已强制终止；本批新增 %d 条结果，暂停时间不计入超时", batchNumber, timeout, outcome.results))
+	} else if outcome.runErr != nil && !stopped {
+		prog.addMessage(fmt.Sprintf("批次 %d naabu 进程异常退出：%v\n标准输出：%s\n错误输出：%s", batchNumber, outcome.runErr, limitedOutput(outcome.stdout), limitedOutput(outcome.stderr)))
+	}
+	if outcome.streamErr != nil {
+		prog.addMessage(fmt.Sprintf("批次 %d 读取 naabu 实时输出失败：%v；已保存实时结果，并继续从输出文件去重补齐", batchNumber, outcome.streamErr))
+	}
+	if outcome.parseErr != nil {
+		prog.addMessage(fmt.Sprintf("批次 %d 读取输出文件 %q 不完整：%v；本批实时及文件去重后新增 %d 条结果", batchNumber, outFile, outcome.parseErr, outcome.results))
+	}
+	prog.completeBatch()
+	snap := prog.snapshot()
+	if err := r.st.UpdateScanProgress(scanID, snap.processed, snap.failed, snap.completed, snap.openPorts, commandText); err != nil {
+		prog.addMessage(fmt.Sprintf("批次 %d 完成后保存进度失败：%v", batchNumber, err))
+	}
+	log.Printf("扫描 %d 批次 %d/%d 已处理，累计 %d 条开放端口", scanID, batchNumber, totalBatches, snap.openPorts)
+}
+
+// waitWhilePaused 阻塞直到取消暂停或扫描终止；返回 true 表示已终止（调用方应跳过该批次）。
+func (r *Runner) waitWhilePaused(scanID int64) bool {
+	for {
+		paused, stopped, _ := r.controlSnapshot(scanID)
+		if stopped {
+			return true
+		}
+		if !paused {
+			return false
+		}
+		r.mu.Lock()
+		var changed chan struct{}
+		if r.active != nil && r.scanID == scanID {
+			changed = r.active.changed
+		}
+		r.mu.Unlock()
+		if changed == nil {
+			return true
+		}
+		select {
+		case <-changed:
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+func (r *Runner) runBatch(scanID int64, settings NaabuSettings, args []string, outFile string, prog *scanProgress) batchOutcome {
 	var outcome batchOutcome
 	cmd := exec.Command(settings.Path, args...)
 	prepareProcess(cmd)
@@ -249,18 +377,19 @@ func (r *Runner) runBatch(scanID int64, settings NaabuSettings, args []string, o
 		if err := r.st.InsertResults(scanID, batch); err != nil {
 			return err
 		}
+		keys := make([]string, 0, len(batch))
 		for _, result := range batch {
-			seen[engine.ResultKey(result.IP, result.Port, result.Proto)] = struct{}{}
+			keys = append(keys, engine.ResultKey(result.IP, result.Port, result.Proto))
 		}
-		*openPorts += len(batch)
-		outcome.results += len(batch)
+		added, total := prog.markSeen(keys)
+		outcome.results += added
 		pending = pending[:0]
 		clear(pendingKeys)
-		return r.st.UpdateScanOpenPorts(scanID, *openPorts)
+		return r.st.UpdateScanOpenPorts(scanID, total)
 	}
 	queue := func(result store.Result) {
 		key := engine.ResultKey(result.IP, result.Port, result.Proto)
-		if _, exists := seen[key]; exists {
+		if prog.hasSeen(key) {
 			return
 		}
 		if _, exists := pendingKeys[key]; exists {
