@@ -61,6 +61,8 @@ naabu -version   # 应输出版本号
 
 ## 三、编译与运行
 
+> 首次克隆后仓库不含 `config.json`（已被 `.gitignore` 排除以防泄露密钥），请先执行 `cp config.example.json config.json` 再按需修改。
+
 ```bash
 # 编译
 go build -o easm-platform .
@@ -75,6 +77,12 @@ sudo ./easm-platform /path/to/config.json
 启动后默认同时监听 HTTP `http://127.0.0.1:8000` 与 HTTPS `https://127.0.0.1:8443`（地址见 `config.json` 的 `listen` / `https_listen`）。
 
 首次初始化账号默认为 `admin` / `admin123`（以首次启动时的 `config.json` 为准）。**登录后请立即通过右上角「改密」修改；后续账号与密码统一在 Web 中维护，修改 `config.json` 不会覆盖已有账号。**
+
+### 版本与发布
+
+- 查看二进制版本：`./easm-platform -version`。发布构建通过 `-ldflags "-X easm-platform/internal/buildinfo.Version=vX.Y.Z"` 注入版本号；`deploy/ubuntu/package.sh` 已自动注入 `VERSION`，页面侧栏与启动日志也会显示当前版本。
+- 发布新版本（逐步更新）：`VERSION=v1.0.1 ARCH=amd64 bash deploy/ubuntu/package.sh` 产出 `dist/easm-platform-linux-amd64-v1.0.1.tar.gz` → `git tag -a v1.0.1 -m "..." && git push origin v1.0.1` → 在 GitHub Releases 基于该 tag 上传二进制包。
+- **二进制不入库**：`dist/` 与根 `/easm-platform` 已在 `.gitignore` 排除，二进制只随 GitHub Release 分发，避免仓库膨胀。
 
 ### HTTPS 与证书（默认启用）
 
