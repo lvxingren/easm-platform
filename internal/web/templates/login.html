@@ -1,0 +1,26 @@
+{{define "login.html"}}<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>(function(){try{var t=localStorage.getItem('easm-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+<title>登录 · {{.AppName}}</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+<div class="login-box">
+  <div class="login-brand">
+    <div class="logo">灵瞰</div>
+    <div class="sub">{{.AppName}}</div>
+  </div>
+  {{if .Error}}<div class="error-banner">{{.Error}}</div>{{end}}
+  <form method="post" action="/login">
+    <label>用户名<input type="text" name="user" required autofocus autocomplete="username"></label>
+    <label>密码<input type="password" name="pass" required autocomplete="current-password"></label>
+    <button type="submit" class="btn primary">登 录</button>
+  </form>
+</div>
+</body>
+</html>
+{{end}}

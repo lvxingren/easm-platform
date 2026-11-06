@@ -1,0 +1,45 @@
+{{define "whitelist_help.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">白名单是「暴露面基线」：扫描到的开放端口若命中白名单则视为合规、不告警；未命中的才登记为告警并推送飞书。</p>
+
+<div class="panel">
+  <div class="panel-title">一、字段格式</div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>字段</th><th>支持写法</th><th>示例</th></tr></thead>
+    <tbody>
+      <tr><td>IP 规则</td><td>单个 IP / CIDR 网段 / *（全部 IP）</td><td><code>1.2.3.4</code>　<code>10.0.0.0/16</code>　<code>*</code></td></tr>
+      <tr><td>端口</td><td>单端口 / 范围 / 逗号分隔 / *（全部端口）</td><td><code>443</code>　<code>1000-2000</code>　<code>22,80,443</code>　<code>*</code></td></tr>
+      <tr><td>协议</td><td>tcp / udp / *</td><td><code>tcp</code>　<code>*</code></td></tr>
+    </tbody>
+  </table></div>
+  <p class="hint" style="margin-top:10px">注意：白名单 IP 规则<b>不支持</b> <code>a-b</code> 范围写法（范围仅用于资产台账）；需要连续网段请用 CIDR。</p>
+</div>
+
+<div class="panel">
+  <div class="panel-title">二、批量导入格式</div>
+  <p class="hint">每行一条；IP 与端口之间可用空格、逗号或冒号分隔，多端口用逗号；行尾可写 <code>tcp</code>/<code>udp</code> 指定协议（默认 tcp）。</p>
+  <pre class="codeblock">1.2.3.4 22,80,443
+10.0.0.5:3306
+10.0.0.0/24 1000-2000 udp
+* 443</pre>
+  <div class="row" style="margin-top:12px"><a class="btn small ghost" href="/api/sample/whitelist.txt">下载样例文件</a><a class="btn small ghost" href="/whitelist">返回白名单</a></div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">三、匹配与告警逻辑</div>
+  <p class="hint">
+    1. 扫描完成后，逐个开放端口与白名单比对，命中任意一条即放行；<br>
+    2. 未命中的端口 = 违规，进入告警去重（同一 IP+端口+协议在「重告警周期」内不重复告警，仅更新最近发现时间）；<br>
+    3. 台账范围内的资产默认告警；范围外是否告警由「系统设置 · 范围外发现也告警」控制；<br>
+    4. 新告警推送飞书，并可在「告警」页标记处理。
+  </p>
+</div>
+
+<div class="panel">
+  <div class="panel-title">四、最佳实践</div>
+  <p class="hint">
+    · 首次使用：先跑一次全端口扫描，再在「扫描记录」页点「生成白名单基线」，把现有暴露面一次性入白，之后只关注<b>新增</b>端口；<br>
+    · 按业务分组维护白名单，填写「负责人 / 备注」便于追溯；<br>
+    · 定期复核白名单，避免把风险端口长期放行。
+  </p>
+</div>
+{{template "foot" .}}{{end}}

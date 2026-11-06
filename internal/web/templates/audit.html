@@ -1,0 +1,31 @@
+{{define "audit.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">记录所有登录与写操作（谁、何时、做了什么、来源 IP），用于安全审计与追溯。仅管理员可见，最多展示最近 2000 条，可按关键词或用户名筛选，导出不受展示上限限制。</p>
+
+<div class="panel">
+  <div class="panel-title">筛选与检索</div>
+  <form method="get" action="/audit" class="filter-bar">
+    <label class="field grow">检索（操作 / 对象 / 详情 / 来源 IP）<input name="q" value="{{.Query}}" placeholder="如 删除、导入资产、10.0.0.1"></label>
+    <label class="field">用户名<input name="user" value="{{.User}}" placeholder="全部用户"></label>
+    <button class="btn primary" type="submit">查询</button>
+    <a class="btn ghost" href="/audit">重置</a>
+    <a class="btn" href="/audit/export?q={{urlquery .Query}}&user={{urlquery .User}}">导出 CSV</a>
+  </form>
+</div>
+
+<div class="section-head"><h2>审计流水（{{len .Logs}} 条）</h2></div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>时间</th><th>用户</th><th>角色</th><th>操作</th><th>对象</th><th>详情</th><th>来源 IP</th></tr></thead>
+  <tbody>
+  {{range .Logs}}
+  <tr>
+    <td>{{fmtTime .Ts}}</td><td>{{.Username}}</td><td><span class="pill mute">{{roleName .Role}}</span></td>
+    <td>{{.Action}}</td><td>{{.Target}}</td><td style="color:var(--text-dim)">{{.Detail}}</td><td>{{.IP}}</td>
+  </tr>
+  {{else}}
+  <tr><td colspan="7"><div class="empty"><div class="big">暂无审计记录</div>调整关键词或用户名后重试</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{template "foot" .}}{{end}}

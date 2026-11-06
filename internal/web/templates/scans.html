@@ -1,0 +1,63 @@
+{{define "scans.html"}}{{template "head" .}}{{template "nav" .}}
+{{if .Running}}<div class="run-banner">● 有任务正在执行，页面会每 5 秒刷新状态。</div>{{end}}
+<p class="hint">这里展示所有已接受执行的任务，包括启动检查失败、naabu 运行失败、超时、部分完成和正常完成。任务配置与历史执行互不影响；删除任务不会删除本页记录。</p>
+
+<div class="panel">
+  <div class="panel-title">筛选与检索</div>
+  <form method="get" action="/scans" class="filter-bar">
+    {{if gt .TaskID 0}}<input type="hidden" name="task_id" value="{{.TaskID}}">{{end}}
+    <label class="field grow">检索执行记录<input name="q" value="{{.Query}}" placeholder="执行 ID、任务名、异常或命令参数"></label>
+    <label class="field">状态<select name="status">
+      <option value="">全部状态</option><option value="running" {{if eq .Status "running"}}selected{{end}}>运行中</option><option value="paused" {{if eq .Status "paused"}}selected{{end}}>已暂停</option>
+      <option value="done" {{if eq .Status "done"}}selected{{end}}>完成</option><option value="partial" {{if eq .Status "partial"}}selected{{end}}>部分完成</option>
+      <option value="stopped" {{if eq .Status "stopped"}}selected{{end}}>已终止</option><option value="failed" {{if eq .Status "failed"}}selected{{end}}>失败</option>
+    </select></label>
+    <label class="field">扫描模式<select name="mode"><option value="">全部模式</option><option value="full" {{if eq .Mode "full"}}selected{{end}}>全端口 1-65535</option><option value="top" {{if eq .Mode "top"}}selected{{end}}>常用端口 top-1000</option><option value="custom" {{if eq .Mode "custom"}}selected{{end}}>自定义端口</option></select></label>
+    <button class="btn primary" type="submit">查询</button><a class="btn ghost" href="/scans">重置</a>
+  </form>
+</div>
+
+<div class="section-head">
+  <h2>执行记录（{{len .Scans}} 条{{if gt .TaskID 0}}，任务 #{{.TaskID}}{{end}}）</h2>
+  <div class="row">
+    {{if ne .Role "viewer"}}<button class="btn" onclick="baseline()">生成白名单基线</button>{{end}}
+    <a class="btn ghost" href="/tasks">返回任务定义</a>
+  </div>
+</div>
+<p class="hint">「生成白名单基线」只使用最近一次正常完成的扫描。部分完成或失败的记录可查看已保留结果，但不会基于不完整结果生成告警。</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ID</th><th>执行名称</th><th>模式</th><th>状态</th><th>开始 / 结束</th><th>目标进度</th><th>开放端口</th><th>异常说明</th><th>操作</th></tr></thead>
+  <tbody>
+  {{range .Scans}}
+  <tr>
+    <td class="num-cell">{{.ID}}</td>
+    <td><a href="/scans?task_id={{.TaskID}}">{{.Name}}</a><div class="muted">任务 #{{.TaskID}}</div></td>
+    <td>{{modeName .Mode}}</td>
+    <td><span class="pill {{scanStatusClass .Status}}">{{scanStatusName .Status}}</span></td>
+    <td>{{fmtTime .StartedAt}}<div class="muted">{{if .FinishedAt}}{{fmtTime .FinishedAt}}{{else}}尚未结束{{end}}</div></td>
+    <td>{{if gt .TargetCount 0}}已处理 {{.ProcessedTargets}}/{{.TargetCount}}<div class="muted">待处理 {{.RemainingTargets}}{{if .FailedTargets}} · 异常 {{.FailedTargets}}{{end}}</div>{{else}}<span class="muted">—</span>{{end}}</td><td class="num-cell">{{.OpenPorts}}</td>
+    <td>{{if .Err}}<div class="error-preview">{{.Err}}</div>{{else}}<span class="muted">—</span>{{end}}</td>
+    <td><a class="btn small ghost" href="/scans/{{.ID}}">执行详情</a> <a class="btn small ghost" href="/results?scan_id={{.ID}}">端口结果</a></td>
+  </tr>
+  {{else}}
+  <tr><td colspan="9"><div class="empty"><div class="big">没有匹配的执行记录</div>可从「扫描任务」运行任务；启动检查失败也会在此留下记录</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+<script>
+async function baseline() {
+  if (!confirm('把最近一次正常完成扫描的全部开放端口加入白名单基线？')) return;
+  const res = await postEmpty('/api/baseline');
+  if (res.ok) { toast('已加入白名单 ' + res.json.added + ' 条', 'ok'); setTimeout(()=>location.reload(), 700); } else toast(res.json.error || '失败', 'err');
+}
+setInterval(async () => {
+  const r = await fetch('/api/status'); const j = await r.json();
+  const banner = document.querySelector('.run-banner');
+  if (j.running || banner) location.reload();
+}, 5000);
+</script>
+{{template "foot" .}}{{end}}

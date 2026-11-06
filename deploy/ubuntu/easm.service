@@ -1,0 +1,34 @@
+[Unit]
+Description=灵瞰 · 外部攻击面管理平台 (EASM) — Linux/systemd 部署
+Documentation=file:///opt/easm/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 工作目录必须是部署目录：config.json / data/easm.db / data/certs/ / data/scan_* 均为相对路径
+WorkingDirectory=/opt/easm
+ExecStart=/opt/easm/easm-platform /opt/easm/config.json
+Restart=always
+RestartSec=3
+
+# ===== 测试环境：以 root 运行，naabu SYN 扫描开箱即用 =====
+User=root
+
+# ===== 降权运行（可选）：改用专用非 root 用户 =====
+# install.sh 已对 naabu 执行 setcap cap_net_raw+ep：普通用户在命令行直接跑 naabu 即可 SYN 扫描（免 sudo）。
+# 建用户并授权目录： useradd -r -s /usr/sbin/nologin easm && chown -R easm:easm /opt/easm
+# 然后把上面的 User=root 换成下面几行（用 ambient 能力最稳妥，与 naabu 文件能力互不冲突）：
+# User=easm
+# Group=easm
+# AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+# CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# NoNewPrivileges=true
+# 注意：若想改靠 naabu 的文件能力(setcap)而非 ambient，则不要设 NoNewPrivileges=true，否则文件能力会被内核忽略导致扫描失败。
+
+# 日志重定向到文件（systemd 240+ 支持 append:；Ubuntu 24.04 为 255）
+StandardOutput=append:/opt/easm/data/easm.log
+StandardError=append:/opt/easm/data/easm.log
+
+[Install]
+WantedBy=multi-user.target

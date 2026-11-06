@@ -1,0 +1,86 @@
+{{define "logs.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">后台运行日志（内存缓存最近若干条，进程重启后清空）。可按级别筛选、只看报错，或输入关键词检索扫描、飞书、数据库、naabu 等模块输出。</p>
+
+<div class="panel">
+  <div class="panel-title">日志筛选</div>
+  <div class="row between" style="margin-bottom:12px">
+    <div class="row">
+      <span class="pill mute">INFO {{.InfoCount}}</span>
+      <span class="pill run">WARN {{.WarnCount}}</span>
+      <span class="pill err">ERROR {{.ErrorCount}}</span>
+    </div>
+    <label class="check"><input type="checkbox" id="live-tail" checked> 实时刷新（每 3 秒）</label>
+  </div>
+  <form method="get" action="/logs" class="filter-bar">
+    <label class="field grow">检索日志<input name="q" value="{{.Query}}" placeholder="关键词，如 naabu、飞书、失败、扫描 3"></label>
+    <label class="field">级别<select name="level">
+      <option value="">全部</option>
+      <option value="error" {{if eq .Level "error"}}selected{{end}}>只看报错</option>
+      <option value="warn" {{if eq .Level "warn"}}selected{{end}}>告警</option>
+      <option value="info" {{if eq .Level "info"}}selected{{end}}>普通信息</option>
+    </select></label>
+    <button class="btn primary" type="submit">查询</button>
+    <a class="btn ghost" href="/logs">重置</a>
+  </form>
+</div>
+
+<div class="section-head"><h2>运行日志{{if .Level}}（{{.Level}}）{{end}}</h2></div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:170px">时间</th><th style="width:90px">级别</th><th>内容</th></tr></thead>
+  <tbody id="log-body">
+  {{range .Entries}}
+  <tr data-log-id="{{.ID}}">
+    <td class="num-cell muted">{{.Ts}}</td>
+    <td><span class="pill {{if eq .Level "error"}}err{{else if eq .Level "warn"}}run{{else}}mute{{end}}">{{.Level}}</span></td>
+    <td class="command-text">{{.Msg}}</td>
+  </tr>
+  {{else}}
+  <tr id="log-empty"><td colspan="3"><div class="empty"><div class="big">没有匹配的日志</div>调整级别或关键词后重试；服务刚启动时日志较少</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+<script>
+const logLevel = {{.Level}};
+const logQuery = {{.Query}};
+let lastLogID = 0;
+(function () {
+  const rows = document.querySelectorAll('#log-body tr[data-log-id]');
+  rows.forEach(tr => { const id = Number(tr.dataset.logId); if (id > lastLogID) lastLogID = id; });
+})();
+function levelPill(level) {
+  const cls = level === 'error' ? 'err' : (level === 'warn' ? 'run' : 'mute');
+  return `<span class="pill ${cls}">${level}</span>`;
+}
+async function tailLogs() {
+  if (!document.getElementById('live-tail').checked) return;
+  const params = new URLSearchParams({ after_id: String(lastLogID), limit: '200' });
+  if (logLevel) params.set('level', logLevel);
+  if (logQuery) params.set('q', logQuery);
+  try {
+    const res = await fetch('/api/logs?' + params.toString(), { cache: 'no-store' });
+    const data = await res.json();
+    const entries = (data.entries || []).slice().reverse();
+    if (!entries.length) return;
+    const body = document.getElementById('log-body');
+    const empty = document.getElementById('log-empty');
+    if (empty) empty.remove();
+    for (const e of entries) {
+      if (e.id <= lastLogID) continue;
+      lastLogID = e.id;
+      const tr = document.createElement('tr');
+      tr.dataset.logId = e.id;
+      const tdTime = document.createElement('td'); tdTime.className = 'num-cell muted'; tdTime.textContent = e.ts;
+      const tdLevel = document.createElement('td'); tdLevel.innerHTML = levelPill(e.level);
+      const tdMsg = document.createElement('td'); tdMsg.className = 'command-text'; tdMsg.textContent = e.msg;
+      tr.append(tdTime, tdLevel, tdMsg);
+      body.insertBefore(tr, body.firstChild);
+    }
+    while (body.children.length > 500) body.removeChild(body.lastChild);
+  } catch (err) { /* 忽略瞬时网络错误，下次轮询重试 */ }
+}
+setInterval(tailLogs, 3000);
+</script>
+{{template "foot" .}}{{end}}

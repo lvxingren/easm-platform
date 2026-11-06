@@ -1,0 +1,88 @@
+{{define "head"}}<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>(function(){try{var t=localStorage.getItem('easm-theme');if(t==='dark'||t==='light'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();</script>
+<title>{{.Title}} · {{.AppName}}</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+{{end}}
+
+{{define "nav"}}
+<aside class="sidebar" id="sidebar">
+  <div class="brand"><span class="logo">灵瞰</span><span class="brand-sub">EASM</span></div>
+  <nav class="nav">
+    <div class="nav-group">概览</div>
+    <a href="/" class="nav-item {{if eq .Active "index"}}active{{end}}">仪表盘</a>
+    <div class="nav-group">资产</div>
+    <a href="/assets" class="nav-item {{if eq .Active "assets"}}active{{end}}">资产台账</a>
+    <a href="/exposure" class="nav-item {{if eq .Active "exposure"}}active{{end}}">暴露面资产</a>
+    <div class="nav-group">扫描</div>
+    <a href="/tasks" class="nav-item {{if eq .Active "tasks"}}active{{end}}">扫描任务</a>
+    <a href="/scans" class="nav-item {{if eq .Active "scans"}}active{{end}}">执行记录</a>
+    <a href="/results" class="nav-item {{if eq .Active "results"}}active{{end}}">扫描结果</a>
+    <div class="nav-group">防护</div>
+    <a href="/whitelist" class="nav-item {{if eq .Active "whitelist"}}active{{end}}">白名单</a>
+    <div class="nav-group">风险</div>
+    <a href="/alerts" class="nav-item {{if eq .Active "alerts"}}active{{end}}">风险告警{{if gt .NewAlerts 0}} <span class="badge">{{.NewAlerts}}</span>{{end}}</a>
+    <div class="nav-group">分析</div>
+    <a href="/analysis" class="nav-item {{if eq .Active "analysis"}}active{{end}}">流量分析</a>
+    {{if .IsAdmin}}
+    <div class="nav-group">系统管理</div>
+    <a href="/accounts" class="nav-item {{if eq .Active "accounts"}}active{{end}}">账号管理</a>
+    <a href="/audit" class="nav-item {{if eq .Active "audit"}}active{{end}}">操作审计</a>
+    <a href="/logs" class="nav-item {{if eq .Active "logs"}}active{{end}}">运行日志</a>
+    <a href="/settings" class="nav-item {{if eq .Active "settings"}}active{{end}}">系统设置</a>
+    {{end}}
+  </nav>
+  <div class="sidebar-foot">仅扫描台账内自有 / 已授权资产</div>
+</aside>
+<div class="sidebar-mask" id="sidebar-mask" onclick="toggleSidebar(false)"></div>
+<div class="main">
+  <header class="topbar">
+    <div class="topbar-left">
+      <button class="nav-toggle" id="nav-toggle" type="button" onclick="toggleSidebar()" aria-label="切换导航菜单" aria-controls="sidebar">☰</button>
+      <div class="page-heading">
+        {{if .Section}}<div class="page-eyebrow">{{.Section}}</div>{{end}}
+        <div class="page-title">{{.Title}}</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      {{if .Running}}<span class="pill run">● 扫描进行中</span>{{end}}
+      <button class="btn ghost small" id="theme-toggle" type="button" onclick="toggleTheme()" title="切换深浅主题">◐ 主题</button>
+      <div class="user-menu">
+        <span class="user-chip">{{.User}} · {{roleName .Role}}</span>
+        <a href="#" class="user-link" onclick="pwModal();return false">改密</a>
+        <a href="/logout" class="user-link">退出</a>
+      </div>
+    </div>
+  </header>
+  <main class="content">
+{{end}}
+
+{{define "foot"}}
+  </main>
+</div>
+</div>
+<div class="toasts" id="toasts"></div>
+<div class="modal-mask" id="pw-modal" style="display:none" onclick="if(event.target===this)pwClose()">
+  <div class="modal">
+    <h3>修改密码</h3>
+    <div class="stack">
+      <label class="field">原密码<input type="password" id="pw-old" autocomplete="current-password"></label>
+      <label class="field">新密码（至少 6 位）<input type="password" id="pw-new" autocomplete="new-password"></label>
+      <div class="row" style="justify-content:flex-end;margin-top:6px">
+        <button class="btn ghost" onclick="pwClose()">取消</button>
+        <button class="btn primary" onclick="pwSubmit()">确认修改</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}

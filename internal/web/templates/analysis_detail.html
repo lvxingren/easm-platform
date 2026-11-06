@@ -1,0 +1,160 @@
+{{define "analysis_detail.html"}}{{template "head" .}}{{template "nav" .}}
+<div class="row between" style="margin-bottom:16px">
+  <a class="btn ghost small" href="/analysis">返回分析列表</a>
+  {{if ne .Role "viewer"}}<div class="row">
+    <button class="btn small" type="button" onclick="retryAnalysis()">重新分析</button>
+    <button class="btn small danger" type="button" onclick="delAnalysis({{.A.ID}})">删除</button>
+  </div>{{end}}
+</div>
+
+<div class="panel">
+  <div class="panel-title">分析 #{{.A.ID}} · {{.A.Name}}</div>
+  <div class="grid">
+    <div><div class="muted">状态</div><strong id="a-status"><span class="pill {{analysisStatusClass .A.Status}}">{{analysisStatusName .A.Status}}</span></strong></div>
+    <div><div class="muted">来源</div><strong>{{if eq .A.SourceType "cfw"}}CFW 防火墙{{else if eq .A.SourceType "ecs"}}ECS 云主机{{else}}其他{{end}}</strong></div>
+    <div><div class="muted">原始记录 / 通信关系</div><strong id="a-counts">{{.A.FlowCount}} / {{.A.EdgeCount}}</strong></div>
+    <div><div class="muted">分析引擎</div><strong id="a-model">{{if .A.UsedMock}}内置规则降级{{else if .A.AIModel}}{{.A.AIModel}}{{else}}—{{end}}</strong></div>
+    <div><div class="muted">创建 / 完成</div><strong>{{fmtTime .A.CreatedAt}} / <span id="a-finished">{{if .A.FinishedAt}}{{fmtTime .A.FinishedAt}}{{else}}—{{end}}</span></strong></div>
+  </div>
+  <div id="a-error" class="error-banner" style="margin-top:14px;{{if not .A.Err}}display:none{{end}}">{{.A.Err}}</div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">上传文件（{{len .Files}}）</div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>文件名</th><th>大小(字节)</th><th>格式</th><th>解析行数</th><th>上传时间</th></tr></thead>
+    <tbody>
+    {{range .Files}}<tr><td>{{.Filename}}</td><td class="num-cell">{{.Size}}</td><td>{{if .Format}}{{.Format}}{{else}}—{{end}}</td><td class="num-cell">{{.RowsParsed}}</td><td>{{fmtTime .UploadedAt}}</td></tr>
+    {{else}}<tr><td colspan="5"><div class="empty">无文件记录</div></td></tr>{{end}}
+    </tbody>
+  </table></div>
+</div>
+
+<div id="a-progress" class="run-banner" style="{{if or (eq .A.Status "done") (eq .A.Status "failed")}}display:none{{end}}">正在解析日志并调用 AI 分析，页面每 2 秒自动刷新状态……</div>
+
+<div id="results" style="{{if ne .A.Status "done"}}display:none{{end}}">
+  <div class="panel"><div class="panel-title">拓扑摘要</div><div id="a-summary" class="command-text"></div></div>
+  <div class="panel">
+    <div class="panel-title">网络拓扑关系图</div>
+    <div id="topology" style="width:100%;overflow:auto;border:1px solid var(--border-soft);border-radius:var(--radius-sm);padding:8px;color:var(--text)"></div>
+    <p class="hint" style="margin-top:10px">节点为资产 IP（颜色表示角色：外部/中转/服务器/终端），连线为通信关系（红=高危、橙=中、灰=低），可拖拽节点调整布局。</p>
+  </div>
+  <div class="panel"><div class="panel-title">异常通信提示</div><div id="anomalies"></div></div>
+  <div class="panel"><div class="panel-title">推荐溯源路径</div><div id="traces"></div></div>
+  <div class="panel">
+    <div class="panel-title">通信关系明细</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>源</th><th>目的</th><th>端口</th><th>协议</th><th>动作</th><th>次数</th><th>首 / 末次</th>{{if ne .Role "viewer"}}<th>操作</th>{{end}}</tr></thead>
+      <tbody id="edge-rows"></tbody>
+    </table></div>
+  </div>
+  <div class="panel"><div class="panel-title">AI 分析报告</div><div id="a-readable" class="command-text"></div></div>
+</div>
+
+<script src="/static/topology.js"></script>
+<script>
+const ANALYSIS_ID = {{.A.ID}};
+const CAN_WRITE = {{if ne .Role "viewer"}}true{{else}}false{{end}};
+const STATUS_NAMES = {pending:'待解析', parsing:'解析中', analyzing:'AI 分析中', done:'完成', failed:'失败'};
+const STATUS_CLASS = {done:'ok', failed:'err', pending:'run', parsing:'run', analyzing:'run'};
+let pollTimer = null;
+
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+function statusPill(status) { const s = document.createElement('span'); s.className = 'pill ' + (STATUS_CLASS[status] || 'run'); s.textContent = STATUS_NAMES[status] || status; return s; }
+
+async function loadAnalysis() {
+  let d;
+  try { const r = await fetch('/api/analysis/' + ANALYSIS_ID, { cache: 'no-store' }); d = await r.json(); } catch (e) { return; }
+  if (!d || !d.status) return;
+  const st = document.getElementById('a-status'); if (st) { st.textContent = ''; st.appendChild(statusPill(d.status)); }
+  setText('a-counts', (d.flow_count || 0) + ' / ' + (d.edge_count || 0));
+  setText('a-model', d.used_mock ? '内置规则降级' : (d.ai_model || '—'));
+  setText('a-finished', d.finished_at ? new Date(d.finished_at).toLocaleString() : '—');
+  const errBox = document.getElementById('a-error');
+  const progress = document.getElementById('a-progress');
+  const results = document.getElementById('results');
+  if (d.status === 'failed') { errBox.style.display = 'block'; errBox.textContent = d.error || '分析失败'; progress.style.display = 'none'; results.style.display = 'none'; stopPoll(); return; }
+  if (d.status === 'done') { errBox.style.display = 'none'; progress.style.display = 'none'; results.style.display = 'block'; renderAll(d); stopPoll(); return; }
+  errBox.style.display = 'none'; progress.style.display = 'block'; results.style.display = 'none'; startPoll();
+}
+
+function renderAll(d) {
+  setText('a-summary', d.summary || '');
+  setText('a-readable', d.readable || '');
+  const topo = d.topology || {};
+  renderTopology(document.getElementById('topology'), topo.nodes || [], topo.edges || []);
+  renderAnomalies(d.anomalies || []);
+  renderTraces(d.trace || []);
+  renderEdges(d.edges || []);
+}
+
+function renderAnomalies(list) {
+  const box = document.getElementById('anomalies'); box.textContent = '';
+  if (!list.length) { const m = document.createElement('div'); m.className = 'muted'; m.textContent = '未发现明显异常'; box.appendChild(m); return; }
+  list.forEach(a => {
+    const row = document.createElement('div'); row.className = 'scan-event' + (a.severity === 'high' ? ' warn' : '');
+    const sev = document.createElement('span'); sev.className = 'pill ' + (a.severity === 'high' ? 'err' : (a.severity === 'warn' ? 'run' : 'mute')); sev.textContent = a.severity || 'info';
+    const main = document.createElement('div');
+    const t = document.createElement('strong'); t.textContent = a.type || '异常'; main.appendChild(t);
+    const det = document.createElement('div'); det.className = 'muted'; det.textContent = a.detail || ''; main.appendChild(det);
+    row.appendChild(sev); row.appendChild(main); box.appendChild(row);
+  });
+}
+
+function renderTraces(list) {
+  const box = document.getElementById('traces'); box.textContent = '';
+  if (!list.length) { const m = document.createElement('div'); m.className = 'muted'; m.textContent = '暂无溯源路径建议'; box.appendChild(m); return; }
+  list.forEach(p => {
+    const wrap = document.createElement('div'); wrap.style.marginBottom = '14px';
+    const h = document.createElement('strong'); h.textContent = p.title || '溯源路径'; wrap.appendChild(h);
+    const meta = document.createElement('div'); meta.className = 'muted'; meta.textContent = '潜在起点：' + (p.entry_point || '—') + '　→　目标资产：' + (p.target || '—'); wrap.appendChild(meta);
+    const ol = document.createElement('ol'); (p.steps || []).forEach(s => { const li = document.createElement('li'); li.textContent = s; ol.appendChild(li); }); wrap.appendChild(ol);
+    box.appendChild(wrap);
+  });
+}
+
+function renderEdges(list) {
+  const tb = document.getElementById('edge-rows'); tb.textContent = '';
+  list.forEach(e => {
+    const tr = document.createElement('tr');
+    const cells = [e.src_ip, e.dst_ip, String(e.dst_port || ''), e.proto || '', e.action || '', String(e.count || ''), (e.first_seen || '—') + ' ~ ' + (e.last_seen || '—')];
+    cells.forEach((v, i) => { const td = document.createElement('td'); td.textContent = v; if (i === 2 || i === 5) td.className = 'num-cell'; tr.appendChild(td); });
+    if (CAN_WRITE) {
+      const td = document.createElement('td');
+      const bw = document.createElement('button'); bw.className = 'btn small ghost'; bw.textContent = '加白'; bw.onclick = () => whitelistIP(e.dst_ip, e.dst_port, e.proto);
+      const ba = document.createElement('button'); ba.className = 'btn small'; ba.style.marginLeft = '6px'; ba.textContent = '建告警'; ba.onclick = () => createAlert(e.dst_ip, e.dst_port, e.proto);
+      td.appendChild(bw); td.appendChild(ba); tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  });
+}
+
+async function whitelistIP(ip, port, proto) {
+  if (!ip) return;
+  if (!confirm(`将 ${ip}:${port || '*'}/${proto || 'tcp'} 加入白名单？`)) return;
+  const body = new FormData(); body.append('ip_spec', ip); body.append('port_spec', port ? String(port) : '*'); body.append('proto', proto || 'tcp'); body.append('remark', '来自流量分析');
+  const res = await postForm('/api/whitelist', body);
+  toast(res.ok ? '已加入白名单' : (res.json.error || '失败'), res.ok ? 'ok' : 'err');
+}
+async function createAlert(ip, port, proto) {
+  if (!ip || !port) { toast('该关系缺少端口，无法建告警', 'err'); return; }
+  if (!confirm(`为 ${ip}:${port}/${proto || 'tcp'} 创建告警处置单？`)) return;
+  const body = new FormData(); body.append('ip', ip); body.append('port', String(port)); body.append('proto', proto || 'tcp'); body.append('note', '来自流量分析');
+  const res = await postForm('/api/alerts/manual', body);
+  toast(res.ok ? '已创建告警' : (res.json.error || '失败'), res.ok ? 'ok' : 'err');
+}
+async function retryAnalysis() {
+  const res = await postEmpty('/api/analysis/' + ANALYSIS_ID + '/retry');
+  if (res.ok) { toast('已重新提交 AI 分析', 'ok'); document.getElementById('a-progress').style.display = 'block'; startPoll(); }
+  else toast(res.json.error || '重试失败', 'err');
+}
+async function delAnalysis(id) {
+  if (!confirm('删除该分析记录及其上传文件？')) return;
+  const res = await postEmpty('/api/analysis/' + id, 'DELETE');
+  if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.href = '/analysis', 500); } else toast(res.json.error || '失败', 'err');
+}
+function startPoll() { if (!pollTimer) pollTimer = setInterval(loadAnalysis, 2000); }
+function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+loadAnalysis();
+</script>
+{{template "foot" .}}{{end}}

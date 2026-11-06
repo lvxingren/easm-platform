@@ -1,0 +1,70 @@
+{{define "tasks.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">任务可反复运行或挂定时计划，目标支持全部台账、按资产标签动态圈选、手工 IP/网段/范围。标签任务每次运行都会读取该标签下的最新资产；全局同时只运行一个扫描，定时任务错过当日/当周时间会补跑。</p>
+
+{{if .Running}}<div class="run-banner">● 当前有扫描运行或暂停中，需等它结束后才能启动新任务。{{if .RunningScan}}<br><strong>{{.RunningScan.Name}}</strong>：{{scanStatusName .RunningScan.Status}}，已处理 {{.RunningScan.ProcessedTargets}}/{{.RunningScan.TargetCount}}，待处理 {{.RunningScan.RemainingTargets}}，当前第 {{.RunningScan.CurrentBatch}}/{{.RunningScan.TotalBatches}} 批。
+  {{if ne .Role "viewer"}}<div class="row" style="margin-top:10px">{{if eq .RunningScan.Status "running"}}<button class="btn small" onclick="controlRunning({{.RunningScan.ID}},'pause')">暂停</button>{{else}}<button class="btn small primary" onclick="controlRunning({{.RunningScan.ID}},'resume')">恢复</button>{{end}}<button class="btn small danger" onclick="controlRunning({{.RunningScan.ID}},'stop')">终止扫描</button></div>{{end}}{{end}}</div>{{end}}
+
+<div class="section-head">
+  <h2>任务列表（{{len .Tasks}} 个）</h2>
+  <div class="row"><a class="btn ghost" href="/scans">全部执行记录</a>{{if ne .Role "viewer"}}<a class="btn primary" href="/tasks/new">+ 新建任务</a>{{end}}</div>
+</div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ID</th><th>名称</th><th>模式</th><th>目标</th><th>入台账</th><th>定时</th><th>上次运行</th><th>执行进度</th>{{if ne .Role "viewer"}}<th>操作</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Tasks}}
+  <tr>
+    <td class="num-cell">{{.ID}}</td><td>{{.Name}}</td><td>{{modeName .Mode}}</td>
+    <td><span class="pill {{if eq .TargetType "tag"}}info{{else}}mute{{end}}" title="{{.IPs}}">{{targetName .}}</span></td>
+    <td>{{if .AddToLedger}}<span class="pill ok">是</span>{{else}}<span style="color:var(--muted)">否</span>{{end}}</td>
+    <td>{{if .SchedEnabled}}<span class="pill info">{{if eq .SchedType "weekly"}}每周 {{weekdayName .Weekday}}{{else}}每日{{end}} {{printf "%02d" .Hour}}:{{printf "%02d" .Minute}}</span>{{else}}<span class="muted">未定时</span>{{end}}</td>
+    <td>{{if .LastRun}}<a href="/scans?task_id={{.ID}}">{{fmtTime .LastRun}}</a>{{else}}—{{end}}</td>
+    <td class="progress-cell">
+      {{if and $.RunningScan (eq .ID $.RunningScan.TaskID)}}
+        <div class="row between"><span>已处理 {{$.RunningScan.ProcessedTargets}}/{{$.RunningScan.TargetCount}}</span><strong>{{$.RunningScan.ProgressPercent}}%</strong></div>
+        <div class="progress-track"><div class="progress-value" style="width:{{$.RunningScan.ProgressPercent}}%"></div></div>
+        <div class="muted">待处理 {{$.RunningScan.RemainingTargets}} · 批次 {{$.RunningScan.CurrentBatch}}/{{$.RunningScan.TotalBatches}}{{if $.RunningScan.FailedTargets}} · 异常 {{$.RunningScan.FailedTargets}}{{end}}</div>
+        <a href="/scans/{{$.RunningScan.ID}}">查看实时执行</a>
+      {{else}}<span class="muted">未在运行</span>{{end}}
+    </td>
+    {{if ne $.Role "viewer"}}
+    <td>
+      <div class="btn-group">
+        <button class="btn small primary" onclick="runTask({{.ID}})">运行</button>
+        <a class="btn small ghost" href="/scans?task_id={{.ID}}">记录</a>
+        <a class="btn small ghost" href="/tasks/{{.ID}}/edit">编辑</a>
+        <button class="btn small danger" onclick="delTask({{.ID}})">删除</button>
+      </div>
+    </td>
+    {{end}}
+  </tr>
+  {{else}}
+  <tr><td colspan="9"><div class="empty"><div class="big">还没有任务</div>点击「新建任务」创建第一个扫描任务{{if ne $.Role "viewer"}}<div class="btn-group" style="justify-content:center;margin-top:14px"><a class="btn primary" href="/tasks/new">新建任务</a></div>{{end}}</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+<script>
+async function runTask(id) {
+  const res = await postEmpty('/api/tasks/' + id + '/run');
+  if (res.json.scan_id) { location.href = '/scans/' + res.json.scan_id; return; }
+  toast(res.json.error || '启动失败，未创建执行记录', 'err');
+}
+async function controlRunning(scanID, action) {
+  if (action === 'stop' && !confirm('确定终止当前扫描？已发现结果会保留。')) return;
+  const res = await postEmpty(`/api/scans/${scanID}/${action}`);
+  toast(res.ok ? '操作已提交' : (res.json.error || '操作失败'), res.ok ? 'ok' : 'err');
+  setTimeout(()=>location.reload(), 400);
+}
+async function delTask(id) {
+  if (!confirm('删除该扫描任务？（历史扫描记录保留）')) return;
+  const res = await postEmpty('/api/tasks/' + id, 'DELETE');
+  if (res.ok) { toast('已删除', 'ok'); setTimeout(()=>location.reload(), 600); } else toast(res.json.error || '失败', 'err');
+}
+setInterval(async () => {
+  const r = await fetch('/api/status'); const j = await r.json();
+  const banner = document.querySelector('.run-banner');
+  if (j.running || banner) location.reload();
+}, 5000);
+</script>
+{{template "foot" .}}{{end}}

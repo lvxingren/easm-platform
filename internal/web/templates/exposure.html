@@ -1,0 +1,146 @@
+{{define "exposure.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">跨扫描聚合所有已探明的开放端口，便于像资产库一样检索和导出。「最近发现」表示最后一次扫描探明时间，不代表实时在线探测；单次扫描的完整结果仍可在扫描详情中查看。勾选条目可批量加入白名单或修改关联资产标签。</p>
+
+<div class="panel">
+  <div class="panel-title">筛选与检索</div>
+  <form method="get" action="/exposure" class="filter-bar">
+    <label class="field grow">IP 或服务<input name="q" value="{{.Query}}" placeholder="例如 1.2.3.4"></label>
+    <label class="field">端口<input type="number" name="port" min="1" max="65535" value="{{if .Port}}{{.Port}}{{end}}" placeholder="全部"></label>
+    <label class="field">协议<select name="proto"><option value="">全部</option><option value="tcp" {{if eq .Proto "tcp"}}selected{{end}}>TCP</option><option value="udp" {{if eq .Proto "udp"}}selected{{end}}>UDP</option></select></label>
+    <button class="btn primary" type="submit">查询</button>
+    <a class="btn ghost" href="/exposure">重置</a>
+    <a class="btn" href="/exposure/export?q={{urlquery .Query}}&proto={{.Proto}}&port={{.Port}}">导出 CSV</a>
+  </form>
+</div>
+
+{{if ne .Role "viewer"}}
+<div class="panel" id="exposure-batch" style="display:none">
+  <div class="panel-title">批量操作</div>
+  <div class="row">
+    <strong id="exposure-count">已选 0 项</strong>
+    <button class="btn primary" type="button" onclick="batchWhitelist()">批量加白</button>
+    <button class="btn" type="button" onclick="openExposureTags()">批量改关联资产标签</button>
+    <button class="btn ghost" type="button" onclick="clearExposureSelection()">取消选择</button>
+    <span class="muted">加白按「IP + 端口 + 协议」精确匹配；改标签按 IP 匹配台账资产（不在台账的 IP 会跳过）。</span>
+  </div>
+</div>
+{{end}}
+
+<div class="section-head"><h2>开放端口资产（{{len .Items}} 条，最多展示 1000 条）</h2></div>
+<div class="table-wrap">
+<table>
+  <thead><tr>{{if ne .Role "viewer"}}<th style="width:36px"><input type="checkbox" onclick="toggleAllChecks(this,'exposure-check');updateExposureBatch()" title="全选/取消"></th>{{end}}<th>资产</th><th>协议</th><th>服务</th><th>白名单</th><th>告警</th><th>首次发现</th><th>最近发现</th><th>出现次数</th><th>操作</th></tr></thead>
+  <tbody>
+  {{range .Items}}
+  <tr>
+    {{if ne $.Role "viewer"}}<td><input type="checkbox" class="exposure-check" data-ip="{{.IP}}" data-port="{{.Port}}" data-proto="{{.Proto}}" data-service="{{.Service}}" onclick="updateExposureBatch()"></td>{{end}}
+    <td><strong>{{.IP}}:{{.Port}}</strong></td>
+    <td>{{.Proto}}</td>
+    <td>{{if .Service}}{{.Service}}{{else}}<span class="muted">未识别</span>{{end}}</td>
+    <td>{{if .Whitelisted}}<span class="pill ok">已加白</span>{{else}}<span class="pill run">未加白</span>{{end}}</td>
+    <td>{{if .AlertStatus}}{{if eq .AlertStatus "new"}}<span class="pill err">{{alertStatusName .AlertStatus}}</span>{{else if eq .AlertStatus "acked"}}<span class="pill run">{{alertStatusName .AlertStatus}}</span>{{else}}<span class="pill mute">{{alertStatusName .AlertStatus}}</span>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{fmtTime .FirstSeenAt}}</td><td>{{fmtTime .LastSeenAt}}</td><td class="num-cell">{{.SeenCount}}</td>
+    <td><div class="btn-group"><a class="btn small ghost" href="/scans/{{.LastScanID}}">最近扫描</a> <a class="btn small ghost" href="/alerts?q={{urlquery .IP}}">相关告警</a>{{if and (ne $.Role "viewer") (not .Whitelisted)}}<button class="btn small" type="button" onclick="whitelistOne('{{.IP}}','{{.Port}}','{{.Proto}}','{{.Service}}')">加白</button>{{end}}</div></td>
+  </tr>
+  {{else}}
+  <tr><td colspan="10"><div class="empty"><div class="big">没有匹配的暴露面记录</div>先运行扫描任务，或调整查询条件</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+{{if ne .Role "viewer"}}
+<!-- 批量修改关联资产标签 -->
+<div class="modal-mask" id="exposure-tags-modal" style="display:none" onclick="modalBackdrop(event,'exposure-tags-modal')">
+  <div class="modal">
+    <div class="modal-head"><h3>批量修改关联资产标签</h3><button class="modal-close" type="button" onclick="closeModal('exposure-tags-modal')">×</button></div>
+    <div class="modal-body">
+      <div class="stack">
+        <label class="field">标签（逗号分隔）<input id="exposure-tags-input" placeholder="如：待核查,生产"></label>
+        <label class="field">方式<select id="exposure-tags-mode">
+          <option value="append">追加（保留原有）</option>
+          <option value="set">覆盖（替换）</option>
+          <option value="clear">清空标签</option>
+        </select></label>
+        <p class="hint" id="exposure-tags-target" style="margin:0"></p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('exposure-tags-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitExposureTags()">应用</button>
+    </div>
+  </div>
+</div>
+<script>
+function exposureSelected() {
+  return Array.from(document.querySelectorAll('.exposure-check:checked'));
+}
+function updateExposureBatch() {
+  const n = exposureSelected().length;
+  const bar = document.getElementById('exposure-batch');
+  if (bar) bar.style.display = n ? 'block' : 'none';
+  const c = document.getElementById('exposure-count');
+  if (c) c.textContent = '已选 ' + n + ' 项';
+}
+function clearExposureSelection() {
+  document.querySelectorAll('.exposure-check').forEach(c => { c.checked = false; });
+  const master = document.querySelector('thead input[type=checkbox]');
+  if (master) master.checked = false;
+  updateExposureBatch();
+}
+async function whitelistOne(ip, port, proto, service) {
+  if (!confirm(`将 ${ip}:${port}/${proto || 'tcp'} 加入白名单？`)) return;
+  const body = new FormData();
+  body.append('ip_spec', ip); body.append('port_spec', String(port)); body.append('proto', proto || 'tcp');
+  if (service) body.append('service', service);
+  body.append('remark', '暴露面确认放行');
+  const res = await postForm('/api/whitelist', body);
+  if (res.ok) { toast('已加入白名单', 'ok'); setTimeout(() => location.reload(), 600); }
+  else toast(res.json.error || '加白失败', 'err');
+}
+async function batchWhitelist() {
+  const rows = exposureSelected();
+  if (!rows.length) { toast('请先勾选暴露面条目', 'err'); return; }
+  if (!confirm(`将选中的 ${rows.length} 个 IP:端口 加入白名单？`)) return;
+  const body = new FormData();
+  rows.forEach(c => {
+    body.append('ip', c.dataset.ip);
+    body.append('port', c.dataset.port);
+    body.append('proto', c.dataset.proto || 'tcp');
+    body.append('service', c.dataset.service || '');
+  });
+  const res = await postForm('/api/exposure/whitelist', body);
+  if (res.ok) {
+    toast(`已加白 ${res.json.added} 条${res.json.skipped ? '，跳过 ' + res.json.skipped + ' 条' : ''}`, 'ok');
+    setTimeout(() => location.reload(), 700);
+  } else toast(res.json.error || '批量加白失败', 'err');
+}
+function openExposureTags() {
+  const ips = Array.from(new Set(exposureSelected().map(c => c.dataset.ip)));
+  if (!ips.length) { toast('请先勾选条目', 'err'); return; }
+  document.getElementById('exposure-tags-input').value = '';
+  document.getElementById('exposure-tags-mode').value = 'append';
+  document.getElementById('exposure-tags-target').textContent = '按选中 ' + ips.length + ' 个 IP 匹配台账资产并改标签；不在台账中的 IP 会被跳过。';
+  openModal('exposure-tags-modal');
+}
+async function submitExposureTags() {
+  const ips = Array.from(new Set(exposureSelected().map(c => c.dataset.ip)));
+  if (!ips.length) { toast('请先勾选条目', 'err'); return; }
+  let mode = document.getElementById('exposure-tags-mode').value;
+  let tags = document.getElementById('exposure-tags-input').value.trim();
+  if (mode === 'clear') { mode = 'set'; tags = ''; }
+  if (mode === 'append' && !tags) { toast('追加模式需填写标签', 'err'); return; }
+  const body = new FormData();
+  body.append('mode', mode);
+  body.append('tags', tags);
+  ips.forEach(ip => body.append('ips', ip));
+  const res = await postForm('/api/targets/batch-tags', body);
+  if (res.ok) {
+    let m = '已更新 ' + res.json.updated + ' 个资产标签';
+    if (res.json.ip_count && res.json.matched_by_ip < res.json.ip_count) m += '（' + res.json.ip_count + ' 个 IP 中 ' + res.json.matched_by_ip + ' 个在台账）';
+    toast(m, 'ok'); closeModal('exposure-tags-modal'); setTimeout(() => location.reload(), 700);
+  } else { toast(res.json.error || '批量改标签失败', 'err'); }
+}
+</script>
+{{end}}
+{{template "foot" .}}{{end}}

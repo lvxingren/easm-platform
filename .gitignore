@@ -1,0 +1,69 @@
+# =========================================================
+# 灵瞰 EASM 平台 · .gitignore
+# 安全优先：严禁提交运行时数据、数据库、证书私钥与含密钥的配置
+# =========================================================
+
+# ---- 运行时数据目录（数据库 / 扫描输出 / 证书 / 日志 / 上传文件）----
+# data/ 下包含 easm.db、备份库、data/certs/*.key 私钥、scan_<id>/batch_*.out、uploads 等
+data/
+
+# ---- 主配置文件（含飞书 webhook/secret、管理员密码等敏感项）----
+config.json
+# 如需提交模板，请使用不含密钥的 config.example.json（勿直接提交真实 config.json）
+!config.example.json
+
+# ---- 部署打包产物（含二进制与 config.json 副本，副本同样带密钥）----
+dist/
+
+# ---- 数据库文件（即使散落在其他目录也一律排除）----
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ---- 证书与私钥 ----
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# ---- 编译产物 / 二进制 ----
+/easm-platform
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# ---- Go 覆盖率 / profile ----
+coverage.out
+*.coverprofile
+
+# ---- 依赖目录（本项目用 go modules，不提交 vendor）----
+vendor/
+
+# ---- 临时冒烟/自验证产物 ----
+.smoke*/
+.smoke-*.sh
+
+# ---- 日志 ----
+*.log
+
+# ---- 操作系统 / 编辑器 ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

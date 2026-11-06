@@ -1,0 +1,187 @@
+{{define "settings.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">系统级配置，仅管理员可访问。各分类<b>独立保存、互不覆盖</b>：naabu / 通知 / 告警 / AI 类参数保存后立即生效；<b>网络监听与 HTTP/HTTPS 开关保存后需重启服务生效</b>，证书上传为热生效。非法值不会部分写入。</p>
+
+<div class="subnav">
+  <a href="#set-network">网络监听</a>
+  <a href="#set-cert">TLS 证书</a>
+  <a href="#set-notify">通知与告警</a>
+  <a href="#set-naabu">naabu 参数</a>
+  <a href="#set-ai">AI 分析</a>
+  <a href="#set-help">异常排查</a>
+</div>
+
+<!-- ① 网络监听 -->
+<div class="panel" id="set-network">
+  <div class="panel-title">网络监听（HTTP / HTTPS）</div>
+  <p class="panel-note">配置文件：<code>{{.ConfigPath}}</code>。监听端口在进程启动时绑定，修改开关或地址后需重启：<code>sudo systemctl restart easm</code>。</p>
+  <form id="network-form" class="grid">
+    <label class="check full"><input type="checkbox" name="http_enabled" {{if .HTTPEnabled}}checked{{end}}> 启用明文 HTTP<span class="field-help">关闭后仅保留 HTTPS；HTTP 与 HTTPS 至少启用一个。</span></label>
+    <label class="field">HTTP 监听地址<input name="listen" value="{{.Listen}}" placeholder="0.0.0.0:8000"><span class="field-help">host:port；0.0.0.0 表示所有网卡，127.0.0.1 仅本机。</span></label>
+    <label class="check" style="align-self:end"><input type="checkbox" name="https_enabled" {{if .HTTPSEnabled}}checked{{end}}> 启用 HTTPS</label>
+    <label class="field">HTTPS 监听地址<input name="https_listen" value="{{.HTTPSListen}}" placeholder="0.0.0.0:8443"><span class="field-help">host:port，常用 8443 或 443。</span></label>
+    <label class="field full">自签名证书 SAN 主机（逗号分隔）<input name="tls_hosts" value="{{.TLSHosts}}" placeholder="localhost, 127.0.0.1, easm.example.com"><span class="field-help">仅影响「自动生成」的自签名证书；上传正式证书后以证书自身 SAN 为准。修改后需删除旧证书并重启才会重签。</span></label>
+    <div class="row full">
+      <button type="submit" class="btn primary">保存网络配置</button>
+      <span class="muted">保存后需重启服务生效</span>
+    </div>
+  </form>
+  <div id="network-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+</div>
+
+<!-- ② TLS 证书 -->
+<div class="panel" id="set-cert">
+  <div class="panel-title">TLS 证书</div>
+  {{if .CertInfo}}
+  <div class="grid">
+    <div><div class="muted">颁发者 / 主体</div><strong>{{.CertInfo.Subject}}</strong><div class="muted">签发：{{.CertInfo.Issuer}}</div></div>
+    <div><div class="muted">有效期</div><strong>{{.CertInfo.NotBefore}} ~ {{.CertInfo.NotAfter}}</strong><div class="muted">剩余约 {{.CertInfo.DaysLeft}} 天{{if .CertInfo.SelfSigned}} · 自签名{{end}}</div></div>
+    <div class="full"><div class="muted">SAN</div><span class="command-text">DNS: {{range $i,$d := .CertInfo.DNSNames}}{{if $i}}, {{end}}{{$d}}{{end}}{{if .CertInfo.IPAddresses}}　IP: {{range $i,$p := .CertInfo.IPAddresses}}{{if $i}}, {{end}}{{$p}}{{end}}{{end}}</span></div>
+  </div>
+  <div class="hint">证书文件：<code>{{.TLSCert}}</code>　私钥文件：<code>{{.TLSKey}}</code></div>
+  {{else}}
+  <p class="panel-note">尚未生成证书。启用 HTTPS 后首次启动会自动生成约 100 年有效期的自签名证书到 <code>{{.TLSCert}}</code>；也可在下方上传正式证书。</p>
+  {{end}}
+
+  <div class="panel-title full" style="margin-top:14px">上传自定义证书（热生效，无需重启）</div>
+  <form id="cert-form" class="grid" enctype="multipart/form-data">
+    <label class="field">证书文件（.crt/.pem/.cer）<input type="file" name="cert_file" accept=".crt,.pem,.cer,.txt"></label>
+    <label class="field">私钥文件（.key/.pem）<input type="file" name="key_file" accept=".key,.pem,.txt"></label>
+    <label class="field full">或粘贴证书 PEM<textarea name="cert_pem" rows="4" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
+    <label class="field full">或粘贴私钥 PEM<textarea name="key_pem" rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
+    <div class="row full">
+      <button type="submit" class="btn primary">上传并启用证书</button>
+      <span class="muted">证书与私钥必须匹配；上传后立即对新连接生效。</span>
+    </div>
+  </form>
+  <div id="cert-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+</div>
+
+<!-- ③ 通知与告警 -->
+<div class="panel" id="set-notify">
+  <div class="panel-title">通知与告警</div>
+  <p class="panel-note">飞书机器人 Webhook 与加签密钥；任务结束推送一条汇总。保存后可点「发送飞书测试」验证通道。</p>
+  <form id="notify-form" class="grid">
+    <label class="field full">飞书 Webhook<input name="feishu_webhook" value="{{.FeishuWebhook}}" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxx"><span class="field-help">风险告警推送地址；留空表示不推送。仅允许飞书官方域名。</span></label>
+    <label class="field">飞书加签密钥<input name="feishu_secret" value="{{.FeishuSecret}}" placeholder="可选"><span class="field-help">机器人启用加签时填写。</span></label>
+    <label class="field">重告警周期（天）<input type="number" name="realert_days" min="1" max="3650" value="{{.RealertDays}}"><span class="field-help">同一未解决告警再次提醒的最短间隔。</span></label>
+    <label class="check full"><input type="checkbox" name="alert_out_of_scope" {{if .AlertOutOfScope}}checked{{end}}> 范围外发现也告警<span class="field-help">台账外 IP 探明开放端口时是否同样登记告警。</span></label>
+    <div class="row full">
+      <button type="submit" class="btn primary">保存通知配置</button>
+      <button type="button" class="btn" onclick="testFeishu()">发送飞书测试</button>
+    </div>
+  </form>
+  <div id="notify-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+</div>
+
+<!-- ④ naabu 参数（含资源监测） -->
+<div class="panel" id="set-naabu">
+  <div class="panel-title">naabu 扫描参数</div>
+  <p class="panel-note">扫描引擎路径与发包参数，保存后立即生效；点「检测 naabu」会实际执行 <code>naabu -version</code> 并校验全部参数。</p>
+  <form id="naabu-form" class="grid">
+    <label class="field full">naabu 路径<input name="naabu_path" value="{{.NaabuPath}}" placeholder="/usr/local/bin/naabu" required><span class="field-help">可执行文件路径，不是安装目录；后台服务建议填写绝对路径。</span></label>
+    <label class="field">发包速率（pps）<input type="number" name="naabu_rate" min="1" max="1000000" value="{{.NaabuRate}}" required><span class="field-help">每秒发包数。过高容易丢包或触发网络限流。</span></label>
+    <label class="field">重试次数<input type="number" name="naabu_retries" min="0" max="10" value="{{.NaabuRetries}}" required><span class="field-help">无响应端口的重试次数；增加后更稳，但扫描更慢。</span></label>
+    <label class="field">任务总超时（分钟）<input type="number" name="scan_timeout_min" min="1" max="1440" value="{{.ScanTimeout}}" required><span class="field-help">整个任务的有效扫描时间；暂停时长不计入，超时后终止并保留已输出结果。</span></label>
+    <label class="field">扫描方式
+      <select name="naabu_scan_type"><option value="c" {{if eq .NaabuScanType "c"}}selected{{end}}>CONNECT（默认）</option><option value="s" {{if eq .NaabuScanType "s"}}selected{{end}}>SYN</option></select>
+      <span class="field-help">CONNECT 权限要求低；SYN 通常更快，但需要 root 或 CAP_NET_RAW。</span>
+    </label>
+    <label class="field">响应等待时间<input name="naabu_timeout" value="{{.NaabuTimeout}}" placeholder="1s" required><span class="field-help">单次探测等待时长，如 500ms、1s、2s；过短可能漏报。</span></label>
+    <label class="field">内部并发线程<input type="number" name="naabu_workers" min="1" max="1000" value="{{.NaabuWorkers}}" required><span class="field-help">naabu 内部 worker 数，默认 25；过高会增加 CPU 和连接压力。</span></label>
+    <label class="field">排除端口（可选）<input name="naabu_exclude_ports" value="{{.NaabuExcludePorts}}" placeholder="22,8000-9000"><span class="field-help">本次以后所有任务都跳过这些端口，支持逗号和范围。</span></label>
+    <label class="field">指定网卡（可选）<input name="naabu_interface" value="{{.NaabuInterface}}" placeholder="eth0 或 en0"><span class="field-help">多网卡服务器使用；留空由 naabu 自动选择。</span></label>
+    <label class="check full" style="align-self:end"><input type="checkbox" name="naabu_verify" {{if .NaabuVerify}}checked{{end}}> 使用 TCP 二次验证开放端口<span class="field-help">降低误报，但会增加连接数和扫描耗时。</span></label>
+
+    <div class="panel-title full" style="margin-top:16px">资源监测（naabu 进程）</div>
+    <label class="check full"><input type="checkbox" name="resource_monitor" {{if .ResourceMonitor}}checked{{end}}> 监测当前 naabu 进程资源占用<span class="field-help">每 5 秒采样 CPU 和 RSS；仅告警，不自动暂停或终止。</span></label>
+    <label class="field">CPU 告警阈值（%）<input type="number" name="resource_cpu_percent" min="1" max="100" value="{{.ResourceCPU}}" required><span class="field-help">100% 表示占满一个逻辑核，默认 90%。</span></label>
+    <label class="field">内存告警阈值（MiB）<input type="number" name="resource_memory_mb" min="1" max="1048576" value="{{.ResourceMemory}}" required><span class="field-help">naabu 进程 RSS，默认 1024 MiB。</span></label>
+    <label class="field">持续时长（秒）<input type="number" name="resource_duration_sec" min="5" max="3600" value="{{.ResourceDuration}}" required><span class="field-help">CPU 或内存任一指标持续超阈值才告警，默认 30 秒。</span></label>
+
+    <div class="row full">
+      <button type="submit" class="btn primary">保存 naabu 配置</button>
+      <button type="button" class="btn" onclick="checkNaabu()">检测 naabu</button>
+    </div>
+  </form>
+  <div id="naabu-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+</div>
+
+<!-- ⑤ AI 分析 -->
+<div class="panel" id="set-ai">
+  <div class="panel-title">AI 分析（网络流量 / 安全设备日志溯源）</div>
+  <p class="panel-note">OpenAI 兼容接口配置；留空端点则用内置规则降级分析（离线可用）。Token 存于服务器数据库、仅用于调用 AI，不写日志。</p>
+  <form id="ai-form" class="grid">
+    <label class="field full">模型端点 URL<input name="ai_endpoint" value="{{.AiEndpoint}}" placeholder="https://api.deepseek.com/v1 或 https://.../compatible-mode/v1"><span class="field-help">需 HTTPS（仅本地 localhost 可用 HTTP 测试），系统自动追加 /chat/completions。留空则用内置规则降级分析。</span></label>
+    <label class="field">鉴权 Token（API Key）<input type="password" name="ai_key" autocomplete="new-password" placeholder="{{if .AiKeySet}}已配置，留空则不修改{{else}}sk-...{{end}}"><span class="field-help">存于服务器数据库、仅用于调用 AI，不写日志。</span></label>
+    <label class="field">模型名称<input name="ai_model" value="{{.AiModel}}" placeholder="gpt-4o-mini / deepseek-chat / qwen-plus"><span class="field-help">端点提供的模型标识。</span></label>
+    <label class="field">超时（秒）<input type="number" name="ai_timeout_sec" min="5" max="600" value="{{.AiTimeout}}" required><span class="field-help">单次 AI 调用超时，默认 60。</span></label>
+    <label class="field">温度（0-2）<input type="number" name="ai_temperature" min="0" max="2" step="0.1" value="{{.AiTemperature}}" required><span class="field-help">越低越确定，分析类任务建议 0-0.3。</span></label>
+    <div class="row full">
+      <button type="submit" class="btn primary">保存 AI 配置</button>
+      <button type="button" class="btn" onclick="testAI()">测试 AI 连接</button>
+    </div>
+  </form>
+  <div id="ai-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+</div>
+
+<!-- ⑥ 异常排查说明 -->
+<div class="panel" id="set-help">
+  <div class="panel-title">异常排查说明</div>
+  <p class="hint">检测会实际执行 <code>naabu -version</code>，同时校验全部参数。路径不存在、无执行权限、架构不匹配、版本命令超时及参数错误会在对应面板的结果框显示完整原因。扫描中的进程异常、标准输出、错误输出和总超时会记录在「执行记录 → 查看详情」。</p>
+</div>
+
+<script>
+function showResult(boxId, message, isError) {
+  const box = document.getElementById(boxId);
+  if (!box) return;
+  box.style.display = 'block';
+  box.style.borderColor = isError ? 'var(--danger-soft-border)' : 'var(--success)';
+  box.textContent = message;
+}
+// 通知 / naabu / AI 三类均 POST /api/settings，后端按提交字段部分更新，互不覆盖
+function bindSettingsForm(formId, boxId, okMsg) {
+  const form = document.getElementById(formId);
+  if (!form) return;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    showResult(boxId, '正在保存……', false);
+    const res = await postForm('/api/settings', new FormData(e.target));
+    showResult(boxId, res.ok ? okMsg : (res.json.error || '保存失败'), !res.ok);
+  });
+}
+bindSettingsForm('notify-form', 'notify-result', '通知与告警配置已保存并生效。');
+bindSettingsForm('naabu-form', 'naabu-result', 'naabu 参数已保存并生效。');
+bindSettingsForm('ai-form', 'ai-result', 'AI 分析配置已保存并生效。');
+
+document.getElementById('network-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  showResult('network-result', '正在保存……', false);
+  const res = await postForm('/api/settings/network', new FormData(e.target));
+  showResult('network-result', res.ok ? (res.json.message || '网络配置已保存，重启服务后生效。') : (res.json.error || '保存失败'), !res.ok);
+});
+document.getElementById('cert-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  showResult('cert-result', '正在校验并写入证书……', false);
+  const res = await postForm('/api/settings/cert', new FormData(e.target));
+  if (res.ok) { showResult('cert-result', res.json.message || '证书已上传并热生效。', false); setTimeout(() => location.reload(), 1200); }
+  else showResult('cert-result', res.json.error || '证书上传失败', true);
+});
+
+async function testFeishu() {
+  const res = await postEmpty('/api/settings/test-feishu');
+  showResult('notify-result', res.ok ? '测试消息已发送，请查看飞书群。' : (res.json.error || '发送失败'), !res.ok);
+}
+async function checkNaabu() {
+  showResult('naabu-result', '正在校验参数并执行 naabu -version，请稍候……', false);
+  const res = await postEmpty('/api/settings/check-naabu');
+  if (res.ok) showResult('naabu-result', '检测通过\n路径：' + res.json.path + '\n版本信息：\n' + res.json.version, false);
+  else showResult('naabu-result', res.json.error || '检测失败', true);
+}
+async function testAI() {
+  showResult('ai-result', '正在测试已保存的 AI 端点连通性与鉴权（如刚修改请先保存配置）……', false);
+  const res = await postEmpty('/api/settings/test-ai');
+  if (res.ok) showResult('ai-result', 'AI 连接正常。', false);
+  else showResult('ai-result', res.json.error || 'AI 连接失败', true);
+}
+</script>
+{{template "foot" .}}{{end}}

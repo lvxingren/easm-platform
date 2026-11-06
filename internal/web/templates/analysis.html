@@ -1,0 +1,81 @@
+{{define "analysis.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">导入 CFW 防火墙 / ECS 云主机的网络流量或安全组日志，自动解析资产间通信关系，并借助 AI 还原网络拓扑、识别异常通信、给出可追溯的攻击溯源路径。原始上传文件保留以供复核与导出。</p>
+
+{{if ne .Role "viewer"}}
+<div class="panel">
+  <div class="panel-title">新建分析</div>
+  <div class="row">
+    <button class="btn primary" type="button" onclick="openModal('new-analysis-modal')">新建分析（上传日志）</button>
+    <span class="muted">支持 CSV / JSON / TXT / XLSX，自动识别 src_ip、dst_ip、端口、协议、动作、时间等列。</span>
+  </div>
+</div>
+{{end}}
+
+<div class="section-head"><h2>分析记录（{{len .Items}} 条）</h2></div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ID</th><th>名称</th><th>来源</th><th>状态</th><th>文件</th><th>通信关系</th><th>创建时间</th><th>操作</th></tr></thead>
+  <tbody>
+  {{range .Items}}
+  <tr>
+    <td class="num-cell">{{.ID}}</td>
+    <td>{{.Name}}</td>
+    <td>{{if eq .SourceType "cfw"}}CFW 防火墙{{else if eq .SourceType "ecs"}}ECS 云主机{{else}}其他{{end}}</td>
+    <td><span class="pill {{analysisStatusClass .Status}}">{{analysisStatusName .Status}}</span>{{if .UsedMock}} <span class="pill mute">规则降级</span>{{end}}</td>
+    <td class="num-cell">{{.FileCount}}</td>
+    <td class="num-cell">{{.EdgeCount}}</td>
+    <td>{{fmtTime .CreatedAt}}</td>
+    <td>
+      <div class="btn-group">
+        <a class="btn small ghost" href="/analysis/{{.ID}}">查看</a>
+        {{if ne $.Role "viewer"}}<button class="btn small danger" type="button" onclick="delAnalysis({{.ID}})">删除</button>{{end}}
+      </div>
+    </td>
+  </tr>
+  {{else}}
+  <tr><td colspan="8"><div class="empty"><div class="big">还没有分析记录</div>上传 CFW / ECS 日志，开始第一次流量溯源分析{{if ne $.Role "viewer"}}<div class="btn-group" style="justify-content:center;margin-top:14px"><button class="btn primary" type="button" onclick="openModal('new-analysis-modal')">新建分析</button></div>{{end}}</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+{{if ne .Role "viewer"}}
+<div class="modal-mask" id="new-analysis-modal" style="display:none" onclick="modalBackdrop(event,'new-analysis-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>新建流量分析</h3><button class="modal-close" type="button" onclick="closeModal('new-analysis-modal')">×</button></div>
+    <div class="modal-body">
+      <form id="analysis-form" class="stack" enctype="multipart/form-data">
+        <label class="field">分析名称<input name="name" placeholder="如：生产网 CFW 日志 1106（留空自动命名）"></label>
+        <label class="field">日志来源<select name="source_type">
+          <option value="cfw">CFW 防火墙</option>
+          <option value="ecs">ECS 云主机</option>
+          <option value="other">其他</option>
+        </select></label>
+        <label class="field">日志文件（可多选）<input type="file" name="files" multiple accept=".csv,.json,.txt,.log,.tsv,.xlsx,.xlsm"></label>
+        <p class="hint" style="margin:0">文件需包含源/目的 IP、端口、协议等字段（列头名会自动识别，支持中英文常见写法）。原始文件会保留在服务器 data/uploads 下。</p>
+      </form>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('new-analysis-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitAnalysis()">开始分析</button>
+    </div>
+  </div>
+</div>
+<script>
+async function submitAnalysis() {
+  const form = document.getElementById('analysis-form');
+  const files = form.querySelector('[name=files]').files;
+  if (!files.length) { toast('请选择至少一个日志文件', 'err'); return; }
+  const res = await postForm('/api/analysis', new FormData(form));
+  if (res.ok) { toast('已创建，正在解析与分析', 'ok'); location.href = '/analysis/' + res.json.id; }
+  else toast(res.json.error || '创建失败', 'err');
+}
+async function delAnalysis(id) {
+  if (!confirm('删除该分析记录及其上传的原始文件？')) return;
+  const res = await postEmpty('/api/analysis/' + id, 'DELETE');
+  if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.reload(), 500); }
+  else toast(res.json.error || '失败', 'err');
+}
+</script>
+{{end}}
+{{template "foot" .}}{{end}}

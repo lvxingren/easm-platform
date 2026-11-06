@@ -1,0 +1,150 @@
+{{define "alerts.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">非白名单开放端口会形成风险告警。请按实际处置选择「跟进中 / 已解决 / 已忽略」并填写说明；已解决端口再次被发现会自动重开，已忽略不再提醒。确认业务放行时可直接加入白名单。勾选多条可批量处置。</p>
+
+<div class="panel">
+  <div class="panel-title">筛选与检索</div>
+  <form method="get" action="/alerts" class="filter-bar">
+    <label class="field grow">检索告警<input name="q" value="{{.Query}}" placeholder="IP、端口、服务、处理人或说明"></label>
+    <label class="field">状态<select name="status">
+      <option value="">全部</option><option value="new" {{if eq .Status "new"}}selected{{end}}>待处理</option>
+      <option value="acked" {{if eq .Status "acked"}}selected{{end}}>跟进中</option><option value="resolved" {{if eq .Status "resolved"}}selected{{end}}>已解决</option>
+      <option value="ignored" {{if eq .Status "ignored"}}selected{{end}}>已忽略</option>
+    </select></label>
+    <button class="btn primary" type="submit">查询</button><a class="btn ghost" href="/alerts">重置</a>
+    <a class="btn" href="/alerts/export?q={{urlquery .Query}}&status={{.Status}}">导出 CSV</a>
+  </form>
+</div>
+
+{{if ne .Role "viewer"}}
+<div class="panel">
+  <div class="panel-title">批量处置</div>
+  <div class="row" style="align-items:flex-end">
+    <label class="field">批量状态<select id="batch-status">
+      <option value="acked">跟进中</option>
+      <option value="resolved">已解决（再次发现会自动重开）</option>
+      <option value="ignored">已忽略（不再提醒）</option>
+      <option value="new">重新打开</option>
+    </select></label>
+    <label class="field grow">统一处理说明<input id="batch-note" placeholder="解决 / 忽略必填；跟进中可留空"></label>
+    <button class="btn primary batch-btn" type="button" onclick="batchAction(document.getElementById('batch-status').value)" disabled>批量处置</button>
+    <button class="btn batch-btn" type="button" onclick="batchAction('whitelist')" disabled>批量加白并忽略</button>
+    <button class="btn batch-btn" type="button" onclick="openAlertBatchTags()" disabled>批量改资产标签</button>
+    <span class="muted" id="batch-count">未选择</span>
+  </div>
+  <p class="hint" style="margin:10px 0 0">批量操作会记录当前账号与审计流水；「批量加白并忽略」为每条告警新增 IP+端口+协议的精确白名单并标记为已忽略。</p>
+</div>
+{{end}}
+
+<div class="section-head"><h2>告警记录（{{len .Alerts}} 条，最多展示 500 条）</h2></div>
+<div class="table-wrap">
+<table>
+  <thead><tr>{{if ne .Role "viewer"}}<th style="width:36px"><input type="checkbox" id="check-all" onclick="toggleAll(this)" title="全选/取消"></th>{{end}}<th>资产</th><th>服务</th><th>范围</th><th>状态</th><th>最近发现</th><th>处理人 / 说明</th><th>飞书</th>{{if ne .Role "viewer"}}<th>操作</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Alerts}}
+  <tr>
+    {{if ne $.Role "viewer"}}<td><input type="checkbox" class="alert-check" value="{{.ID}}" data-ip="{{.IP}}" onclick="updateBatchCount()"></td>{{end}}
+    <td><a href="/exposure?q={{urlquery .IP}}&port={{.Port}}"><strong>{{.IP}}:{{.Port}}</strong></a><div class="muted">{{.Proto}}</div></td>
+    <td>{{if .Service}}{{.Service}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{if .InScope}}<span class="pill info">范围内</span>{{else}}<span class="pill mute">范围外</span>{{end}}</td>
+    <td>{{if eq .Status "new"}}<span class="pill err">待处理</span>{{else if eq .Status "acked"}}<span class="pill run">跟进中</span>{{else}}<span class="pill mute">{{alertStatusName .Status}}</span>{{end}}</td>
+    <td>{{fmtTime .LastSeenAt}}<div class="muted">首次 {{fmtTime .FirstSeenAt}}</div></td>
+    <td>{{if .Handler}}{{.Handler}}{{else}}<span class="muted">—</span>{{end}}<div class="muted wrap-note" title="{{.HandleNote}}">{{if .HandleNote}}{{.HandleNote}}{{else}}—{{end}}</div></td>
+    <td>{{if .SentFeishu}}<span class="pill ok">已推送</span>{{else}}<span class="muted">未推送</span>{{end}}</td>
+    {{if ne $.Role "viewer"}}<td><div class="btn-group"><a class="btn small" href="/alerts/{{.ID}}?status={{urlquery $.Status}}&q={{urlquery $.Query}}">处置</a><button class="btn small ghost" type="button" data-id="{{.ID}}" data-ip="{{.IP}}" data-port="{{.Port}}" data-proto="{{.Proto}}" onclick="alertWhitelist(this)">加白</button></div></td>{{end}}
+  </tr>
+  {{else}}
+  <tr><td colspan="9"><div class="empty"><div class="big">没有匹配的告警</div>可调整筛选条件；新扫描发现的非白名单端口会在此登记</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+{{if ne .Role "viewer"}}
+<!-- 批量修改关联资产标签模态 -->
+<div class="modal-mask" id="alert-tags-modal" style="display:none" onclick="modalBackdrop(event,'alert-tags-modal')">
+  <div class="modal">
+    <div class="modal-head"><h3>批量修改关联资产标签</h3><button class="modal-close" type="button" onclick="closeModal('alert-tags-modal')">×</button></div>
+    <div class="modal-body">
+      <div class="stack">
+        <label class="field">标签（逗号分隔）<input id="alert-tags-input" placeholder="如：待核查,生产"></label>
+        <label class="field">方式<select id="alert-tags-mode">
+          <option value="append">追加（保留原有）</option>
+          <option value="set">覆盖（替换）</option>
+          <option value="clear">清空标签</option>
+        </select></label>
+        <p class="hint" id="alert-tags-target" style="margin:0"></p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('alert-tags-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitAlertBatchTags()">应用</button>
+    </div>
+  </div>
+</div>
+<script>
+function selectedIds() {
+  return Array.from(document.querySelectorAll('.alert-check:checked')).map(c => c.value);
+}
+function toggleAll(master) {
+  document.querySelectorAll('.alert-check').forEach(c => { c.checked = master.checked; });
+  updateBatchCount();
+}
+function updateBatchCount() {
+  const n = selectedIds().length;
+  const el = document.getElementById('batch-count');
+  if (el) el.textContent = n ? `已选 ${n} 条` : '未选择';
+  document.querySelectorAll('.batch-btn').forEach(b => { b.disabled = n === 0; });
+}
+async function alertWhitelist(btn) {
+  const ip = btn.dataset.ip, port = btn.dataset.port, proto = btn.dataset.proto || 'tcp';
+  if (!confirm(`将 ${ip}:${port}/${proto} 加入白名单并标记已忽略？`)) return;
+  const res = await postForm('/api/alerts/' + btn.dataset.id + '/whitelist', new FormData());
+  if (res.ok) { toast('已加白并忽略', 'ok'); setTimeout(() => location.reload(), 500); }
+  else toast(res.json.error || '加白失败', 'err');
+}
+async function batchAction(action) {
+  const ids = selectedIds();
+  if (!ids.length) { toast('请先勾选要处置的告警', 'err'); return; }
+  const note = document.getElementById('batch-note').value.trim();
+  if ((action === 'resolved' || action === 'ignored') && !note) { toast('解决或忽略需要填写统一说明', 'err'); return; }
+  if (action === 'whitelist' && !confirm(`将选中的 ${ids.length} 条告警对应端口加入白名单并忽略？`)) return;
+  const body = new FormData();
+  body.append('action', action);
+  body.append('note', note);
+  ids.forEach(id => body.append('ids', id));
+  const res = await postForm('/api/alerts/batch', body);
+  if (res.ok) { toast('批量处置完成', 'ok'); setTimeout(() => location.reload(), 500); }
+  else { toast(res.json.error || '批量处置失败', 'err'); }
+}
+function selectedAlertIPs() {
+  return Array.from(document.querySelectorAll('.alert-check:checked')).map(c => c.dataset.ip).filter(Boolean);
+}
+function openAlertBatchTags() {
+  const ips = selectedAlertIPs();
+  if (!ips.length) { toast('请先勾选告警', 'err'); return; }
+  document.getElementById('alert-tags-input').value = '';
+  document.getElementById('alert-tags-mode').value = 'append';
+  document.getElementById('alert-tags-target').textContent = '按选中告警的 ' + ips.length + ' 个 IP 匹配台账资产并改标签；不在台账中的 IP（如网段/范围资产或范围外）会被跳过。';
+  openModal('alert-tags-modal');
+}
+async function submitAlertBatchTags() {
+  const ips = selectedAlertIPs();
+  if (!ips.length) { toast('请先勾选告警', 'err'); return; }
+  let mode = document.getElementById('alert-tags-mode').value;
+  let tags = document.getElementById('alert-tags-input').value.trim();
+  if (mode === 'clear') { mode = 'set'; tags = ''; }
+  if (mode === 'append' && !tags) { toast('追加模式需填写标签', 'err'); return; }
+  const body = new FormData();
+  body.append('mode', mode);
+  body.append('tags', tags);
+  ips.forEach(ip => body.append('ips', ip));
+  const res = await postForm('/api/targets/batch-tags', body);
+  if (res.ok) {
+    let m = '已更新 ' + res.json.updated + ' 个资产标签';
+    if (res.json.ip_count && res.json.matched_by_ip < res.json.ip_count) m += '（' + res.json.ip_count + ' 个 IP 中 ' + res.json.matched_by_ip + ' 个在台账）';
+    toast(m, 'ok'); closeModal('alert-tags-modal'); setTimeout(() => location.reload(), 700);
+  } else { toast(res.json.error || '批量改标签失败', 'err'); }
+}
+</script>
+{{end}}
+{{template "foot" .}}{{end}}

@@ -1,0 +1,55 @@
+{{define "index.html"}}{{template "head" .}}{{template "nav" .}}
+
+<div class="cards">
+  <div class="card"><div class="num">{{.TargetCount}}</div><div class="label">监控资产</div></div>
+  <div class="card ok"><div class="num">{{.ScanCount}}</div><div class="label">累计扫描</div></div>
+  <a class="card warn" href="/exposure"><div class="num">{{.ExposureCount}}</div><div class="label">已探明开放端口</div></a>
+  <a class="card alert" href="/alerts"><div class="num">{{.NewAlerts}}</div><div class="label">未处理告警</div></a>
+</div>
+
+{{if .Running}}<div class="run-banner">● 有扫描正在运行或处于暂停状态；正常完成后才会自动比对白名单并推送端口风险告警。</div>{{end}}
+
+<div class="section-head">
+  <h2>最近扫描</h2>
+  <div class="row"><a class="btn small" href="/tasks">扫描任务</a><a class="btn small ghost" href="/scans">全部记录</a></div>
+</div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ID</th><th>任务</th><th>模式</th><th>状态</th><th>开始</th><th>开放端口</th><th></th></tr></thead>
+  <tbody>
+  {{range .Scans}}
+  <tr>
+    <td class="num-cell">{{.ID}}</td><td>{{.Name}}</td><td>{{modeName .Mode}}</td>
+    <td><span class="pill {{scanStatusClass .Status}}">{{scanStatusName .Status}}</span></td>
+    <td>{{fmtTime .StartedAt}}</td><td class="num-cell">{{.OpenPorts}}</td>
+    <td>{{if gt .OpenPorts 0}}<a class="btn small ghost" href="/scans/{{.ID}}">查看端口</a>{{end}}</td>
+  </tr>
+  {{else}}
+  <tr><td colspan="7"><div class="empty"><div class="big">还没有扫描记录</div>去「扫描任务」新建一个任务并开始扫描<div class="btn-group" style="justify-content:center;margin-top:14px"><a class="btn" href="/tasks">前往扫描任务</a></div></div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+<div class="section-head">
+  <h2>最近告警</h2>
+  <a class="btn small ghost" href="/alerts">全部告警</a>
+</div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>资产</th><th>协议</th><th>范围</th><th>状态</th><th>最近发现</th></tr></thead>
+  <tbody>
+  {{range .Alerts}}
+  <tr>
+    <td>{{.IP}}:{{.Port}}</td><td>{{.Proto}}</td>
+    <td>{{if .InScope}}<span class="pill info">范围内</span>{{else}}<span class="pill mute">范围外</span>{{end}}</td>
+    <td>{{if eq .Status "new"}}<span class="pill err">待处理</span>{{else if eq .Status "acked"}}<span class="pill run">跟进中</span>{{else}}<span class="pill mute">{{alertStatusName .Status}}</span>{{end}}</td>
+    <td>{{fmtTime .LastSeenAt}}</td>
+  </tr>
+  {{else}}
+  <tr><td colspan="5"><div class="empty"><div class="big">暂无告警</div>扫描到不在白名单的开放端口时会在此登记</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{template "foot" .}}{{end}}

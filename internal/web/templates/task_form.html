@@ -1,0 +1,145 @@
+{{define "task_form.html"}}{{template "head" .}}{{template "nav" .}}
+<div class="panel" style="max-width:780px">
+  <div class="panel-title">{{if .Editing}}编辑任务 #{{.Task.ID}}{{else}}新建扫描任务{{end}}</div>
+  <form id="task-form" class="grid">
+    <label class="field">任务名称<input name="name" value="{{.Task.Name}}" placeholder="如：核心业务全端口周扫" required></label>
+    <label class="field">扫描模式
+      <select name="mode" id="scan-mode" onchange="toggleTaskFields()">
+        <option value="top" {{if and (ne .Task.Mode "full") (ne .Task.Mode "custom")}}selected{{end}}>常用端口 top-1000</option>
+        <option value="full" {{if eq .Task.Mode "full"}}selected{{end}}>全端口 1-65535</option>
+        <option value="custom" {{if eq .Task.Mode "custom"}}selected{{end}}>自定义端口</option>
+      </select>
+      <span class="field-help" id="mode-help">Top 1000 常用端口基于 Shodan/Censys 统计，适合快速摸底。</span>
+    </label>
+    <label class="field full" id="custom-ports-wrap" style="display:none">自定义端口
+      <input name="custom_ports" id="custom-ports" value="{{.Task.CustomPorts}}" placeholder="22,80,443 或 8000-9000 或 22,80,443,8000-9000" oninput="validateCustomPorts()">
+      <span class="field-help" id="custom-ports-help">逗号分隔单端口，连字符表示范围；每个端口须在 1-65535，结束端口不小于起始端口。</span>
+    </label>
+    <label class="field full">目标范围
+      <select name="target_type" id="target-type" onchange="toggleTaskFields()">
+        <option value="all" {{if eq .Task.TargetType "all"}}selected{{end}}>全部资产台账</option>
+        <option value="tag" {{if eq .Task.TargetType "tag"}}selected{{end}}>按资产标签圈选（运行时动态读取）</option>
+        <option value="manual" {{if eq .Task.TargetType "manual"}}selected{{end}}>手工填写 IP / 网段 / 范围</option>
+      </select>
+    </label>
+    <label class="field full" id="target-tag" style="display:none">资产标签
+      <select name="target_tag">
+        <option value="">请选择标签</option>
+        {{range .Tags}}<option value="{{.}}" {{if eq . $.Task.TargetTag}}selected{{end}}>{{.}}</option>{{end}}
+      </select>
+      <span class="hint">标签在「资产台账」导入或编辑；每次运行会包含该标签下的最新资产。</span>
+    </label>
+    <label class="field full" id="target-manual" style="display:none">手工目标（每行或逗号分隔）
+      <textarea name="ips" rows="5" placeholder="1.2.3.4&#10;10.0.0.0/24&#10;1.2.3.1-1.2.3.50">{{.Task.IPs}}</textarea>
+      <span class="field-help">支持单 IP / CIDR 网段 / IP 范围。<button type="button" class="btn small ghost" onclick="openModal('task-help-modal')">格式帮助 / 模板</button></span>
+    </label>
+    <label class="check full" id="add-ledger-wrap" style="display:none"><input type="checkbox" name="add_to_ledger" {{if .Task.AddToLedger}}checked{{end}}> 同时把手工目标加入资产台账</label>
+    <label class="check full"><input type="checkbox" name="sched_enabled" id="sched-enabled" onchange="toggleTaskFields()" {{if .Task.SchedEnabled}}checked{{end}}> 启用定时计划</label>
+    <div class="grid full" id="schedule-fields" style="display:none">
+      <label class="field">定时类型
+        <select name="sched_type">
+          <option value="daily" {{if ne .Task.SchedType "weekly"}}selected{{end}}>每日</option>
+          <option value="weekly" {{if eq .Task.SchedType "weekly"}}selected{{end}}>每周</option>
+        </select>
+      </label>
+      <label class="field">时间（时 : 分）
+        <span class="row"><input type="number" name="hour" min="0" max="23" value="{{.Task.Hour}}" style="width:50%"><input type="number" name="minute" min="0" max="59" value="{{.Task.Minute}}" style="width:50%"></span>
+      </label>
+      <label class="field">星期（每周生效）
+        <select name="weekday">
+          <option value="-1" {{if lt .Task.Weekday 0}}selected{{end}}>不指定</option>
+          <option value="0" {{if eq .Task.Weekday 0}}selected{{end}}>周日</option><option value="1" {{if eq .Task.Weekday 1}}selected{{end}}>周一</option>
+          <option value="2" {{if eq .Task.Weekday 2}}selected{{end}}>周二</option><option value="3" {{if eq .Task.Weekday 3}}selected{{end}}>周三</option>
+          <option value="4" {{if eq .Task.Weekday 4}}selected{{end}}>周四</option><option value="5" {{if eq .Task.Weekday 5}}selected{{end}}>周五</option>
+          <option value="6" {{if eq .Task.Weekday 6}}selected{{end}}>周六</option>
+        </select>
+      </label>
+    </div>
+    <div class="row full">
+      {{if .Editing}}<button type="button" class="btn primary" onclick="submitForm(false)">保存修改</button>
+      {{else}}<button type="button" class="btn" onclick="submitForm(false)">仅保存</button>
+      <button type="button" class="btn primary" onclick="submitForm(true)">保存并立即运行</button>{{end}}
+      <a class="btn ghost" href="/tasks">返回列表</a>
+    </div>
+  </form>
+</div>
+
+<div class="modal-mask" id="task-help-modal" style="display:none" onclick="modalBackdrop(event,'task-help-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>手工目标格式与模板</h3><button class="modal-close" type="button" onclick="closeModal('task-help-modal')">×</button></div>
+    <div class="modal-body">
+      <p class="hint">每行一个或逗号分隔，支持三种写法；非法行会在保存时报错并指出具体条目：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>类型</th><th>写法</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td>单 IP</td><td>点分十进制</td><td><code>1.2.3.4</code></td></tr>
+          <tr><td>CIDR 网段</td><td>IP/掩码</td><td><code>10.0.0.0/24</code></td></tr>
+          <tr><td>IP 范围</td><td>起-止</td><td><code>1.2.3.1-1.2.3.50</code></td></tr>
+        </tbody>
+      </table></div>
+      <p class="hint" style="margin-top:12px">下载目标列表模板（可编辑后粘贴到上方输入框）：</p>
+      <div class="btn-group">
+        <a class="btn small" href="/api/sample/assets.csv">CSV 模板</a>
+        <a class="btn small" href="/api/sample/assets.xlsx">XLSX 模板</a>
+      </div>
+    </div>
+    <div class="modal-foot"><button class="btn primary" type="button" onclick="closeModal('task-help-modal')">知道了</button></div>
+  </div>
+</div>
+<script>
+const EDITING = {{.Editing}};
+const TASK_ID = {{.Task.ID}};
+function toggleTaskFields() {
+  const type = document.getElementById('target-type').value;
+  document.getElementById('target-tag').style.display = type === 'tag' ? 'flex' : 'none';
+  document.getElementById('target-manual').style.display = type === 'manual' ? 'flex' : 'none';
+  document.getElementById('add-ledger-wrap').style.display = type === 'manual' ? 'flex' : 'none';
+  document.getElementById('schedule-fields').style.display = document.getElementById('sched-enabled').checked ? 'grid' : 'none';
+  const mode = document.getElementById('scan-mode').value;
+  document.getElementById('custom-ports-wrap').style.display = mode === 'custom' ? 'flex' : 'none';
+  const help = document.getElementById('mode-help');
+  if (mode === 'full') help.textContent = '扫描全部 1-65535 端口，覆盖最全但耗时最长。';
+  else if (mode === 'custom') help.textContent = '仅扫描下方指定的端口，适合复核特定服务。';
+  else help.textContent = 'Top 1000 常用端口基于 Shodan/Censys 统计，适合快速摸底。';
+  validateCustomPorts();
+}
+// validateCustomPorts 实时校验自定义端口格式；非自定义模式时直接放行。返回是否合法。
+function validateCustomPorts() {
+  const wrap = document.getElementById('custom-ports-wrap');
+  if (wrap.style.display === 'none') return true;
+  const input = document.getElementById('custom-ports');
+  const help = document.getElementById('custom-ports-help');
+  const bad = (msg) => { input.style.borderColor = 'var(--danger)'; help.style.color = 'var(--danger-text)'; help.textContent = msg; return false; };
+  const good = () => { input.style.borderColor = ''; help.style.color = ''; help.textContent = '格式正确；逗号分隔单端口，连字符表示范围。'; return true; };
+  const v = (input.value || '').trim();
+  if (!v) return bad('自定义端口模式必须填写端口');
+  for (let raw of v.split(',')) {
+    const p = raw.trim();
+    if (!p) return bad('存在空的端口项，请检查多余逗号');
+    const m = p.match(/^(\d+)(?:-(\d+))?$/);
+    if (!m) return bad('格式错误：' + p + '（应为 80 或 8000-9000）');
+    const a = parseInt(m[1], 10);
+    if (a < 1 || a > 65535) return bad('端口超出 1-65535：' + p);
+    if (m[2]) {
+      const b = parseInt(m[2], 10);
+      if (b < a || b > 65535) return bad('范围无效（结束须≥起始且≤65535）：' + p);
+    }
+  }
+  return good();
+}
+toggleTaskFields();
+async function submitForm(runNow) {
+  if (!validateCustomPorts()) { toast('自定义端口格式有误，请先修正', 'err'); return; }
+  const fd = new FormData(document.getElementById('task-form'));
+  if (runNow) fd.append('run_now', 'on');
+  const url = EDITING ? ('/api/tasks/' + TASK_ID) : '/api/tasks';
+  const res = await postForm(url, fd);
+  if (!res.ok) { toast(res.json.error || '保存失败', 'err'); return; }
+  if (res.json.run_error) toast('任务已保存，但运行失败：' + res.json.run_error, 'err');
+  else if (runNow) toast('任务已保存并启动（扫描 ID ' + res.json.scan_id + '）', 'ok');
+  else toast('任务已保存', 'ok');
+  const target = runNow && res.json.scan_id ? '/scans/' + res.json.scan_id : '/tasks';
+  setTimeout(() => location.href = target, 800);
+}
+</script>
+{{template "foot" .}}{{end}}

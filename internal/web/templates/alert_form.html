@@ -1,0 +1,46 @@
+{{define "alert_form.html"}}{{template "head" .}}{{template "nav" .}}
+<div class="row between" style="margin-bottom:16px">
+  <a class="btn ghost small" href="{{.Return}}">返回告警列表</a>
+  <a class="btn ghost small" href="/exposure?q={{urlquery .Alert.IP}}&port={{.Alert.Port}}">查看关联暴露面</a>
+</div>
+{{if .Error}}<div class="error-banner">{{.Error}}</div>{{end}}
+
+<div class="panel">
+  <div class="panel-title">告警 #{{.Alert.ID}} · {{.Alert.IP}}:{{.Alert.Port}}</div>
+  <div class="grid">
+    <div><div class="muted">当前状态</div><strong>{{alertStatusName .Alert.Status}}</strong></div>
+    <div><div class="muted">协议 / 服务</div><strong>{{.Alert.Proto}}{{if .Alert.Service}} / {{.Alert.Service}}{{end}}</strong></div>
+    <div><div class="muted">资产范围</div><strong>{{if .Alert.InScope}}范围内{{else}}范围外{{end}}</strong></div>
+    <div><div class="muted">飞书通知</div><strong>{{if .Alert.SentFeishu}}已推送{{else}}未推送{{end}}</strong></div>
+    <div><div class="muted">首次发现</div><strong>{{fmtTime .Alert.FirstSeenAt}}</strong></div>
+    <div><div class="muted">最近发现</div><strong>{{fmtTime .Alert.LastSeenAt}}</strong></div>
+    {{if .Alert.Handler}}<div><div class="muted">最近处理人</div><strong>{{.Alert.Handler}}</strong></div>{{end}}
+    {{if .Alert.HandledAt}}<div><div class="muted">处理时间</div><strong>{{fmtTime .Alert.HandledAt}}</strong></div>{{end}}
+  </div>
+</div>
+
+<div class="panel" style="max-width:820px">
+  <div class="panel-title">填写处置结果</div>
+  <form method="post" action="/alerts/{{.Alert.ID}}" class="grid">
+    <input type="hidden" name="return" value="{{.Return}}">
+    <label class="field full">处理状态
+      <select name="status" required>
+        <option value="acked" {{if eq .Status "acked"}}selected{{end}}>跟进中</option>
+        <option value="resolved" {{if eq .Status "resolved"}}selected{{end}}>已解决（再次发现会自动重开）</option>
+        <option value="ignored" {{if eq .Status "ignored"}}selected{{end}}>已忽略（不再提醒）</option>
+        <option value="new" {{if eq .Status "new"}}selected{{end}}>重新打开</option>
+      </select>
+    </label>
+    <label class="field full">处理说明
+      <textarea name="note" rows="7" placeholder="填写排查结论、工单号、业务负责人或放行依据">{{.Note}}</textarea>
+    </label>
+    <p class="hint full">解决或忽略必须填写说明。保存后会记录当前账号、处理时间和审计流水。</p>
+    <div class="row full">
+      <button class="btn primary" type="submit">保存处置</button>
+      <button class="btn" type="submit" formaction="/alerts/{{.Alert.ID}}/whitelist">加入白名单并忽略</button>
+      <a class="btn ghost" href="{{.Return}}">取消</a>
+    </div>
+    <p class="hint full">仅在确认该端口属于业务放行时选择加白：系统将新增该 IP、端口和协议的精确白名单，并把告警标记为已忽略。</p>
+  </form>
+</div>
+{{template "foot" .}}{{end}}

@@ -1,0 +1,224 @@
+{{define "whitelist.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">白名单用于放行「已知合规」的开放端口：扫描结果命中白名单即视为合规、不告警，未命中的才登记为告警。字段格式、导入示例与匹配逻辑见「帮助 / 说明」。</p>
+
+<div class="panel">
+  <div class="panel-title">白名单操作</div>
+  <div class="row between" style="align-items:flex-start">
+    <div class="btn-group">
+      {{if ne .Role "viewer"}}
+      <button class="btn primary" type="button" onclick="openModal('wl-add-modal')">单条添加</button>
+      <button class="btn" type="button" onclick="openModal('wl-import-modal')">批量导入</button>
+      <button class="btn" type="button" onclick="genBaseline()">生成基线</button>
+      {{end}}
+      <button class="btn ghost" type="button" onclick="openModal('wl-help-modal')">帮助 / 说明</button>
+      <a class="btn" href="/whitelist/export">导出 CSV</a>
+    </div>
+    <span class="muted">共 {{len .Entries}} 条</span>
+  </div>
+  <div class="filter-bar" style="margin-top:12px">
+    <label class="field grow">检索白名单<input id="wl-q" oninput="filterWl()" placeholder="IP、端口、服务、负责人、业务或备注"></label>
+    <label class="field">业务筛选<select id="wl-business" onchange="filterWl()"><option value="">全部业务</option>{{range .Businesses}}<option value="{{.}}">{{.}}</option>{{end}}</select></label>
+  </div>
+</div>
+
+<div class="section-head"><h2>条目（{{len .Entries}} 条）</h2></div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>IP/网段</th><th>端口</th><th>协议</th><th>服务</th><th>负责人</th><th>业务</th><th>备注</th><th>创建时间</th>{{if ne .Role "viewer"}}<th></th>{{end}}</tr></thead>
+  <tbody id="wl-body">
+  {{range .Entries}}
+  <tr data-business="{{.Business}}" data-spec="{{.IPSpec}} {{.PortSpec}} {{.Proto}} {{.Service}} {{.Owner}} {{.Business}} {{.Remark}}">
+    <td>{{.IPSpec}}</td><td>{{.PortSpec}}</td><td>{{.Proto}}</td><td>{{.Service}}</td>
+    <td>{{.Owner}}</td><td>{{if .Business}}{{.Business}}{{else}}<span class="muted">—</span>{{end}}</td><td>{{.Remark}}</td><td>{{fmtTime .CreatedAt}}</td>
+    {{if ne $.Role "viewer"}}<td><button class="btn small danger" type="button" onclick="delWl({{.ID}})">删除</button></td>{{end}}
+  </tr>
+  {{else}}
+  <tr><td colspan="9"><div class="empty"><div class="big">白名单为空</div>可单条添加、批量导入，或用「生成基线」把最近一次完成扫描的暴露面全部入白{{if ne $.Role "viewer"}}<div class="btn-group" style="justify-content:center;margin-top:14px"><button class="btn primary" type="button" onclick="openModal('wl-add-modal')">单条添加</button><button class="btn" type="button" onclick="openModal('wl-import-modal')">批量导入</button></div>{{end}}</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+{{if ne .Role "viewer"}}
+<!-- 单条添加 -->
+<div class="modal-mask" id="wl-add-modal" style="display:none" onclick="modalBackdrop(event,'wl-add-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>单条添加白名单</h3><button class="modal-close" type="button" onclick="closeModal('wl-add-modal')">×</button></div>
+    <div class="modal-body">
+      <form id="wl-form" class="grid">
+        <label class="field">IP / 网段 / *<input name="ip_spec" placeholder="1.2.3.4 或 10.0.0.0/16 或 *" required></label>
+        <label class="field">端口<input name="port_spec" placeholder="443 / 1000-2000 / 22,80,443 / *" required></label>
+        <label class="field">协议<input name="proto" placeholder="tcp / udp / *" value="tcp"></label>
+        <label class="field">服务名<input name="service" placeholder="备注，如 HTTPS"></label>
+        <label class="field">负责人<input name="owner" placeholder="可选"></label>
+        <label class="field">业务归属<input name="business" placeholder="可选，如 核心业务"></label>
+        <label class="field full">备注<input name="remark" placeholder="可选"></label>
+      </form>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('wl-add-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitWlAdd()">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批量导入 -->
+<div class="modal-mask" id="wl-import-modal" style="display:none" onclick="modalBackdrop(event,'wl-import-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>批量导入白名单</h3><button class="modal-close" type="button" onclick="closeModal('wl-import-modal')">×</button></div>
+    <div class="modal-body">
+      <p class="hint">每行一条：<code>IP + 端口</code>，多端口用逗号隔开。支持 <code>1.2.3.4 22,80,443</code>、<code>1.2.3.4,22,80</code>、<code>1.2.3.4:3306</code>、端口范围 <code>10.0.0.5 1000-2000</code>，行尾可加 <code>udp</code>（默认 tcp）。IP 支持单 IP / CIDR / *。</p>
+      <form id="wl-import-form" class="stack">
+        <textarea name="entries" rows="6" placeholder="1.2.3.4 22,80,443&#10;10.0.0.5 3306&#10;10.0.0.0/24 1000-2000 udp"></textarea>
+      </form>
+      <div class="btn-group" style="margin-top:10px"><a class="btn small ghost" href="/api/sample/whitelist.txt">下载样例文件</a></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('wl-import-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitWlImport()">导入白名单</button>
+    </div>
+  </div>
+</div>
+
+<!-- 基线预览 -->
+<div class="modal-mask" id="wl-baseline-modal" style="display:none" onclick="modalBackdrop(event,'wl-baseline-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>生成白名单基线 · 预览</h3><button class="modal-close" type="button" onclick="closeModal('wl-baseline-modal')">×</button></div>
+    <div class="modal-body">
+      <p class="hint" id="baseline-scan-info">正在读取最近一次完成扫描的开放端口……</p>
+      <label class="field" style="margin-bottom:12px">业务归属（可选，批量写入所选条目）<input id="baseline-business" placeholder="如：核心业务 / 生产"></label>
+      <div class="row between" style="margin-bottom:8px">
+        <label class="check"><input type="checkbox" id="baseline-all" checked onchange="toggleBaselineAll(this)"> 全选</label>
+        <span class="muted" id="baseline-count">共 0 条，已选 0 条</span>
+      </div>
+      <div class="table-wrap" style="max-height:44vh;overflow:auto">
+        <table>
+          <thead><tr><th style="width:36px"></th><th>IP</th><th>端口</th><th>协议</th><th>服务</th></tr></thead>
+          <tbody id="baseline-body"></tbody>
+        </table>
+      </div>
+      <div id="baseline-empty" class="empty" style="display:none"><div class="big">没有可加入基线的开放端口</div>最近一次完成扫描的端口都已在白名单中，或尚无完成的扫描。</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('wl-baseline-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitBaseline()">加入白名单</button>
+    </div>
+  </div>
+</div>
+{{end}}
+
+<!-- 帮助 / 说明（所有角色可见）-->
+<div class="modal-mask" id="wl-help-modal" style="display:none" onclick="modalBackdrop(event,'wl-help-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>白名单格式与匹配说明</h3><button class="modal-close" type="button" onclick="closeModal('wl-help-modal')">×</button></div>
+    <div class="modal-body">
+      <div class="table-wrap"><table>
+        <thead><tr><th>字段</th><th>支持写法</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td>IP 规则</td><td>单 IP / CIDR / *（全部）</td><td><code>1.2.3.4</code>　<code>10.0.0.0/16</code>　<code>*</code></td></tr>
+          <tr><td>端口</td><td>单端口 / 范围 / 逗号分隔 / *</td><td><code>443</code>　<code>1000-2000</code>　<code>22,80,443</code></td></tr>
+          <tr><td>协议</td><td>tcp / udp / *</td><td><code>tcp</code>　<code>*</code></td></tr>
+        </tbody>
+      </table></div>
+      <p class="hint" style="margin-top:12px">匹配逻辑：扫描完成后逐个开放端口与白名单比对，命中任意一条即放行、不告警；未命中的登记为告警并可推送飞书。IP 规则不支持 <code>a-b</code> 范围写法（范围仅用于资产台账），连续网段请用 CIDR。</p>
+      <div class="btn-group"><a class="btn small" href="/api/sample/whitelist.txt">下载导入样例</a></div>
+    </div>
+    <div class="modal-foot">
+      <a class="btn ghost" href="/help/whitelist">查看完整文档</a>
+      <button class="btn primary" type="button" onclick="closeModal('wl-help-modal')">知道了</button>
+    </div>
+  </div>
+</div>
+
+{{if ne .Role "viewer"}}
+<script>
+async function submitWlAdd() {
+  const form = document.getElementById('wl-form');
+  const res = await postForm('/api/whitelist', new FormData(form));
+  if (res.ok) { toast('已添加', 'ok'); closeModal('wl-add-modal'); setTimeout(() => location.reload(), 600); }
+  else toast(res.json.error || '添加失败', 'err');
+}
+async function submitWlImport() {
+  const form = document.getElementById('wl-import-form');
+  const res = await postForm('/api/whitelist/import', new FormData(form));
+  if (res.ok) { toast(`解析 ${res.json.parsed} 条，导入 ${res.json.added} 条`, 'ok'); closeModal('wl-import-modal'); setTimeout(() => location.reload(), 700); }
+  else toast(res.json.error || '导入失败', 'err');
+}
+// 生成基线：先拉取最近一次完成扫描中尚未加白的端口预览，勾选确认后写入。
+let baselineEntries = [];
+async function genBaseline() {
+  openModal('wl-baseline-modal');
+  const info = document.getElementById('baseline-scan-info');
+  const body = document.getElementById('baseline-body');
+  const empty = document.getElementById('baseline-empty');
+  info.textContent = '正在读取最近一次完成扫描的开放端口……';
+  body.innerHTML = ''; empty.style.display = 'none'; baselineEntries = [];
+  document.getElementById('baseline-count').textContent = '共 0 条，已选 0 条';
+  let data;
+  try {
+    const resp = await fetch('/api/baseline/preview', { cache: 'no-store' });
+    data = await resp.json();
+    if (!resp.ok) { info.textContent = data.error || '读取预览失败'; return; }
+  } catch (e) { info.textContent = '读取预览失败，请重试'; return; }
+  baselineEntries = data.entries || [];
+  info.textContent = `来源执行 #${data.scan_id}（${data.scan_name || '未命名'}）：以下为尚未在白名单中的开放端口，取消勾选可排除后再加入。`;
+  if (!baselineEntries.length) { empty.style.display = ''; return; }
+  baselineEntries.forEach((e, idx) => {
+    const tr = document.createElement('tr');
+    const tdCheck = document.createElement('td');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'baseline-check'; cb.dataset.idx = String(idx); cb.checked = true; cb.onchange = updateBaselineCount;
+    tdCheck.appendChild(cb);
+    const tdIp = document.createElement('td'); tdIp.textContent = e.ip;
+    const tdPort = document.createElement('td'); tdPort.className = 'num-cell'; tdPort.textContent = e.port;
+    const tdProto = document.createElement('td'); tdProto.textContent = e.proto || 'tcp';
+    const tdSvc = document.createElement('td'); tdSvc.textContent = e.service || '未识别';
+    tr.append(tdCheck, tdIp, tdPort, tdProto, tdSvc);
+    body.appendChild(tr);
+  });
+  document.getElementById('baseline-all').checked = true;
+  updateBaselineCount();
+}
+function toggleBaselineAll(master) {
+  document.querySelectorAll('.baseline-check').forEach(c => { c.checked = master.checked; });
+  updateBaselineCount();
+}
+function updateBaselineCount() {
+  const total = document.querySelectorAll('.baseline-check').length;
+  const sel = document.querySelectorAll('.baseline-check:checked').length;
+  document.getElementById('baseline-count').textContent = `共 ${total} 条，已选 ${sel} 条`;
+  const all = document.getElementById('baseline-all');
+  if (all) all.checked = total > 0 && sel === total;
+}
+async function submitBaseline() {
+  const checked = Array.from(document.querySelectorAll('.baseline-check:checked'));
+  if (!checked.length) { toast('请至少勾选一条', 'err'); return; }
+  const body = new FormData();
+  body.append('business', document.getElementById('baseline-business').value.trim());
+  checked.forEach(c => {
+    const e = baselineEntries[Number(c.dataset.idx)];
+    if (!e) return;
+    body.append('ip', e.ip); body.append('port', String(e.port)); body.append('proto', e.proto || 'tcp'); body.append('service', e.service || '');
+  });
+  const res = await postForm('/api/baseline/apply', body);
+  if (res.ok) { toast(`基线已生成，新增 ${res.json.added} 条白名单${res.json.skipped ? '，跳过 ' + res.json.skipped + ' 条' : ''}`, 'ok'); closeModal('wl-baseline-modal'); setTimeout(() => location.reload(), 700); }
+  else toast(res.json.error || '生成失败', 'err');
+}
+async function delWl(id) {
+  if (!confirm('删除该白名单条目？')) return;
+  const res = await postEmpty('/api/whitelist/' + id, 'DELETE');
+  if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.reload(), 600); } else toast(res.json.error || '失败', 'err');
+}
+function filterWl() {
+  const q = (document.getElementById('wl-q').value || '').trim().toLowerCase();
+  const biz = document.getElementById('wl-business').value;
+  document.querySelectorAll('#wl-body tr').forEach(tr => {
+    const text = (tr.dataset.spec || '').toLowerCase();
+    const okQ = !q || text.includes(q);
+    const okB = !biz || (tr.dataset.business || '') === biz;
+    tr.style.display = (okQ && okB) ? '' : 'none';
+  });
+}
+</script>
+{{end}}
+{{template "foot" .}}{{end}}

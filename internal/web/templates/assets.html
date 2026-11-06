@@ -1,0 +1,290 @@
+{{define "assets.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">台账内目标为扫描与告警范围，支持四种类型：<code>1.2.3.4</code>（单 IP）、<code>10.0.0.0/24</code>（CIDR 网段）、<code>1.2.3.1-1.2.3.50</code>（IP 范围）、<code>example.com</code>（域名）。可批量导入、手动添加、按标签分组、批量修改标签与维护信息。</p>
+
+<div class="panel">
+  <div class="panel-title">检索与筛选</div>
+  <form method="get" action="/assets" class="filter-bar">
+    <input type="hidden" name="tag" value="{{.CurTag}}">
+    <input type="hidden" name="filter" value="{{.Filter}}">
+    <label class="field grow">检索资产<input name="q" value="{{.Query}}" placeholder="IP、域名、标签、来源、维护人员或安全设备"></label>
+    <button class="btn primary" type="submit">查询</button>
+    <a class="btn ghost" href="/assets">重置</a>
+    <a class="btn" href="/assets/export?q={{urlquery .Query}}&tag={{urlquery .CurTag}}&filter={{.Filter}}">导出 CSV</a>
+  </form>
+  <div class="row between" style="margin-top:14px;align-items:flex-start">
+    <div class="btn-group">
+      <span class="muted">标签状态：</span>
+      <a class="btn small {{if eq .Filter ""}}primary{{end}}" href="/assets?q={{urlquery .Query}}&tag={{urlquery .CurTag}}">全部</a>
+      <a class="btn small {{if eq .Filter "tagged"}}primary{{end}}" href="/assets?filter=tagged&q={{urlquery .Query}}&tag={{urlquery .CurTag}}">已打标签</a>
+      <a class="btn small {{if eq .Filter "untagged"}}primary{{end}}" href="/assets?filter=untagged&q={{urlquery .Query}}&tag={{urlquery .CurTag}}">未打标签</a>
+    </div>
+    <div class="btn-group">
+      {{if ne .Role "viewer"}}
+      <button class="btn primary" type="button" onclick="openModal('add-modal')">手动添加</button>
+      <button class="btn" type="button" onclick="openModal('import-modal')">导入资产</button>
+      {{end}}
+      <button class="btn ghost" type="button" onclick="openModal('help-modal')">帮助 / 模板</button>
+    </div>
+  </div>
+  <div class="row" style="margin-top:14px">
+    <span class="muted">标签筛选：</span>
+    <a href="/assets?q={{urlquery .Query}}&filter={{.Filter}}" class="tag {{if not .CurTag}}active{{end}}">全部</a>
+    {{range .AllTags}}<a href="/assets?tag={{urlquery .}}&q={{urlquery $.Query}}&filter={{$.Filter}}" class="tag {{if eq . $.CurTag}}active{{end}}">{{.}}</a>{{end}}
+  </div>
+</div>
+
+{{if ne .Role "viewer"}}
+<div class="panel" id="batch-bar" style="display:none">
+  <div class="row">
+    <strong id="batch-count">已选 0 项</strong>
+    <button class="btn primary" type="button" onclick="openBatchTags()">批量修改标签</button>
+    <button class="btn danger" type="button" onclick="batchDeleteTargets()">批量删除</button>
+    <button class="btn ghost" type="button" onclick="clearAssetSelection()">取消选择</button>
+    <span class="muted">批量操作作用于勾选的资产，与行内单条操作互不影响。</span>
+  </div>
+</div>
+{{end}}
+
+<div class="section-head">
+  <h2>当前资产（{{len .Targets}} / {{.Total}} 个{{if .CurTag}} · 标签「{{.CurTag}}」{{end}}）</h2>
+</div>
+<div class="table-wrap">
+<table>
+  <thead><tr>{{if ne .Role "viewer"}}<th style="width:36px"><input type="checkbox" onclick="toggleAllChecks(this,'asset-check');updateAssetBatch()" title="全选/取消"></th>{{end}}<th>目标</th><th>类型</th><th>标签</th><th>维护人员</th><th>安全设备</th><th>来源</th><th>导入时间</th>{{if ne .Role "viewer"}}<th>操作</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Targets}}
+  <tr>
+    {{if ne $.Role "viewer"}}<td><input type="checkbox" class="asset-check" value="{{.ID}}" onclick="updateAssetBatch()"></td>{{end}}
+    <td>{{if eq .Kind "ip"}}<a href="/exposure?q={{urlquery .IP}}">{{.IP}}</a>{{else}}{{.IP}}{{end}}</td>
+    <td>{{if eq .Kind "cidr"}}<span class="pill info">网段</span>{{else if eq .Kind "range"}}<span class="pill info">范围</span>{{else if eq .Kind "domain"}}<span class="pill info">域名</span>{{else}}<span class="pill mute">单 IP</span>{{end}}</td>
+    <td>{{range $t := splitTags .Tags}}<span class="tag">{{$t}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{if .Owner}}{{.Owner}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{if .SecurityDevice}}{{.SecurityDevice}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{.Source}}</td><td>{{fmtTime .CreatedAt}}</td>
+    {{if ne $.Role "viewer"}}
+    <td>
+      <div class="btn-group">
+        <button class="btn small ghost" data-id="{{.ID}}" data-spec="{{.IP}}" data-owner="{{.Owner}}" data-device="{{.SecurityDevice}}" data-tags="{{.Tags}}" onclick="editTargetFromBtn(this)">编辑</button>
+        <button class="btn small danger" data-id="{{.ID}}" data-ip="{{.IP}}" onclick="delTargetFromBtn(this)">删除</button>
+      </div>
+    </td>
+    {{end}}
+  </tr>
+  {{else}}
+  <tr><td colspan="9"><div class="empty"><div class="big">台账为空</div>粘贴 IP / 网段 / 范围 / 域名，或上传文件导入资产{{if ne $.Role "viewer"}}<div class="btn-group" style="justify-content:center;margin-top:14px"><button class="btn primary" type="button" onclick="openModal('import-modal')">导入资产</button><button class="btn" type="button" onclick="openModal('add-modal')">手动添加</button></div>{{end}}</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+{{if ne .Role "viewer"}}
+<!-- 手动添加单条资产 -->
+<div class="modal-mask" id="add-modal" style="display:none" onclick="modalBackdrop(event,'add-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>手动添加资产</h3><button class="modal-close" type="button" onclick="closeModal('add-modal')">×</button></div>
+    <div class="modal-body">
+      <form id="add-form" class="grid">
+        <label class="field full">IP / 网段 / 范围 / 域名<input name="spec" placeholder="1.2.3.4 或 10.0.0.0/24 或 1.2.3.1-1.2.3.50 或 example.com" required></label>
+        <label class="field">维护人员<input name="owner" placeholder="业务负责人 / 联系人（可选）"></label>
+        <label class="field">安全设备<input name="security_device" placeholder="如 WAF / 云盾 / 防火墙（可选）"></label>
+        <label class="field full">标签（逗号分隔，可选）<input name="tags" placeholder="如：核心业务,生产"></label>
+      </form>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('add-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitAdd()">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导入资产 -->
+<div class="modal-mask" id="import-modal" style="display:none" onclick="modalBackdrop(event,'import-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>导入资产</h3><button class="modal-close" type="button" onclick="closeImport()">×</button></div>
+    <div class="modal-body">
+      <form id="import-form" class="stack">
+        <label class="field">目标（每行一个或逗号分隔，支持 IP / 网段 / 范围 / 域名）<textarea name="ips" rows="5" placeholder="1.2.3.4&#10;10.0.0.0/24&#10;example.com"></textarea></label>
+        <label class="field">本批标签（可选，逗号分隔）<input name="tag" placeholder="给这批导入的资产统一打标签"></label>
+        <label class="field">或上传 CSV / TXT / XLSX<input type="file" name="file" accept=".csv,.txt,.xlsx,.xlsm"></label>
+      </form>
+      <p class="hint" style="margin-top:10px">上传的 CSV / XLSX 可含表头列「目标, 维护人员, 安全设备」，系统按列名自动识别；未提供的列留空。文本框粘贴仅解析目标本身。</p>
+      <div id="import-result" class="result-box" style="display:none"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeImport()">关闭</button>
+      <button class="btn primary" type="button" onclick="submitImport()">开始导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批量修改标签 -->
+<div class="modal-mask" id="batch-tags-modal" style="display:none" onclick="modalBackdrop(event,'batch-tags-modal')">
+  <div class="modal">
+    <div class="modal-head"><h3>批量修改标签</h3><button class="modal-close" type="button" onclick="closeModal('batch-tags-modal')">×</button></div>
+    <div class="modal-body">
+      <div class="stack">
+        <label class="field">标签（逗号分隔）<input id="batch-tags-input" placeholder="如：核心业务,生产"></label>
+        <label class="field">方式<select id="batch-tags-mode">
+          <option value="append">追加（保留原有标签）</option>
+          <option value="set">覆盖（替换为新标签）</option>
+          <option value="clear">清空标签</option>
+        </select></label>
+        <p class="hint" id="batch-tags-target" style="margin:0">将作用于选中的资产</p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('batch-tags-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitBatchTags()">应用</button>
+    </div>
+  </div>
+</div>
+
+<!-- 编辑资产（维护人员 / 安全设备 / 标签）-->
+<div class="modal-mask" id="edit-modal" style="display:none" onclick="modalBackdrop(event,'edit-modal')">
+  <div class="modal">
+    <div class="modal-head"><h3>编辑资产</h3><button class="modal-close" type="button" onclick="closeModal('edit-modal')">×</button></div>
+    <div class="modal-body">
+      <div class="stack">
+        <label class="field">目标（不可修改）<input id="edit-spec" disabled></label>
+        <label class="field">维护人员<input id="edit-owner" placeholder="业务负责人 / 联系人"></label>
+        <label class="field">安全设备<input id="edit-device" placeholder="如 WAF / 云盾 / 防火墙"></label>
+        <label class="field">标签（逗号分隔，留空即清除）<input id="edit-tags"></label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('edit-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitEdit()">保存</button>
+    </div>
+  </div>
+</div>
+{{end}}
+
+<!-- 帮助 / 模板 -->
+<div class="modal-mask" id="help-modal" style="display:none" onclick="modalBackdrop(event,'help-modal')">
+  <div class="modal lg">
+    <div class="modal-head"><h3>导入模板与格式说明</h3><button class="modal-close" type="button" onclick="closeModal('help-modal')">×</button></div>
+    <div class="modal-body">
+      <p class="hint">支持四种目标类型，导入时自动去重、去 BOM、容错解析：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>类型</th><th>写法</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td>单 IP</td><td>点分十进制</td><td><code>1.2.3.4</code></td></tr>
+          <tr><td>CIDR 网段</td><td>IP/掩码</td><td><code>10.0.0.0/24</code></td></tr>
+          <tr><td>IP 范围</td><td>起-止</td><td><code>1.2.3.1-1.2.3.50</code></td></tr>
+          <tr><td>域名</td><td>主机名（可含 *. 通配）</td><td><code>example.com</code></td></tr>
+        </tbody>
+      </table></div>
+      <p class="hint" style="margin-top:12px">CSV / XLSX 可用表头列「目标, 维护人员, 安全设备」，系统按列名识别，未提供的列留空。下载样例：</p>
+      <div class="btn-group">
+        <a class="btn small" href="/api/sample/assets.csv">CSV 样例</a>
+        <a class="btn small" href="/api/sample/assets.xlsx">XLSX 样例</a>
+      </div>
+      <p class="hint" style="margin-top:12px">非法行会被跳过，并在导入结果中给出数量与示例，不会静默丢弃。「本批标签」会应用到本次新增的资产上。</p>
+    </div>
+    <div class="modal-foot"><button class="btn primary" type="button" onclick="closeModal('help-modal')">知道了</button></div>
+  </div>
+</div>
+
+{{if ne .Role "viewer"}}
+<script>
+let importChanged = false;
+
+async function submitImport() {
+  const form = document.getElementById('import-form');
+  const box = document.getElementById('import-result');
+  const res = await postForm('/api/assets/import', new FormData(form));
+  box.style.display = 'block';
+  if (!res.ok) { box.textContent = res.json.error || '导入失败'; return; }
+  let msg = `合法 ${res.json.parsed} 个，新增 ${res.json.added} 个`;
+  if (res.json.invalid) msg += `\n跳过非法内容 ${res.json.invalid} 项：${(res.json.invalid_sample || []).join('、')}`;
+  const tag = (form.querySelector('[name=tag]').value || '').trim();
+  msg += tag ? `\n本批标签「${tag}」已应用到新增资产` : '\n未设置本批标签（可稍后用「编辑」或「批量修改标签」补充）';
+  box.textContent = msg;
+  importChanged = true;
+  toast(res.json.invalid ? `导入完成，新增 ${res.json.added} 个，跳过 ${res.json.invalid} 项非法` : `导入成功，新增 ${res.json.added} 个`, res.json.invalid ? 'err' : 'ok');
+}
+function closeImport() { closeModal('import-modal'); if (importChanged) location.reload(); }
+
+async function submitAdd() {
+  const form = document.getElementById('add-form');
+  const res = await postForm('/api/targets', new FormData(form));
+  if (res.ok) {
+    toast(res.json.message || (res.json.added ? '已添加资产' : '资产已存在'), res.json.added ? 'ok' : 'err');
+    if (res.json.added) { closeModal('add-modal'); setTimeout(() => location.reload(), 600); }
+  } else toast(res.json.error || '添加失败', 'err');
+}
+
+function updateAssetBatch() {
+  const n = checkedValues('asset-check').length;
+  const bar = document.getElementById('batch-bar');
+  if (bar) bar.style.display = n ? 'block' : 'none';
+  const c = document.getElementById('batch-count');
+  if (c) c.textContent = '已选 ' + n + ' 项';
+}
+function clearAssetSelection() {
+  document.querySelectorAll('.asset-check').forEach(c => { c.checked = false; });
+  const master = document.querySelector('thead input[type=checkbox]');
+  if (master) master.checked = false;
+  updateAssetBatch();
+}
+function openBatchTags() {
+  const n = checkedValues('asset-check').length;
+  if (!n) { toast('请先勾选资产', 'err'); return; }
+  document.getElementById('batch-tags-input').value = '';
+  document.getElementById('batch-tags-mode').value = 'append';
+  document.getElementById('batch-tags-target').textContent = '将作用于选中的 ' + n + ' 个资产';
+  openModal('batch-tags-modal');
+}
+async function submitBatchTags() {
+  const ids = checkedValues('asset-check');
+  if (!ids.length) { toast('请先勾选资产', 'err'); return; }
+  let mode = document.getElementById('batch-tags-mode').value;
+  let tags = document.getElementById('batch-tags-input').value.trim();
+  if (mode === 'clear') { mode = 'set'; tags = ''; }
+  if (mode === 'append' && !tags) { toast('追加模式需填写标签', 'err'); return; }
+  const body = new FormData();
+  body.append('mode', mode);
+  body.append('tags', tags);
+  ids.forEach(id => body.append('target_ids', id));
+  const res = await postForm('/api/targets/batch-tags', body);
+  if (res.ok) { toast('已更新 ' + res.json.updated + ' 个资产的标签', 'ok'); closeModal('batch-tags-modal'); setTimeout(() => location.reload(), 600); }
+  else toast(res.json.error || '批量修改失败', 'err');
+}
+
+async function batchDeleteTargets() {
+  const ids = checkedValues('asset-check');
+  if (ids.length > 0 && !confirm('确定删除选中的 ' + ids.length + ' 个资产？该操作不可恢复。')) return;
+  const body = new FormData();
+  ids.forEach(id => body.append('ids', id));
+  const res = await postForm('/api/targets/batch-delete', body);
+  if (res.ok) { toast('已删除 ' + res.json.deleted + ' 个资产', 'ok'); setTimeout(() => location.reload(), 600); }
+  else toast(res.json.error || '批量删除失败', 'err');
+}
+
+let editTargetId = 0;
+function editTargetFromBtn(btn) {
+  editTargetId = btn.dataset.id;
+  document.getElementById('edit-spec').value = btn.dataset.spec || '';
+  document.getElementById('edit-owner').value = btn.dataset.owner || '';
+  document.getElementById('edit-device').value = btn.dataset.device || '';
+  document.getElementById('edit-tags').value = btn.dataset.tags || '';
+  openModal('edit-modal');
+}
+async function submitEdit() {
+  const body = new FormData();
+  body.append('owner', document.getElementById('edit-owner').value.trim());
+  body.append('security_device', document.getElementById('edit-device').value.trim());
+  body.append('tags', document.getElementById('edit-tags').value.trim());
+  const res = await postForm('/api/targets/' + editTargetId, body);
+  if (res.ok) { toast('已保存', 'ok'); closeModal('edit-modal'); setTimeout(() => location.reload(), 500); }
+  else toast(res.json.error || '保存失败', 'err');
+}
+function delTargetFromBtn(btn) { delTarget(btn.dataset.id, btn.dataset.ip); }
+async function delTarget(id, ip) {
+  if (!confirm('从台账删除 ' + ip + ' ？')) return;
+  const res = await postEmpty('/api/targets/' + id, 'DELETE');
+  if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.reload(), 500); } else toast(res.json.error || '失败', 'err');
+}
+</script>
+{{end}}
+{{template "foot" .}}{{end}}

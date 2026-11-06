@@ -1,0 +1,189 @@
+{{define "scan_detail.html"}}{{template "head" .}}{{template "nav" .}}
+<div class="row between" style="margin-bottom:16px">
+  <a class="btn ghost small" href="/scans">返回执行记录</a>
+  <div class="row">
+    {{if and .Running (ne .Role "viewer")}}
+    <button id="pause-btn" class="btn" type="button" onclick="controlScan('pause')" {{if ne .Scan.Status "running"}}style="display:none"{{end}}>暂停扫描</button>
+    <button id="resume-btn" class="btn primary" type="button" onclick="controlScan('resume')" {{if ne .Scan.Status "paused"}}style="display:none"{{end}}>恢复扫描</button>
+    <button id="stop-btn" class="btn danger" type="button" onclick="controlScan('stop')">终止扫描</button>
+    {{end}}
+    {{if and (ne .Role "viewer") (not .Running) (or (eq .Scan.Status "running") (eq .Scan.Status "paused"))}}
+    <button class="btn" type="button" onclick="resyncScan()" title="服务重启或进程异常退出后，手动把悬空的运行中/暂停状态修正为已终止">重新同步状态</button>
+    {{end}}
+    {{if and (ne .Role "viewer") (gt .Scan.TaskID 0)}}<a class="btn ghost small" href="/tasks/{{.Scan.TaskID}}/edit">编辑任务定义</a>{{end}}
+  </div>
+</div>
+<div class="panel">
+  <div class="panel-title">执行 #{{.Scan.ID}} · {{if .Scan.Name}}{{.Scan.Name}}{{else}}未命名任务{{end}}</div>
+  <div class="grid">
+    <div><div class="muted">状态</div><strong id="scan-status"><span class="pill {{scanStatusClass .Scan.Status}}">{{scanStatusName .Scan.Status}}</span></strong></div>
+    <div><div class="muted">任务定义</div><strong>#{{.Scan.TaskID}}</strong></div>
+    <div><div class="muted">扫描模式</div><strong>{{modeName .Scan.Mode}}</strong></div>
+    <div><div class="muted">目标规格数</div><strong id="target-count">{{.Scan.TargetCount}}</strong></div>
+    <div><div class="muted">开始时间</div><strong>{{fmtTime .Scan.StartedAt}}</strong></div>
+    <div><div class="muted">结束时间</div><strong id="finished-at">{{if .Scan.FinishedAt}}{{fmtTime .Scan.FinishedAt}}{{else}}尚未结束{{end}}</strong></div>
+    <div><div class="muted">已保存开放端口</div><strong id="open-ports">{{.Scan.OpenPorts}}</strong></div>
+    <div><div class="muted">实时连接</div><strong id="live-state" class="muted">{{if .Running}}每 2 秒更新{{else}}执行已结束{{end}}</strong></div>
+  </div>
+  <div id="scan-error" class="error-banner" style="margin-top:16px;{{if not .Scan.Err}}display:none{{end}}"><strong>执行说明 / 异常详情</strong><br><span id="scan-error-text">{{.Scan.Err}}</span></div>
+  <div id="stopped-note" class="run-banner" style="margin-top:16px;{{if ne .Scan.Status "stopped"}}display:none{{end}}">本次由用户或平台停止，列表仅包含停止前已经发现并入库的结果，不生成白名单比对和端口风险告警。</div>
+</div>
+
+<div id="progress-panel" class="panel" {{if eq .Scan.TargetCount 0}}style="display:none"{{end}}>
+  <div class="panel-title">目标处理进度</div>
+  <div class="row between"><strong id="progress-text">已处理 {{.Scan.ProcessedTargets}} / {{.Scan.TargetCount}} 个目标规格</strong><strong id="progress-percent">{{.Scan.ProgressPercent}}%</strong></div>
+  <div class="progress-track large"><div id="progress-value" class="progress-value" style="width:{{.Scan.ProgressPercent}}%"></div></div>
+  <div class="grid" style="margin-top:12px">
+    <div><div class="muted">待处理</div><strong id="remaining-targets">{{.Scan.RemainingTargets}}</strong></div>
+    <div><div class="muted">异常目标</div><strong id="failed-targets">{{.Scan.FailedTargets}}</strong></div>
+    <div><div class="muted">当前 / 总批次</div><strong id="batch-progress">{{.Scan.CurrentBatch}} / {{.Scan.TotalBatches}}</strong></div>
+    <div><div class="muted">已发现开放端口</div><strong id="progress-open-ports">{{.Scan.OpenPorts}}</strong></div>
+  </div>
+  <p class="hint" style="margin-top:12px;margin-bottom:0">每批最多 20 个目标规格；端口结果在批处理运行中即时入库，目标进度在每批结束后更新。终止时，未完成的当前批次不会伪记为全部处理。</p>
+</div>
+
+<div class="panel">
+  <div class="panel-title">naabu 资源占用</div>
+  <div class="grid">
+    <div><div class="muted">当前 CPU（100% = 一个逻辑核）</div><strong id="resource-cpu">{{printf "%.1f" .Scan.CPUPercent}}%</strong></div>
+    <div><div class="muted">当前 RSS</div><strong><span id="resource-memory">{{fmtMB .Scan.MemoryRSS}}</span> MiB</strong></div>
+    <div><div class="muted">峰值 CPU</div><strong id="resource-max-cpu">{{printf "%.1f" .Scan.MaxCPUPercent}}%</strong></div>
+    <div><div class="muted">峰值 RSS</div><strong><span id="resource-max-memory">{{fmtMB .Scan.MaxMemoryRSS}}</span> MiB</strong></div>
+  </div>
+  <p class="hint" style="margin-bottom:0">每 5 秒采样；持续超阈值只记录事件并发送飞书告警，不会自动暂停或终止扫描。</p>
+</div>
+
+<div id="command-panel" class="panel" {{if not .Scan.Command}}style="display:none"{{end}}>
+  <div class="panel-title">当前 / 最近批次实际执行参数</div>
+  <div id="scan-command" class="codeblock command-text">{{.Scan.Command}}</div>
+  <p class="hint" style="margin-top:10px;margin-bottom:0">目标文件和输出文件位于服务运行目录下；排查时请确认服务账号对这些路径具有读写权限。</p>
+</div>
+
+<div class="panel">
+  <div class="panel-title">执行事件</div>
+  <div id="event-list">
+    {{range .Events}}
+    <div class="scan-event {{if eq .Level "warn"}}warn{{end}}" data-event-id="{{.ID}}"><span class="muted">{{fmtTime .Ts}}</span><span>{{.Message}}</span></div>
+    {{end}}
+  </div>
+  <div id="events-empty" class="muted" {{if .Events}}style="display:none"{{end}}>暂停、恢复、终止和资源超阈值告警会显示在这里。</div>
+</div>
+
+<div class="section-head"><h2>开放端口列表（<span id="result-count">{{len .Results}}</span> 条）</h2><div class="row"><a class="btn small ghost" href="/results?scan_id={{.Scan.ID}}">独立结果页面</a><a class="btn small ghost" href="/exposure">进入聚合暴露面</a></div></div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>序号</th><th>IP</th><th>端口</th><th>协议</th><th>状态</th></tr></thead>
+  <tbody id="results-body">
+  {{range $i, $r := .Results}}
+  <tr data-result-id="{{$r.ID}}"><td class="num-cell">{{add1 $i}}</td><td>{{$r.IP}}</td><td class="num-cell">{{$r.Port}}</td><td>{{$r.Proto}}</td><td>{{if eq $r.Status 1}}<span class="pill ok">开放</span>{{else}}<span class="pill mute">未开放</span>{{end}}</td></tr>
+  {{end}}
+  </tbody>
+</table>
+<div id="results-empty" class="empty" {{if .Results}}style="display:none"{{end}}><div class="big">本次执行暂时没有已保存的开放端口</div>运行中结果会逐批、逐行实时追加；无结果不代表异常，也可能是目标无开放端口或端口被过滤。</div>
+</div>
+<script>
+const scanID = {{.Scan.ID}};
+let lastResultID = {{.LastResultID}};
+let lastEventID = {{.LastEventID}};
+let scanActive = {{if .Running}}true{{else}}false{{end}};
+const canControl = {{if and .Running (ne .Role "viewer")}}true{{else}}false{{end}};
+let polling = false;
+let resultCount = {{len .Results}};
+const statusNames = {done:'完成', running:'运行中', paused:'已暂停', partial:'部分完成', stopped:'已终止', failed:'失败'};
+const statusClasses = {done:'ok', running:'run', paused:'run', partial:'run', stopped:'mute', failed:'err'};
+
+function setText(id, value) { const el = document.getElementById(id); if (el) el.textContent = value; }
+function formatMemory(bytes) { return (Number(bytes || 0) / 1048576).toFixed(1); }
+function remaining(scan) { return Math.max(0, Number(scan.target_count || 0) - Number(scan.processed_targets || 0)); }
+function percent(scan) { if (!scan.target_count) return 0; return Math.min(100, Math.floor(scan.processed_targets * 100 / scan.target_count)); }
+function updateControls(status) {
+  const pause = document.getElementById('pause-btn');
+  const resume = document.getElementById('resume-btn');
+  const stop = document.getElementById('stop-btn');
+  if (pause) pause.style.display = canControl && status === 'running' ? '' : 'none';
+  if (resume) resume.style.display = canControl && status === 'paused' ? '' : 'none';
+  if (stop) stop.style.display = canControl && (status === 'running' || status === 'paused') ? '' : 'none';
+}
+function updateScan(scan) {
+  const status = statusNames[scan.status] || '失败';
+  const statusClass = statusClasses[scan.status] || 'err';
+  const statusEl = document.getElementById('scan-status');
+  statusEl.textContent = '';
+  const pill = document.createElement('span'); pill.className = 'pill ' + statusClass; pill.textContent = status; statusEl.appendChild(pill);
+  setText('target-count', scan.target_count || 0);
+  setText('open-ports', scan.open_ports || 0); setText('progress-open-ports', scan.open_ports || 0);
+  setText('finished-at', scan.finished_at ? new Date(scan.finished_at).toLocaleString() : '尚未结束');
+  setText('progress-text', `已处理 ${scan.processed_targets || 0} / ${scan.target_count || 0} 个目标规格`);
+  setText('progress-percent', percent(scan) + '%');
+  const progress = document.getElementById('progress-value'); if (progress) progress.style.width = percent(scan) + '%';
+  setText('remaining-targets', remaining(scan)); setText('failed-targets', scan.failed_targets || 0);
+  setText('batch-progress', `${scan.current_batch || 0} / ${scan.total_batches || 0}`);
+  document.getElementById('progress-panel').style.display = scan.target_count > 0 ? '' : 'none';
+  setText('resource-cpu', Number(scan.cpu_percent || 0).toFixed(1) + '%');
+  setText('resource-memory', formatMemory(scan.memory_rss));
+  setText('resource-max-cpu', Number(scan.max_cpu_percent || 0).toFixed(1) + '%');
+  setText('resource-max-memory', formatMemory(scan.max_memory_rss));
+  setText('scan-command', scan.command || ''); document.getElementById('command-panel').style.display = scan.command ? '' : 'none';
+  const error = document.getElementById('scan-error'); error.style.display = scan.error ? '' : 'none'; setText('scan-error-text', scan.error || '');
+  document.getElementById('stopped-note').style.display = scan.status === 'stopped' ? '' : 'none';
+  scanActive = scan.status === 'running' || scan.status === 'paused';
+  setText('live-state', scanActive ? '每 2 秒更新' : '执行已结束');
+  updateControls(scan.status);
+}
+function appendResults(results) {
+  const body = document.getElementById('results-body');
+  for (const result of results) {
+    if (!result.id || result.id <= lastResultID) continue;
+    lastResultID = Math.max(lastResultID, result.id); resultCount++;
+    const row = document.createElement('tr'); row.dataset.resultId = result.id;
+    const values = [resultCount, result.ip, result.port, result.proto || 'tcp'];
+    for (let i = 0; i < values.length; i++) { const cell = document.createElement('td'); cell.textContent = values[i]; if (i === 0 || i === 2) cell.className = 'num-cell'; row.appendChild(cell); }
+    const state = document.createElement('td'); const pill = document.createElement('span'); pill.className = 'pill ' + (result.status === 1 ? 'ok' : 'mute'); pill.textContent = result.status === 1 ? '开放' : '未开放'; state.appendChild(pill); row.appendChild(state);
+    body.appendChild(row);
+  }
+  setText('result-count', resultCount); document.getElementById('results-empty').style.display = resultCount ? 'none' : '';
+}
+function appendEvents(events) {
+  const list = document.getElementById('event-list');
+  for (const event of events) {
+    if (!event.id || event.id <= lastEventID) continue;
+    lastEventID = Math.max(lastEventID, event.id);
+    const row = document.createElement('div'); row.className = 'scan-event' + (event.level === 'warn' ? ' warn' : ''); row.dataset.eventId = event.id;
+    const time = document.createElement('span'); time.className = 'muted'; time.textContent = event.ts ? new Date(event.ts).toLocaleString() : '';
+    const message = document.createElement('span'); message.textContent = event.message || '';
+    row.append(time, message); list.appendChild(row);
+  }
+  document.getElementById('events-empty').style.display = list.children.length ? 'none' : '';
+}
+async function refreshLive() {
+  if (!scanActive || polling) return;
+  polling = true;
+  try {
+    const response = await fetch(`/api/scans/${scanID}/live?after_id=${lastResultID}&event_after_id=${lastEventID}`, {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '读取实时状态失败');
+    appendResults(data.results || []); appendEvents(data.events || []); updateScan(data.scan);
+  } catch (error) {
+    setText('live-state', '连接失败，自动重试');
+  } finally { polling = false; }
+}
+async function controlScan(action) {
+  if (action === 'stop' && !confirm('确定终止当前扫描？naabu 进程会被停止，已发现的结果保留，但不会生成端口风险告警。')) return;
+  const buttons = ['pause-btn','resume-btn','stop-btn'].map(id => document.getElementById(id)).filter(Boolean);
+  buttons.forEach(button => button.disabled = true);
+  const res = await postEmpty(`/api/scans/${scanID}/${action}`);
+  buttons.forEach(button => button.disabled = false);
+  toast(res.ok ? '操作已提交' : (res.json.error || '操作失败'), res.ok ? 'ok' : 'err');
+  scanActive = true; await refreshLive();
+}
+// resyncScan 手动修正悬空状态：服务重启或进程异常退出后，执行可能仍显示运行中/暂停。
+async function resyncScan() {
+  if (!confirm('该执行的扫描进程可能已随服务重启或异常退出而消失。确认将状态手动同步为「已终止」？已入库结果会保留。')) return;
+  const res = await postEmpty(`/api/scans/${scanID}/resync`);
+  toast(res.ok ? '状态已同步' : (res.json.error || '同步失败'), res.ok ? 'ok' : 'err');
+  if (res.ok) setTimeout(() => location.reload(), 600);
+}
+if (scanActive) { refreshLive(); }
+setInterval(refreshLive, 2000);
+</script>
+{{template "foot" .}}{{end}}

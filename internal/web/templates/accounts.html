@@ -1,0 +1,77 @@
+{{define "accounts.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">管理后台账号与角色。<b>管理员</b>可管理账号 / 审计 / 系统设置；<b>操作员</b>可管理资产、任务、白名单、告警；<b>只读</b>仅可查看。首个管理员账号来自 <code>config.json</code>，请登录后尽快改密。</p>
+
+<div class="panel">
+  <div class="panel-title">新增账号</div>
+  <form id="user-form" class="grid">
+    <label class="field">用户名<input name="username" required placeholder="登录用户名"></label>
+    <label class="field">密码<input name="password" type="password" required placeholder="至少 6 位"></label>
+    <label class="field">角色
+      <select name="role">
+        <option value="operator">操作员</option>
+        <option value="admin">管理员</option>
+        <option value="viewer">只读</option>
+      </select>
+    </label>
+    <label class="field">显示名<input name="display_name" placeholder="可选，如 张三"></label>
+    <div class="full row"><button type="submit" class="btn primary">创建账号</button></div>
+  </form>
+</div>
+
+<div class="section-head"><h2>账号列表（{{len .Users}} 个）</h2></div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ID</th><th>用户名</th><th>显示名</th><th>角色</th><th>启用</th><th>创建时间</th><th>最近登录</th><th>操作</th></tr></thead>
+  <tbody>
+  {{range .Users}}
+  <tr id="u{{.ID}}">
+    <td class="num-cell">{{.ID}}</td><td>{{.Username}}</td>
+    <td><input name="display_name" value="{{.DisplayName}}" style="max-width:140px" onchange="updateUser({{.ID}})"></td>
+    <td>
+      <select name="role" style="max-width:120px" onchange="updateUser({{.ID}})">
+        <option value="admin" {{if eq .Role "admin"}}selected{{end}}>管理员</option>
+        <option value="operator" {{if eq .Role "operator"}}selected{{end}}>操作员</option>
+        <option value="viewer" {{if eq .Role "viewer"}}selected{{end}}>只读</option>
+      </select>
+    </td>
+    <td><input type="checkbox" name="enabled" {{if .Enabled}}checked{{end}} onchange="updateUser({{.ID}})" style="width:auto"></td>
+    <td>{{fmtTime .CreatedAt}}</td><td>{{if .LastLogin}}{{fmtTime .LastLogin}}{{else}}—{{end}}</td>
+    <td>
+      <button class="btn small ghost" onclick="resetPw({{.ID}}, '{{.Username}}')">重置密码</button>
+      <button class="btn small danger" onclick="delUser({{.ID}}, '{{.Username}}')">删除</button>
+    </td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+<script>
+document.getElementById('user-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const res = await postForm('/api/users', new FormData(e.target));
+  if (res.ok) { toast('账号已创建', 'ok'); setTimeout(()=>location.reload(), 600); } else toast(res.json.error || '创建失败', 'err');
+});
+async function updateUser(id) {
+  const row = document.getElementById('u' + id);
+  const fd = new FormData();
+  fd.append('role', row.querySelector('[name=role]').value);
+  fd.append('display_name', row.querySelector('[name=display_name]').value);
+  if (row.querySelector('[name=enabled]').checked) fd.append('enabled', 'on');
+  const res = await postForm('/api/users/' + id, fd);
+  if (res.ok) toast('已更新', 'ok');
+  else { toast(res.json.error || '更新失败', 'err'); setTimeout(()=>location.reload(), 900); }
+}
+async function resetPw(id, name) {
+  const pw = prompt('为 ' + name + ' 设置新密码（至少 6 位）：');
+  if (pw === null) return;
+  const res = await postForm('/api/users/' + id + '/password', { password: pw });
+  if (res.ok) toast('密码已重置', 'ok'); else toast(res.json.error || '失败', 'err');
+}
+async function delUser(id, name) {
+  if (!confirm('删除账号 ' + name + ' ？')) return;
+  const res = await postEmpty('/api/users/' + id, 'DELETE');
+  if (res.ok) { toast('已删除', 'ok'); setTimeout(()=>location.reload(), 600); } else toast(res.json.error || '失败', 'err');
+}
+</script>
+{{template "foot" .}}{{end}}

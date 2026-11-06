@@ -1,0 +1,40 @@
+{{define "results.html"}}{{template "head" .}}{{template "nav" .}}
+<p class="hint">按单次执行展示开放端口，保留执行名称、扫描模式和时间来源。可只看全端口或常用端口结果，避免不同任务混在一起；最多展示 2000 条，进入执行详情可只看某一次执行。</p>
+
+<div class="panel">
+  <div class="panel-title">筛选与检索</div>
+  <form method="get" action="/results" class="filter-bar">
+    <label class="field grow">资产 / 执行名称 / 执行 ID<input name="q" value="{{.Query}}" placeholder="例如 1.2.3.4 或 全端口"></label>
+    <label class="field">扫描模式<select name="mode"><option value="">全部模式</option><option value="full" {{if eq .Mode "full"}}selected{{end}}>全端口 1-65535</option><option value="top" {{if eq .Mode "top"}}selected{{end}}>常用端口 top-1000</option><option value="custom" {{if eq .Mode "custom"}}selected{{end}}>自定义端口</option></select></label>
+    <label class="field">端口<input type="number" name="port" min="1" max="65535" value="{{if .Port}}{{.Port}}{{end}}" placeholder="全部"></label>
+    {{if gt .TaskID 0}}<input type="hidden" name="task_id" value="{{.TaskID}}">{{end}}
+    {{if gt .ScanID 0}}<input type="hidden" name="scan_id" value="{{.ScanID}}">{{end}}
+    <button class="btn primary" type="submit">查询</button><a class="btn ghost" href="/results">重置</a>
+    <a class="btn" href="/results/export?q={{urlquery .Query}}&mode={{.Mode}}&port={{if .Port}}{{.Port}}{{end}}{{if gt .TaskID 0}}&task_id={{.TaskID}}{{end}}{{if gt .ScanID 0}}&scan_id={{.ScanID}}{{end}}">导出 CSV</a>
+  </form>
+</div>
+
+<div class="section-head">
+  <h2>端口结果（{{len .Items}} 条{{if gt .ScanID 0}}，执行 #{{.ScanID}}{{else if gt .TaskID 0}}，任务 #{{.TaskID}}{{end}}）</h2>
+  <a class="btn ghost" href="/scans{{if gt .TaskID 0}}?task_id={{.TaskID}}{{end}}">执行记录</a>
+</div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>资产</th><th>协议</th><th>服务</th><th>扫描模式</th><th>执行名称</th><th>扫描时间</th><th>操作</th></tr></thead>
+  <tbody>
+  {{range .Items}}
+  <tr>
+    <td><strong>{{.IP}}:{{.Port}}</strong></td><td>{{.Proto}}</td>
+    <td>{{if .Service}}{{.Service}}{{else}}<span class="muted">未识别</span>{{end}}</td>
+    <td><span class="pill {{if eq .ScanMode "full"}}info{{else}}mute{{end}}">{{modeName .ScanMode}}</span></td>
+    <td>{{.ScanName}}<div class="muted">执行 #{{.ScanID}} · 任务 #{{.TaskID}}</div></td>
+    <td>{{fmtTime .StartedAt}}</td>
+    <td><a class="btn small ghost" href="/scans/{{.ScanID}}">执行详情</a> <a class="btn small ghost" href="/exposure?q={{urlquery .IP}}&port={{.Port}}">聚合暴露面</a></td>
+  </tr>
+  {{else}}
+  <tr><td colspan="7"><div class="empty"><div class="big">没有匹配的端口结果</div>可调整扫描模式、执行 ID、资产或端口查询条件</div></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{template "foot" .}}{{end}}
