@@ -21,6 +21,7 @@ import (
 	"github.com/xuri/excelize/v2"
 
 	"easm-platform/internal/ai"
+	"easm-platform/internal/buildinfo"
 	"easm-platform/internal/cert"
 	"easm-platform/internal/config"
 	"easm-platform/internal/engine"
@@ -54,6 +55,7 @@ type pageData struct {
 	Section   string
 	Active    string
 	AppName   string
+	Version   string
 	User      string
 	Role      string
 	IsAdmin   bool
@@ -374,7 +376,7 @@ func (s *Server) baseData(r *http.Request, title, active string) (pageData, erro
 		return pageData{}, err
 	}
 	sess := currentUser(r)
-	return pageData{Title: title, Section: sectionOf(active), Active: active, AppName: s.cfg.AppName, User: sess.username, Role: sess.role, IsAdmin: sess.role == "admin", NewAlerts: n}, nil
+	return pageData{Title: title, Section: sectionOf(active), Active: active, AppName: s.cfg.AppName, Version: buildinfo.Version, User: sess.username, Role: sess.role, IsAdmin: sess.role == "admin", NewAlerts: n}, nil
 }
 
 func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {

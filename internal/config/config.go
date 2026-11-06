@@ -47,7 +47,7 @@ func Load(path string) (*Config, error) {
 		c.Listen = ":8000"
 	}
 	if c.AppName == "" {
-		c.AppName = "灵瞰 · 外部攻击面管理平台"
+		c.AppName = "灵瞰 · 资产测绘管理平台"
 	}
 	if c.DBPath == "" {
 		c.DBPath = "data/easm.db"

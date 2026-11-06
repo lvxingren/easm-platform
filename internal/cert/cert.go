@@ -61,7 +61,7 @@ func generate(certPath, keyPath string, hosts []string) error {
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			Organization: []string{"灵瞰 · 外部攻击面管理平台"},
+			Organization: []string{"灵瞰 · 资产测绘管理平台"},
 			CommonName:   "EASM",
 		},
 		NotBefore:             now.Add(-time.Hour), // 容忍轻微的时钟偏差

@@ -39,7 +39,7 @@
     <a href="/settings" class="nav-item {{if eq .Active "settings"}}active{{end}}">系统设置</a>
     {{end}}
   </nav>
-  <div class="sidebar-foot">仅扫描台账内自有 / 已授权资产</div>
+  <div class="sidebar-foot">{{.Version}} · 仅扫描台账内自有 / 已授权资产</div>
 </aside>
 <div class="sidebar-mask" id="sidebar-mask" onclick="toggleSidebar(false)"></div>
 <div class="main">

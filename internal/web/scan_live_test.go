@@ -27,7 +27,7 @@ func newScanLiveTestServer(t *testing.T) (*Server, *store.Store) {
 			t.Fatal(err)
 		}
 	}
-	cfg := &config.Config{AppName: "灵瞰 · 外部攻击面管理平台", NaabuPath: "naabu", NaabuRate: "1000"}
+	cfg := &config.Config{AppName: "灵瞰 · 资产测绘管理平台", NaabuPath: "naabu", NaabuRate: "1000"}
 	eng := engine.New(st, cfg)
 	server := New(st, cfg, scanner.New(st, cfg, eng), eng)
 	for _, username := range []string{"viewer", "operator"} {

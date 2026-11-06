@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 灵瞰 · 外部攻击面管理平台（EASM）—— 成品打包脚本（在开发机执行）
+# 灵瞰 · 资产测绘管理平台（EASM）—— 成品打包脚本（在开发机执行）
 #
 # 作用：交叉编译 Linux 二进制 + 收集部署所需文件到成品目录 dist/，并打成 tar.gz，
 #       实现「一次上传」：scp 该 tar.gz 到服务器 → 解压 → sudo bash install.sh。
@@ -33,8 +33,8 @@ log "清理并创建成品目录：$STAGE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
-log "交叉编译 Linux/${ARCH} 二进制（CGO 关闭，纯 Go 依赖，静态可移植）"
-CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -ldflags="-s -w" -o "$STAGE/easm-platform" .
+log "交叉编译 Linux/${ARCH} 二进制（CGO 关闭，纯 Go 依赖，静态可移植；注入版本号 ${VERSION}）"
+CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -ldflags="-s -w -X easm-platform/internal/buildinfo.Version=${VERSION}" -o "$STAGE/easm-platform" .
 
 log "收集部署文件"
 cp config.json                "$STAGE/config.json"
@@ -44,7 +44,7 @@ cp deploy/ubuntu/easm.service "$STAGE/easm.service"
 chmod +x "$STAGE/install.sh" "$STAGE/easm-platform"
 
 cat > "$STAGE/DEPLOY.txt" <<EOF
-灵瞰 · 外部攻击面管理平台（EASM）—— Linux 部署包（${ARCH} / ${VERSION}）
+灵瞰 · 资产测绘管理平台（EASM）—— Linux 部署包（${ARCH} / ${VERSION}）
 生成时间：$(date '+%Y-%F %T')
 
 【一次上传部署】

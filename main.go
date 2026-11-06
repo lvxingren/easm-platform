@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 
 	"easm-platform/internal/applog"
+	"easm-platform/internal/buildinfo"
 	"easm-platform/internal/cert"
 	"easm-platform/internal/config"
 	"easm-platform/internal/engine"
@@ -24,12 +26,19 @@ func main() {
 	applog.Init()
 	cfgPath := "config.json"
 	if len(os.Args) > 1 {
-		cfgPath = os.Args[1]
+		switch os.Args[1] {
+		case "-version", "--version", "version":
+			fmt.Printf("灵瞰 · 资产测绘管理平台 %s\n", buildinfo.Version)
+			return
+		default:
+			cfgPath = os.Args[1]
+		}
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	applog.Infof("%s %s 正在启动（配置文件：%s）", cfg.AppName, buildinfo.Version, cfgPath)
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("打开数据库失败: %v", err)

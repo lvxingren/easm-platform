@@ -1,0 +1,23 @@
+{
+  "app_name": "灵瞰 · 资产测绘管理平台",
+  "listen": "127.0.0.1:8000",
+  "http_enabled": true,
+  "https_enabled": true,
+  "https_listen": "127.0.0.1:8443",
+  "tls_cert": "data/certs/server.crt",
+  "tls_key": "data/certs/server.key",
+  "tls_hosts": ["localhost", "127.0.0.1"],
+  "db_path": "data/easm.db",
+  "naabu_path": "naabu",
+  "naabu_rate": "2000",
+  "realert_days": 7,
+  "alert_out_of_scope": true,
+  "feishu": {
+    "webhook": "",
+    "secret": ""
+  },
+  "admin": {
+    "user": "admin",
+    "password": "admin123"
+  }
+}
