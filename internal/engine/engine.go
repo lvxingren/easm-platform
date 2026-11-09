@@ -577,7 +577,7 @@ func (e *Engine) NotifyScanSummary(scanID int64, status string, newAlerts []stor
 	if digest != nil && digest.AlertTotal > alertTotal {
 		alertTotal = digest.AlertTotal
 	}
-	if err := nf.Send(e.buildSummaryText(scan, status, newAlerts, alertTotal, resourceAlerts)); err != nil {
+	if err := nf.Send(e.appendFscanSections(e.buildSummaryText(scan, status, newAlerts, alertTotal, resourceAlerts), scanID)); err != nil {
 		log.Printf("飞书发送失败: %v", err)
 		return
 	}
@@ -595,6 +595,55 @@ func (e *Engine) NotifyScanSummary(scanID int64, status string, newAlerts []stor
 }
 
 // NotifyScanResource 已废弃：资源告警不再实时推送飞书，改为统一并入任务结束汇总。
+
+// appendFscanSections 对 fscan 任务在汇总末尾追加「端口发现清单」与「漏洞发现」。
+// 非 fscan 任务（无 engine=fscan 事件）原样返回，保证 naabu 汇总不受影响。
+func (e *Engine) appendFscanSections(text string, scanID int64) string {
+	if n, _ := e.st.CountScanEvents(scanID, "engine"); n == 0 {
+		return text
+	}
+	text = e.appendPortSection(text, scanID)
+	return e.appendVulnSection(text, scanID)
+}
+
+// appendPortSection 追加开放端口总数 + 有界样本列表。
+func (e *Engine) appendPortSection(text string, scanID int64) string {
+	total, err := e.st.CountResultsByScan(scanID)
+	if err != nil || total == 0 {
+		return text
+	}
+	page, err := e.st.ResultsPage(scanID, 0, 10)
+	if err != nil {
+		return text
+	}
+	var b strings.Builder
+	b.WriteString(text)
+	fmt.Fprintf(&b, "\n端口发现：共 %d 个开放端口\n", total)
+	for _, r := range page.Results {
+		svc := r.Service
+		if svc == "" {
+			svc = "-"
+		}
+		fmt.Fprintf(&b, " - %s:%d %s\n", r.IP, r.Port, svc)
+	}
+	return b.String()
+}
+
+// appendVulnSection 在汇总末尾追加 fscan 漏洞发现清单（高危/中危数量 + 有界样本）。
+// 无漏洞时原样返回，保证 naabu 任务的汇总不受影响（向后兼容）。
+func (e *Engine) appendVulnSection(text string, scanID int64) string {
+	high, mid, samples, err := e.st.VulnSummary(scanID, 10)
+	if err != nil || (high == 0 && mid == 0 && len(samples) == 0) {
+		return text
+	}
+	var b strings.Builder
+	b.WriteString(text)
+	fmt.Fprintf(&b, "\n漏洞发现：高危 %d 条，中危 %d 条\n", high, mid)
+	for _, v := range samples {
+		fmt.Fprintf(&b, " - %s:%d %s [%s]\n", v.IP, v.Port, v.Vuln, v.Severity)
+	}
+	return b.String()
+}
 
 func scanStatusText(status string) string {
 	switch status {
@@ -641,7 +690,7 @@ func (e *Engine) buildSummaryText(scan *store.Scan, status string, newAlerts []s
 	b.WriteString("\n")
 	switch status {
 	case "stopped":
-		b.WriteString("说明：任务被用户或平台终止，保留终止前已发现结果，不生成端口风险告警。\n")
+		b.WriteString("说明：已基于已入库结果完成白名单比对与风险告警，结果可能因提前终止而不完整。\n")
 	case "partial", "failed":
 		b.WriteString("说明：结果不完整，未执行白名单比对与端口风险告警，详见执行详情异常。\n")
 	}

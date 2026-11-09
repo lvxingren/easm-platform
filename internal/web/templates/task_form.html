@@ -11,6 +11,15 @@
       </select>
       <span class="field-help" id="mode-help">Top 1000 常用端口基于 Shodan/Censys 统计，适合快速摸底。</span>
     </label>
+    <label class="field">扫描引擎
+      <select name="engine" id="scan-engine" onchange="toggleTaskFields()">
+        <option value="naabu" {{if and (ne .Task.Engine "fscan") (ne .Task.Engine "fscan-vuln") (ne .Task.Engine "fscan-mixed")}}selected{{end}}>naabu（端口，默认）</option>
+        <option value="fscan" {{if eq .Task.Engine "fscan"}}selected{{end}}>fscan · 纯端口扫描</option>
+        <option value="fscan-vuln" {{if eq .Task.Engine "fscan-vuln"}}selected{{end}}>fscan · 漏洞检测</option>
+        <option value="fscan-mixed" {{if eq .Task.Engine "fscan-mixed"}}selected{{end}}>fscan · 混合模式</option>
+      </select>
+      <span class="field-help">fscan 三模式需在系统设置配置 fscan 路径；纯端口默认轻量高效，未配置时不影响 naabu 任务。</span>
+    </label>
     <label class="field full" id="custom-ports-wrap" style="display:none">自定义端口
       <input name="custom_ports" id="custom-ports" value="{{.Task.CustomPorts}}" placeholder="22,80,443 或 8000-9000 或 22,80,443,8000-9000" oninput="validateCustomPorts()">
       <span class="field-help" id="custom-ports-help">逗号分隔单端口，连字符表示范围；每个端口须在 1-65535，结束端口不小于起始端口。</span>
@@ -96,12 +105,18 @@ function toggleTaskFields() {
   document.getElementById('add-ledger-wrap').style.display = type === 'manual' ? 'flex' : 'none';
   document.getElementById('schedule-fields').style.display = document.getElementById('sched-enabled').checked ? 'grid' : 'none';
   const mode = document.getElementById('scan-mode').value;
-  document.getElementById('custom-ports-wrap').style.display = mode === 'custom' ? 'flex' : 'none';
+  const fscan = isFscanEngine();
+  document.getElementById('custom-ports-wrap').style.display = (mode === 'custom' || fscan) ? 'flex' : 'none';
   const help = document.getElementById('mode-help');
-  if (mode === 'full') help.textContent = '扫描全部 1-65535 端口，覆盖最全但耗时最长。';
+  if (fscan) help.textContent = 'fscan 引擎：自定义端口留空时默认全端口 1-65535；常用端口可参考 Top1000。';
+  else if (mode === 'full') help.textContent = '扫描全部 1-65535 端口，覆盖最全但耗时最长。';
   else if (mode === 'custom') help.textContent = '仅扫描下方指定的端口，适合复核特定服务。';
   else help.textContent = 'Top 1000 常用端口基于 Shodan/Censys 统计，适合快速摸底。';
   validateCustomPorts();
+}
+function isFscanEngine() {
+  const e = document.getElementById('scan-engine');
+  return e && e.value.indexOf('fscan') === 0;
 }
 // validateCustomPorts 实时校验自定义端口格式；非自定义模式时直接放行。返回是否合法。
 function validateCustomPorts() {
@@ -112,7 +127,10 @@ function validateCustomPorts() {
   const bad = (msg) => { input.style.borderColor = 'var(--danger)'; help.style.color = 'var(--danger-text)'; help.textContent = msg; return false; };
   const good = () => { input.style.borderColor = ''; help.style.color = ''; help.textContent = '格式正确；逗号分隔单端口，连字符表示范围。'; return true; };
   const v = (input.value || '').trim();
-  if (!v) return bad('自定义端口模式必须填写端口');
+  if (!v) {
+    if (isFscanEngine()) { input.style.borderColor=''; help.style.color=''; help.textContent='留空使用 fscan 默认全端口 1-65535；常用端口可参考 Top1000（22,80,443,3389,...）。'; return true; }
+    return bad('自定义端口模式必须填写端口');
+  }
   for (let raw of v.split(',')) {
     const p = raw.trim();
     if (!p) return bad('存在空的端口项，请检查多余逗号');

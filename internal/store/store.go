@@ -62,6 +62,8 @@ type Scan struct {
 	IsSplitTask    bool `json:"is_split_task"`   // 是否拆分为多个子任务
 	SplitTotal     int  `json:"split_total"`     // 子任务总数
 	SplitCompleted int  `json:"split_completed"` // 已完成子任务数
+	// ResumeOf 指向被续扫的父执行 ID（0 表示非续扫）。
+	ResumeOf int64 `json:"resume_of"`
 }
 
 // ScanResultRow 是带执行来源的端口结果，供跨任务查询和按扫描模式区分。
@@ -100,6 +102,9 @@ type Result struct {
 	Proto   string `json:"proto"`
 	Service string `json:"service"`
 	Status  int    `json:"status"` // 1=开放, 0=未开放
+	// Vuln 为 fscan 等引擎发现的漏洞名称（内存态映射字段）；
+	// 端口/服务仍走 scan_results，漏洞明细持久化到附加表 scan_vulns，不改动 naabu 现有表结构。
+	Vuln string `json:"vuln,omitempty"`
 }
 
 // ScanEvent 记录扫描控制与资源事件，不与开放端口风险告警混用。
@@ -137,6 +142,7 @@ type ScanTask struct {
 	ID           int64
 	Name         string
 	Mode         string
+	Engine       string // naabu | fscan | mixed；空值归一为 naabu（向后兼容）
 	CustomPorts  string // mode==custom 时的端口规格，如 22,80,443,8000-9000
 	TargetType   string // all | tag | manual
 	TargetTag    string
@@ -223,6 +229,7 @@ type ScanSubTask struct {
 	SubIndex     int
 	Status       string // pending | running | done | failed
 	SpecsJSON    string // 本批目标规格 JSON 编码
+	SubScanID    int64  // 子任务对应的 scans 表记录 ID（执行时写入）
 	StartedAt    string
 	FinishedAt   string
 	OpenPorts    int
@@ -256,7 +263,7 @@ CREATE TABLE IF NOT EXISTS scan_results (id INTEGER PRIMARY KEY AUTOINCREMENT, s
 CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, ip_spec TEXT, port_spec TEXT, proto TEXT DEFAULT '*', service TEXT DEFAULT '', owner TEXT DEFAULT '', remark TEXT DEFAULT '', business TEXT DEFAULT '', created_at TEXT);
 CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', in_scope INTEGER DEFAULT 1, status TEXT DEFAULT 'new', first_seen_at TEXT, last_seen_at TEXT, sent_feishu INTEGER DEFAULT 0, created_at TEXT, handler TEXT DEFAULT '', handle_note TEXT DEFAULT '', handled_at TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, mode TEXT, sched_type TEXT, hour INTEGER, minute INTEGER, weekday INTEGER DEFAULT -1, enabled INTEGER DEFAULT 1, last_run TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', mode TEXT DEFAULT 'top', custom_ports TEXT DEFAULT '', target_type TEXT DEFAULT 'all', target_tag TEXT DEFAULT '', ips TEXT DEFAULT '', add_to_ledger INTEGER DEFAULT 0, sched_enabled INTEGER DEFAULT 0, sched_type TEXT DEFAULT 'daily', hour INTEGER DEFAULT 2, minute INTEGER DEFAULT 0, weekday INTEGER DEFAULT -1, created_at TEXT DEFAULT '', last_run TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', mode TEXT DEFAULT 'top', engine TEXT DEFAULT 'naabu', custom_ports TEXT DEFAULT '', target_type TEXT DEFAULT 'all', target_tag TEXT DEFAULT '', ips TEXT DEFAULT '', add_to_ledger INTEGER DEFAULT 0, sched_enabled INTEGER DEFAULT 0, sched_type TEXT DEFAULT 'daily', hour INTEGER DEFAULT 2, minute INTEGER DEFAULT 0, weekday INTEGER DEFAULT -1, created_at TEXT DEFAULT '', last_run TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, pass_hash TEXT NOT NULL, role TEXT DEFAULT 'operator', display_name TEXT DEFAULT '', enabled INTEGER DEFAULT 1, created_at TEXT DEFAULT '', last_login TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT DEFAULT '', username TEXT DEFAULT '', role TEXT DEFAULT '', action TEXT DEFAULT '', target TEXT DEFAULT '', detail TEXT DEFAULT '', ip TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT DEFAULT '');
@@ -264,7 +271,10 @@ CREATE TABLE IF NOT EXISTS scan_events (id INTEGER PRIMARY KEY AUTOINCREMENT, sc
 CREATE TABLE IF NOT EXISTS analysis (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', source_type TEXT DEFAULT '', status TEXT DEFAULT 'pending', created_at TEXT DEFAULT '', finished_at TEXT DEFAULT '', error TEXT DEFAULT '', flow_count INTEGER DEFAULT 0, edge_count INTEGER DEFAULT 0, file_count INTEGER DEFAULT 0, ai_model TEXT DEFAULT '', ai_endpoint TEXT DEFAULT '', summary TEXT DEFAULT '', readable TEXT DEFAULT '', topology_json TEXT DEFAULT '', anomalies_json TEXT DEFAULT '', trace_json TEXT DEFAULT '', used_mock INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS analysis_files (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_id INTEGER NOT NULL, filename TEXT DEFAULT '', size INTEGER DEFAULT 0, format TEXT DEFAULT '', stored_path TEXT DEFAULT '', rows_parsed INTEGER DEFAULT 0, uploaded_at TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS analysis_edges (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_id INTEGER NOT NULL, src_ip TEXT DEFAULT '', dst_ip TEXT DEFAULT '', dst_port INTEGER DEFAULT 0, proto TEXT DEFAULT '', action TEXT DEFAULT '', count INTEGER DEFAULT 0, first_seen TEXT DEFAULT '', last_seen TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS scan_sub_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_scan_id INTEGER NOT NULL, sub_index INTEGER NOT NULL, status TEXT DEFAULT 'pending', specs_json TEXT DEFAULT '', started_at TEXT DEFAULT '', finished_at TEXT DEFAULT '', open_ports INTEGER DEFAULT 0, error TEXT DEFAULT '', UNIQUE(parent_scan_id, sub_index));
+CREATE TABLE IF NOT EXISTS scan_sub_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_scan_id INTEGER NOT NULL, sub_index INTEGER NOT NULL, status TEXT DEFAULT 'pending', specs_json TEXT DEFAULT '', sub_scan_id INTEGER DEFAULT 0, started_at TEXT DEFAULT '', finished_at TEXT DEFAULT '', open_ports INTEGER DEFAULT 0, error TEXT DEFAULT '', UNIQUE(parent_scan_id, sub_index));
+CREATE TABLE IF NOT EXISTS scan_target_status (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL, spec_raw TEXT NOT NULL, spec_kind TEXT DEFAULT 'ip', batch_index INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', updated_at TEXT DEFAULT '', UNIQUE(scan_id, spec_raw));
+CREATE TABLE IF NOT EXISTS scan_vulns (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', vuln TEXT, severity TEXT DEFAULT 'mid', UNIQUE(scan_id, ip, port, proto, vuln));
+CREATE TABLE IF NOT EXISTS domain_map (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT, ip TEXT, source TEXT DEFAULT 'domain_resolver', created_at TEXT, UNIQUE(domain, ip));
 CREATE INDEX IF NOT EXISTS idx_results_scan ON scan_results(scan_id);
 CREATE INDEX IF NOT EXISTS idx_results_scan_id ON scan_results(scan_id, id);
 CREATE INDEX IF NOT EXISTS idx_scan_events_scan ON scan_events(scan_id, id);
@@ -307,6 +317,9 @@ CREATE INDEX IF NOT EXISTS idx_analysis_edges ON analysis_edges(analysis_id);
 		`ALTER TABLE scans ADD COLUMN is_split_task INTEGER DEFAULT 0`,
 		`ALTER TABLE scans ADD COLUMN split_total INTEGER DEFAULT 0`,
 		`ALTER TABLE scans ADD COLUMN split_completed INTEGER DEFAULT 0`,
+		`ALTER TABLE scan_sub_tasks ADD COLUMN sub_scan_id INTEGER DEFAULT 0`,
+		`ALTER TABLE scan_tasks ADD COLUMN engine TEXT DEFAULT 'naabu'`,
+		`ALTER TABLE scans ADD COLUMN resume_of INTEGER DEFAULT 0`,
 	} {
 		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			log.Printf("schema 迁移忽略: %v", err)
@@ -606,9 +619,9 @@ func (s *Store) CreateSubTasks(parentScanID int64, specsJSON []string) error {
 // NextPendingSubTask 获取下一个待执行的子任务（按 sub_index 升序）。
 func (s *Store) NextPendingSubTask(parentScanID int64) (*ScanSubTask, error) {
 	var sub ScanSubTask
-	err := s.db.QueryRow(`SELECT id, parent_scan_id, sub_index, COALESCE(status,''), COALESCE(specs_json,''), COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,'')
+	err := s.db.QueryRow(`SELECT id, parent_scan_id, sub_index, COALESCE(status,''), COALESCE(specs_json,''), COALESCE(sub_scan_id,0), COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,'')
 		FROM scan_sub_tasks WHERE parent_scan_id=? AND status='pending' ORDER BY sub_index LIMIT 1`, parentScanID).
-		Scan(&sub.ID, &sub.ParentScanID, &sub.SubIndex, &sub.Status, &sub.SpecsJSON, &sub.StartedAt, &sub.FinishedAt, &sub.OpenPorts, &sub.Error)
+		Scan(&sub.ID, &sub.ParentScanID, &sub.SubIndex, &sub.Status, &sub.SpecsJSON, &sub.SubScanID, &sub.StartedAt, &sub.FinishedAt, &sub.OpenPorts, &sub.Error)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -633,7 +646,7 @@ func (s *Store) MarkSubTaskRunning(id int64) error {
 
 // SubTasksByParent 获取主任务下的所有子任务。
 func (s *Store) SubTasksByParent(parentScanID int64) ([]ScanSubTask, error) {
-	rows, err := s.db.Query(`SELECT id, parent_scan_id, sub_index, COALESCE(status,''), COALESCE(specs_json,''), COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,'')
+	rows, err := s.db.Query(`SELECT id, parent_scan_id, sub_index, COALESCE(status,''), COALESCE(specs_json,''), COALESCE(sub_scan_id,0), COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,'')
 		FROM scan_sub_tasks WHERE parent_scan_id=? ORDER BY sub_index`, parentScanID)
 	if err != nil {
 		return nil, err
@@ -642,12 +655,46 @@ func (s *Store) SubTasksByParent(parentScanID int64) ([]ScanSubTask, error) {
 	var out []ScanSubTask
 	for rows.Next() {
 		var sub ScanSubTask
-		if err := rows.Scan(&sub.ID, &sub.ParentScanID, &sub.SubIndex, &sub.Status, &sub.SpecsJSON, &sub.StartedAt, &sub.FinishedAt, &sub.OpenPorts, &sub.Error); err != nil {
+		if err := rows.Scan(&sub.ID, &sub.ParentScanID, &sub.SubIndex, &sub.Status, &sub.SpecsJSON, &sub.SubScanID, &sub.StartedAt, &sub.FinishedAt, &sub.OpenPorts, &sub.Error); err != nil {
 			return nil, err
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// UpdateSubTaskScanID 把子任务对应的 scans 记录 ID 写回 scan_sub_tasks，供完成后聚合结果使用。
+func (s *Store) UpdateSubTaskScanID(id int64, subScanID int64) error {
+	_, err := s.db.Exec(`UPDATE scan_sub_tasks SET sub_scan_id=? WHERE id=?`, subScanID, id)
+	return err
+}
+
+// CopySubScanResults 把指定子扫描的结果复制到主扫描 ID 下（INSERT OR IGNORE 去重）。
+// 返回实际新增行数。用于拆分任务完成后主扫描聚合结果以生成告警。
+func (s *Store) CopySubScanResults(parentScanID int64, subScanIDs []int64) (int, error) {
+	if len(subScanIDs) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	total := 0
+	for _, subID := range subScanIDs {
+		res, err := tx.Exec(`INSERT OR IGNORE INTO scan_results(scan_id, ip, port, proto, service, status)
+			SELECT ?, ip, port, proto, service, status FROM scan_results WHERE scan_id=?`, parentScanID, subID)
+		if err != nil {
+			return total, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			total += int(n)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return total, err
+	}
+	return total, nil
 }
 
 // IncrementSplitCompleted 原子增加已完成子任务计数。
@@ -691,7 +738,7 @@ func (s *Store) FinishScan(id int64, openPorts int, scanErr string) error {
 // 重启后内存中已无对应 naabu 进程，这些状态必然是悬空的。返回修正条数。
 func (s *Store) HealStaleScans() (int64, error) {
 	res, err := s.db.Exec(`UPDATE scans SET status='stopped', finished_at=?, error=? WHERE status IN ('running','paused')`,
-		now(), "服务重启后自动修正：原扫描进程已不存在，状态置为已终止；已入库结果保留，不生成白名单比对和告警。")
+		now(), "服务重启后自动修正：原扫描进程已不存在，状态置为已终止；已入库结果保留，但本次重启无法执行白名单比对与告警生成，请等待下次扫描完成或手工触发。")
 	if err != nil {
 		return 0, err
 	}
@@ -735,7 +782,7 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
 		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0),
-		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0)
+		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0), COALESCE(resume_of,0)
 		FROM scans WHERE ` + strings.Join(where, " AND ") + ` ORDER BY id DESC`
 	if limit > 0 {
 		sqlText += " LIMIT ?"
@@ -752,7 +799,7 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 		if err := rows.Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
 			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount,
-			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted); err != nil {
+			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted, &sc.ResumeOf); err != nil {
 			return nil, err
 		}
 		out = append(out, sc)
@@ -767,11 +814,11 @@ func (s *Store) Scan(id int64) (*Scan, error) {
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
 		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0),
-		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0) FROM scans WHERE id=?`, id).
+		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0), COALESCE(resume_of,0) FROM scans WHERE id=?`, id).
 		Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
 			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount,
-			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted)
+			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted, &sc.ResumeOf)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1145,6 +1192,12 @@ func (s *Store) MarkScheduleRun(id int64) error {
 func normalizeScanTask(t ScanTask) ScanTask {
 	t.TargetTag = strings.TrimSpace(t.TargetTag)
 	t.CustomPorts = strings.TrimSpace(t.CustomPorts)
+	if t.Engine != "fscan" && t.Engine != "fscan-vuln" && t.Engine != "fscan-mixed" && t.Engine != "mixed" {
+		t.Engine = "naabu"
+	}
+	if t.Engine == "mixed" {
+		t.Engine = "fscan-mixed"
+	}
 	if t.Mode != "full" && t.Mode != "custom" {
 		t.Mode = "top"
 	}
@@ -1166,8 +1219,8 @@ func normalizeScanTask(t ScanTask) ScanTask {
 
 func (s *Store) CreateScanTask(t ScanTask) (int64, error) {
 	t = normalizeScanTask(t)
-	res, err := s.db.Exec(`INSERT INTO scan_tasks(name, mode, custom_ports, target_type, target_tag, ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		t.Name, t.Mode, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, now())
+	res, err := s.db.Exec(`INSERT INTO scan_tasks(name, mode, engine, custom_ports, target_type, target_tag, ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		t.Name, t.Mode, t.Engine, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, now())
 	if err != nil {
 		return 0, err
 	}
@@ -1176,13 +1229,13 @@ func (s *Store) CreateScanTask(t ScanTask) (int64, error) {
 
 func (s *Store) UpdateScanTask(t ScanTask) error {
 	t = normalizeScanTask(t)
-	_, err := s.db.Exec(`UPDATE scan_tasks SET name=?, mode=?, custom_ports=?, target_type=?, target_tag=?, ips=?, add_to_ledger=?, sched_enabled=?, sched_type=?, hour=?, minute=?, weekday=? WHERE id=?`,
-		t.Name, t.Mode, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, t.ID)
+	_, err := s.db.Exec(`UPDATE scan_tasks SET name=?, mode=?, engine=?, custom_ports=?, target_type=?, target_tag=?, ips=?, add_to_ledger=?, sched_enabled=?, sched_type=?, hour=?, minute=?, weekday=? WHERE id=?`,
+		t.Name, t.Mode, t.Engine, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, t.ID)
 	return err
 }
 
 func (s *Store) ScanTasks() ([]ScanTask, error) {
-	rows, err := s.db.Query(`SELECT id, name, mode, COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks ORDER BY id DESC`)
+	rows, err := s.db.Query(`SELECT id, name, mode, COALESCE(engine,'naabu'), COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1191,7 +1244,7 @@ func (s *Store) ScanTasks() ([]ScanTask, error) {
 	for rows.Next() {
 		var t ScanTask
 		var atl, se int
-		if err := rows.Scan(&t.ID, &t.Name, &t.Mode, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Mode, &t.Engine, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun); err != nil {
 			return nil, err
 		}
 		t.AddToLedger = atl == 1
@@ -1204,8 +1257,8 @@ func (s *Store) ScanTasks() ([]ScanTask, error) {
 func (s *Store) ScanTask(id int64) (*ScanTask, error) {
 	var t ScanTask
 	var atl, se int
-	err := s.db.QueryRow(`SELECT id, name, mode, COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks WHERE id=?`, id).
-		Scan(&t.ID, &t.Name, &t.Mode, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun)
+	err := s.db.QueryRow(`SELECT id, name, mode, COALESCE(engine,'naabu'), COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks WHERE id=?`, id).
+		Scan(&t.ID, &t.Name, &t.Mode, &t.Engine, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1486,6 +1539,28 @@ func (s *Store) SeedSettings(defaults map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// UpgradePerformanceDefaults 把仍等于旧默认值的扫描性能参数升级到调优默认值
+// （更多并行进程/内部线程/发包速率、默认不限制超时）。仅当值等于旧默认（用户未自定义）时升级，
+// 保留用户手动配置；新库由 SeedSettings 直接写入新默认值，不经过此迁移。
+func (s *Store) UpgradePerformanceDefaults() {
+	upgrades := []struct{ key, old, next string }{
+		{"naabu_workers", "25", "100"},
+		{"naabu_workers", "50", "100"},
+		{"scan_concurrency", "3", "6"},
+		{"scan_concurrency", "4", "6"},
+		{"naabu_rate", "2000", "5000"},
+		{"naabu_rate", "3000", "5000"},
+		{"scan_timeout_min", "60", "0"}, // 0 = 不限制超时（符合使用习惯）
+	}
+	for _, u := range upgrades {
+		if s.Setting(u.key) == u.old {
+			if err := s.SetSetting(u.key, u.next); err != nil {
+				log.Printf("升级性能默认值 %s 失败: %v", u.key, err)
+			}
+		}
+	}
 }
 
 func (s *Store) Close() error { return s.db.Close() }

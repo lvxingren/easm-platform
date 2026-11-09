@@ -160,7 +160,7 @@ func TestScanStatusFiltersAndStoppedDetail(t *testing.T) {
 		t.Fatalf("终止状态筛选不正确: 状态=%d，响应=%s", response.Code, body)
 	}
 	response = scanLiveRequest(server, http.MethodGet, fmt.Sprintf("/scans/%d", stoppedID), "viewer")
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "停止前已经发现并入库的结果") {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "终止前已入库的结果") {
 		t.Fatalf("终止详情说明缺失: 状态=%d，响应=%s", response.Code, response.Body.String())
 	}
 }

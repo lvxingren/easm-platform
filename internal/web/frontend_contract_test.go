@@ -24,6 +24,13 @@ type scanDetailPageData struct {
 	LastEventID      int64
 	CapacityRejected bool
 	CapacityAdvice   []string
+	TargetStatus     []store.TargetStatus
+	TSDone           int
+	TSPending        int
+	TSRunning        int
+	TSFailed         int
+	UnfinishedCount  int
+	CanResume        bool
 }
 
 func renderScanDetail(t *testing.T, server *Server, running bool, scan store.Scan) string {

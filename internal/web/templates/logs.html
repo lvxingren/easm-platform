@@ -24,6 +24,27 @@
   </form>
 </div>
 
+<div class="panel">
+  <div class="panel-title">TLS 握手噪音统计</div>
+  <p class="panel-note">被降级的客户端 TLS 握手失败（不信任自签名证书 / 端口扫描半开连接等）不计入报错。来源 IP 仅保留前 3 段掩码；若某网段持续高频出现，可能为扫描攻击。</p>
+  <div class="row" style="margin-bottom:12px">
+    <span class="pill mute">今日 {{.TLSToday}}</span>
+    <span class="pill run">近 7 天 {{.TLSWeek}}</span>
+  </div>
+  {{if .TLSTop}}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>来源网段（/24 掩码）</th><th style="width:120px">次数</th></tr></thead>
+    <tbody>
+    {{range .TLSTop}}<tr><td class="command-text">{{.Segment}}.*</td><td class="num-cell">{{.Count}}</td></tr>{{end}}
+    </tbody>
+  </table>
+  </div>
+  {{else}}
+  <p class="muted">暂无被降级的 TLS 噪音记录。</p>
+  {{end}}
+</div>
+
 <div class="section-head"><h2>运行日志{{if .Level}}（{{.Level}}）{{end}}</h2></div>
 <div class="table-wrap">
 <table>

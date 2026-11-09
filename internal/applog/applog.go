@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 日志级别，用于「报错单独展示」和级别筛选。
@@ -186,7 +187,13 @@ func (serverErrorWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	if IsClientTLSNoise(msg) {
-		Infof("客户端 TLS 握手失败（通常为不信任自签名证书或端口扫描，非服务端故障）：%s", msg)
+		ip := ExtractClientIP(msg)
+		recordTLSNoise(ip, time.Now())
+		masked := msg
+		if ip != "" {
+			masked = strings.ReplaceAll(msg, ip, MaskIP(ip))
+		}
+		Infof("客户端 TLS 握手失败（通常为不信任自签名证书或端口扫描，非服务端故障）：%s", masked)
 		return len(p), nil
 	}
 	Errorf("%s", msg)

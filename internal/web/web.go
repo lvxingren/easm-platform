@@ -108,6 +108,7 @@ func New(st *store.Store, cfg *config.Config, sc *scanner.Runner, eng *engine.En
 		"alertStatusName":     alertStatusName,
 		"scanStatusName":      scanStatusName,
 		"scanStatusClass":     scanStatusClass,
+		"targetStatusName":    store.TargetStatusName,
 		"analysisStatusName":  analysisStatusName,
 		"analysisStatusClass": analysisStatusClass,
 		"weekdayName": func(day int) string {
@@ -226,6 +227,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/analysis/{id}", s.auth(s.apiAnalysisStatus))
 	mux.HandleFunc("GET /api/logs", s.requireAdmin(s.apiLogs))
 	mux.HandleFunc("POST /api/scans/{id}/{action}", s.requireWrite(s.apiScanControl))
+	mux.HandleFunc("POST /api/scans/{id}/resume", s.requireWrite(s.apiScanResume))
 	mux.HandleFunc("GET /api/status", s.auth(s.apiStatus))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -536,6 +538,11 @@ func (s *Server) pageScanDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	bd, _ := s.baseData(r, "执行详情 #"+r.PathValue("id"), "scans")
 	bd.Running = s.sc.IsRunning() && s.sc.CurrentScanID() == id
+	// 目标规格处理状态 + 续扫可用性（终止后区分已完成/未完成）。
+	tsRows, _ := s.st.TargetStatusByScan(id)
+	tsDone, tsPending, tsRunning, tsFailed, _ := s.st.TargetStatusCounts(id)
+	unfinished := tsPending + tsRunning + tsFailed
+	canResume := unfinished > 0 && scanTerminal(sc.Status)
 	s.render(w, "scan_detail.html", struct {
 		pageData
 		Scan             store.Scan
@@ -547,8 +554,16 @@ func (s *Server) pageScanDetail(w http.ResponseWriter, r *http.Request) {
 		LastEventID      int64
 		CapacityRejected bool
 		CapacityAdvice   []string
+		TargetStatus     []store.TargetStatus
+		TSDone           int
+		TSPending        int
+		TSRunning        int
+		TSFailed         int
+		UnfinishedCount  int
+		CanResume        bool
 	}{bd, *sc, results.Results, resultTotal, results.NextCursor, results.HasMore, events, lastEventID,
-		isCapacityRejection(sc.Err), capacitySuggestions(sc.Err)})
+		isCapacityRejection(sc.Err), capacitySuggestions(sc.Err),
+		tsRows, tsDone, tsPending, tsRunning, tsFailed, unfinished, canResume})
 }
 
 func (s *Server) pageResults(w http.ResponseWriter, r *http.Request) {
@@ -667,6 +682,12 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		AiKeySet           bool
 		AutoSplitOnTimeout bool
 		SplitBatchSize     string
+		FscanPath          string
+		FscanWorkers       string
+		FscanVuln          bool
+		FscanMode          string
+		SubfinderPath      string
+		DomainResolve      bool
 	}{
 		pageData:           bd,
 		FeishuWebhook:      get("feishu_webhook", ""),
@@ -674,14 +695,14 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		NaabuPath:          get("naabu_path", s.cfg.NaabuPath),
 		NaabuRate:          get("naabu_rate", s.cfg.NaabuRate),
 		NaabuRetries:       get("naabu_retries", "2"),
-		NaabuWorkers:       get("naabu_workers", "25"),
+		NaabuWorkers:       get("naabu_workers", "100"),
 		NaabuTimeout:       get("naabu_timeout", "1s"),
 		NaabuScanType:      get("naabu_scan_type", "c"),
 		NaabuExcludePorts:  get("naabu_exclude_ports", ""),
 		NaabuInterface:     get("naabu_interface", ""),
 		NaabuVerify:        get("naabu_verify", "0") == "1",
-		ScanTimeout:        get("scan_timeout_min", "60"),
-		ScanConcurrency:    get("scan_concurrency", "3"),
+		ScanTimeout:        get("scan_timeout_min", "0"),
+		ScanConcurrency:    get("scan_concurrency", "6"),
 		RealertDays:        get("realert_days", strconv.Itoa(s.cfg.RealertDays)),
 		AlertOutOfScope:    get("alert_out_of_scope", "1") == "1",
 		ResourceMonitor:    get("resource_monitor", "1") == "1",
@@ -704,6 +725,12 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		AiKeySet:           s.st.Setting("ai_key") != "",
 		AutoSplitOnTimeout: get("auto_split_on_timeout", "1") == "1",
 		SplitBatchSize:     get("split_batch_size", "50"),
+		FscanPath:          get("fscan_path", "fscan"),
+		FscanWorkers:       get("fscan_workers", "100"),
+		FscanVuln:          get("fscan_vuln", "1") == "1",
+		FscanMode:          get("fscan_mode", "port"),
+		SubfinderPath:      get("subfinder_path", ""),
+		DomainResolve:      get("domain_resolve_enabled", "0") == "1",
 	})
 }
 
@@ -939,6 +966,7 @@ func taskFromForm(r *http.Request) store.ScanTask {
 	return store.ScanTask{
 		Name:         strings.TrimSpace(r.FormValue("name")),
 		Mode:         mode,
+		Engine:       r.FormValue("engine"),
 		CustomPorts:  strings.TrimSpace(r.FormValue("custom_ports")),
 		TargetType:   targetType,
 		TargetTag:    strings.TrimSpace(r.FormValue("target_tag")),
@@ -1325,6 +1353,24 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			pairs["split_batch_size"] = v
+		}
+	}
+
+	// fscan 与域名扫描引擎
+	if has("fscan_path") || has("fscan_workers") || has("fscan_vuln") || has("subfinder_path") || has("fscan_mode") {
+		pairs["fscan_path"] = val("fscan_path")
+		pairs["fscan_vuln"] = onOff("fscan_vuln")
+		pairs["subfinder_path"] = val("subfinder_path")
+		pairs["domain_resolve_enabled"] = onOff("domain_resolve_enabled")
+		if m := val("fscan_mode"); m == "port" || m == "vuln" || m == "mixed" {
+			pairs["fscan_mode"] = m
+		}
+		if v := val("fscan_workers"); v != "" {
+			if n, err := strconv.Atoi(v); err != nil || n < 1 || n > 1000 {
+				writeJSON(w, 400, map[string]string{"error": "配置未保存：fscan 内部线程必须是 1-1000 的整数"})
+				return
+			}
+			pairs["fscan_workers"] = v
 		}
 	}
 

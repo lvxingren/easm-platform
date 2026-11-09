@@ -56,7 +56,7 @@ func Load(path string) (*Config, error) {
 		c.NaabuPath = "naabu"
 	}
 	if c.NaabuRate == "" {
-		c.NaabuRate = "2000"
+		c.NaabuRate = "5000"
 	}
 	if c.RealertDays <= 0 {
 		c.RealertDays = 7

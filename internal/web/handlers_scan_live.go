@@ -184,6 +184,22 @@ func (s *Server) apiScanControl(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"ok": "1", "scan": scan})
 }
 
+// apiScanResume 从被终止/部分完成的执行发起「继续扫描未完成节点」增量续扫。
+func (s *Server) apiScanResume(w http.ResponseWriter, r *http.Request) {
+	scanID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if scanID <= 0 {
+		writeJSON(w, 400, map[string]string{"error": "执行 ID 格式错误"})
+		return
+	}
+	newID, err := s.sc.StartResume(scanID)
+	s.audit(r, "续扫未完成目标", "#"+strconv.FormatInt(scanID, 10), fmt.Sprintf("新执行 #%d", newID))
+	if err != nil {
+		writeJSON(w, 409, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": "1", "scan_id": newID})
+}
+
 // apiScanSubTasks 返回拆分任务的子任务列表。
 func (s *Server) apiScanSubTasks(w http.ResponseWriter, r *http.Request) {
 	scanID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)

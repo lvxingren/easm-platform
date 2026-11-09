@@ -16,26 +16,28 @@
 <aside class="sidebar" id="sidebar">
   <div class="brand"><span class="logo">灵瞰</span><span class="brand-sub">EASM</span></div>
   <nav class="nav">
-    <div class="nav-group">概览</div>
     <a href="/" class="nav-item {{if eq .Active "index"}}active{{end}}">仪表盘</a>
-    <div class="nav-group">资产</div>
     <a href="/assets" class="nav-item {{if eq .Active "assets"}}active{{end}}">资产台账</a>
-    <a href="/exposure" class="nav-item {{if eq .Active "exposure"}}active{{end}}">暴露面资产</a>
-    <div class="nav-group">扫描</div>
     <a href="/tasks" class="nav-item {{if eq .Active "tasks"}}active{{end}}">扫描任务</a>
     <a href="/scans" class="nav-item {{if eq .Active "scans"}}active{{end}}">执行记录</a>
-    <a href="/results" class="nav-item {{if eq .Active "results"}}active{{end}}">扫描结果</a>
-    <div class="nav-group">防护</div>
-    <a href="/whitelist" class="nav-item {{if eq .Active "whitelist"}}active{{end}}">白名单</a>
-    <div class="nav-group">风险</div>
-    <a href="/alerts" class="nav-item {{if eq .Active "alerts"}}active{{end}}">风险告警{{if gt .NewAlerts 0}} <span class="badge">{{.NewAlerts}}</span>{{end}}</a>
-    <div class="nav-group">分析</div>
-    <a href="/analysis" class="nav-item {{if eq .Active "analysis"}}active{{end}}">流量分析</a>
+    <div class="nav-sec" id="sec-ops">
+      <button type="button" class="nav-item nav-sec-toggle" onclick="toggleNavGroup('sec-ops')" aria-expanded="true" aria-controls="sec-ops-body">
+        <span>安全运营</span><span class="nav-caret">▾</span>
+      </button>
+      <div class="nav-sec-body" id="sec-ops-body">
+        <a href="/exposure" class="nav-item {{if eq .Active "exposure"}}active{{end}}">暴露面资产</a>
+        <a href="/alerts" class="nav-item {{if eq .Active "alerts"}}active{{end}}">风险告警{{if gt .NewAlerts 0}} <span class="badge">{{.NewAlerts}}</span>{{end}}</a>
+        <a href="/results" class="nav-item {{if eq .Active "results"}}active{{end}}">扫描结果</a>
+        <a href="/whitelist" class="nav-item {{if eq .Active "whitelist"}}active{{end}}">白名单</a>
+        <a href="/analysis" class="nav-item {{if eq .Active "analysis"}}active{{end}}">流量分析</a>
+        {{if .IsAdmin}}
+        <a href="/audit" class="nav-item {{if eq .Active "audit"}}active{{end}}">操作审计</a>
+        <a href="/logs" class="nav-item {{if eq .Active "logs"}}active{{end}}">运行日志</a>
+        {{end}}
+      </div>
+    </div>
     {{if .IsAdmin}}
-    <div class="nav-group">系统管理</div>
     <a href="/accounts" class="nav-item {{if eq .Active "accounts"}}active{{end}}">账号管理</a>
-    <a href="/audit" class="nav-item {{if eq .Active "audit"}}active{{end}}">操作审计</a>
-    <a href="/logs" class="nav-item {{if eq .Active "logs"}}active{{end}}">运行日志</a>
     <a href="/settings" class="nav-item {{if eq .Active "settings"}}active{{end}}">系统设置</a>
     {{end}}
   </nav>

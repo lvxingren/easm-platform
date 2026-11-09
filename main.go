@@ -49,12 +49,12 @@ func main() {
 		"naabu_path":            cfg.NaabuPath,
 		"naabu_rate":            cfg.NaabuRate,
 		"naabu_retries":         "2",
-		"naabu_workers":         "25",
+		"naabu_workers":         "100",
 		"naabu_timeout":         "1s",
 		"naabu_scan_type":       "c",
 		"naabu_verify":          "0",
-		"scan_timeout_min":      "60",
-		"scan_concurrency":      "3",
+		"scan_timeout_min":      "0",
+		"scan_concurrency":      "6",
 		"resource_monitor":      "1",
 		"resource_cpu_percent":  "90",
 		"resource_memory_mb":    "1024",
@@ -66,6 +66,8 @@ func main() {
 	}); err != nil {
 		log.Fatalf("初始化设置失败: %v", err)
 	}
+	// 存量库性能调优：仅把仍等于旧默认值的并发/线程/速率升级到 2C4G 推荐值，保留用户自定义。
+	st.UpgradePerformanceDefaults()
 	if err := st.EnsureAdmin(cfg.Admin.User, cfg.Admin.Password); err != nil {
 		log.Fatalf("初始化管理员账号失败: %v", err)
 	}

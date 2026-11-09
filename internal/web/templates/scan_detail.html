@@ -37,7 +37,7 @@
     <p class="hint" style="margin:10px 0 0">{{if .IsAdmin}}<a href="/settings">前往系统设置调整扫描参数后重新运行</a>{{else}}请把以上信息转交管理员，在「系统设置」中调整扫描参数后重新运行。{{end}}</p>
   </div>
   {{end}}
-  <div id="stopped-note" class="run-banner" style="margin-top:16px;{{if ne .Scan.Status "stopped"}}display:none{{end}}">本次由用户或平台停止，列表仅包含停止前已经发现并入库的结果，不生成白名单比对和端口风险告警。</div>
+  <div id="stopped-note" class="run-banner" style="margin-top:16px;{{if ne .Scan.Status "stopped"}}display:none{{end}}">本次扫描已被终止，列表仅包含终止前已入库的结果。已基于已入库结果完成白名单比对与风险告警，结果可能因提前终止而不完整。</div>
 </div>
 
 <div id="progress-panel" class="panel" {{if eq .Scan.TargetCount 0}}style="display:none"{{end}}>
@@ -52,6 +52,41 @@
   </div>
   <p class="hint" style="margin-top:12px;margin-bottom:0">每批最多 20 个目标规格；端口结果在批处理运行中即时入库，目标进度在每批结束后更新。终止时，未完成的当前批次不会伪记为全部处理。</p>
 </div>
+
+{{if .TargetStatus}}
+<div class="panel" id="target-status-panel">
+  <div class="panel-title">目标处理状态（按规格）</div>
+  <div class="row" style="margin-bottom:12px">
+    <span class="pill ok">已完成 {{.TSDone}}</span>
+    <span class="pill mute">未开始 {{.TSPending}}</span>
+    <span class="pill run">扫描中 {{.TSRunning}}</span>
+    <span class="pill err">失败 {{.TSFailed}}</span>
+    {{if and .CanResume (ne .Role "viewer")}}
+    <button class="btn primary" type="button" onclick="resumeUnfinished()">继续扫描未完成节点（{{.UnfinishedCount}}）</button>
+    {{end}}
+  </div>
+  {{if .Scan.ResumeOf}}<p class="hint" style="margin-top:0">本次为续扫执行，父执行：<a href="/scans/{{.Scan.ResumeOf}}">#{{.Scan.ResumeOf}}</a>（已完成结果保留在父执行，不重复扫描）。</p>{{end}}
+  <details>
+    <summary class="muted" style="cursor:pointer">展开查看每个目标规格的处理状态</summary>
+    <div class="table-wrap" style="margin-top:10px">
+    <table>
+      <thead><tr><th>目标规格</th><th>类型</th><th>批次</th><th>状态</th></tr></thead>
+      <tbody>
+      {{range .TargetStatus}}<tr><td class="command-text">{{.SpecRaw}}</td><td>{{.SpecKind}}</td><td class="num-cell">{{.BatchIndex}}</td><td><span class="pill {{if eq .Status "done"}}ok{{else if eq .Status "failed"}}err{{else if eq .Status "running"}}run{{else}}mute{{end}}">{{targetStatusName .Status}}</span></td></tr>{{end}}
+      </tbody>
+    </table>
+    </div>
+  </details>
+</div>
+<script>
+async function resumeUnfinished() {
+  if (!confirm('将对本次执行中未完成的目标发起增量续扫（保留已完成结果），是否继续？')) return;
+  const res = await postEmpty('/api/scans/{{.Scan.ID}}/resume');
+  if (res.ok) { toast('已发起续扫，跳转到新执行', 'ok'); setTimeout(() => location.href = '/scans/' + res.json.scan_id, 600); }
+  else toast(res.json.error || '续扫发起失败', 'err');
+}
+</script>
+{{end}}
 
 {{if .Scan.IsSplitTask}}
 <div id="split-task-panel" class="panel">

@@ -273,6 +273,8 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 		r.fail(scanID, fmt.Errorf("初始化扫描进度失败，扫描未启动: %v", err))
 		return
 	}
+	// 记录每个目标规格的初始状态（pending），供终止后区分已完成/未完成与增量续扫。
+	_ = r.st.InitTargetStatus(scanID, specs, scanBatchSize)
 
 	// settings 由 StartTask 传入（与容量预检同一份快照，-rate 已是 plan.PerRate）：
 	// 这里不再重新读取设置，避免执行与容量结论不一致。
@@ -287,7 +289,13 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 		r.fail(scanID, fmt.Errorf("扫描控制状态初始化失败"))
 		return
 	}
-	r.active.deadline = time.Now().Add(timeout)
+	// 超时为 0 表示不限制（默认）：deadline 置零，所有批次/重试不做超时强制终止，
+	// 任务跑到完成；如需保护可在系统设置填写上限分钟数。
+	if timeout > 0 {
+		r.active.deadline = time.Now().Add(timeout)
+	} else {
+		r.active.deadline = time.Time{}
+	}
 	r.mu.Unlock()
 
 	// 启动前按容量/保留策略清理旧的扫描产物：只删除平台生成的 batch_* 文件，
@@ -363,7 +371,7 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 		if message != "" {
 			message += "\n\n"
 		}
-		message += "扫描已由用户或平台停止，当前展示的是停止前已发现的结果；不执行白名单比对和端口风险告警。"
+		message += "扫描已由用户或平台停止。已基于已入库结果完成白名单比对与风险告警，结果可能因提前终止而不完整。"
 	} else if message != "" {
 		status = "failed"
 		if snap.openPorts > 0 {
@@ -376,9 +384,10 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 	}
 	log.Printf("扫描 %d 结束(%s): 已处理 %d/%d 个目标，异常目标 %d 个，开放端口 %d 条，耗时 %s",
 		scanID, status, snap.processed, len(specs), snap.failed, snap.openPorts, elapsed)
-	// 任务结束时无论成败只发一条飞书汇总；仅完整完成的执行才比对白名单并生成端口风险告警。
+	// 任务结束时无论成败只发一条飞书汇总；完整完成或用户/平台停止的执行都会比对白名单并生成端口风险告警，
+	// 停止场景下结果可能不完整，但已入库的部分仍值得及时呈现给运营人员跟进。
 	var newAlerts []store.Alert
-	if status == "done" {
+	if status == "done" || status == "stopped" {
 		newAlerts = r.eng.AfterScan(scanID)
 	}
 	r.eng.NotifyScanSummary(scanID, status, newAlerts)
@@ -398,9 +407,11 @@ func (r *Runner) processBatch(scanID int64, settings NaabuSettings, mode, custom
 	if err := writeTargets(targetsFile, batch); err != nil {
 		prog.addMessage(fmt.Sprintf("批次 %d 写入目标文件 %q 失败：%v；本批目标未处理，请检查目录权限和磁盘空间", batchNumber, targetsFile, err))
 		prog.addFailed(len(batch))
+		_ = r.st.MarkBatchTargetStatus(scanID, batchIndex, store.TargetFailed)
 		prog.completeBatch()
 		return
 	}
+	_ = r.st.MarkBatchTargetStatus(scanID, batchIndex, store.TargetRunning)
 	if prog.connectOnly() {
 		// 本次执行已确认 SYN 权限不足：后续批次不再重复踩坑，直接使用 CONNECT。
 		settings.ScanType = "c"
@@ -496,6 +507,16 @@ func (r *Runner) processBatch(scanID int64, settings NaabuSettings, mode, custom
 	if outcome.parseErr != nil {
 		prog.addMessage(fmt.Sprintf("批次 %d 读取输出文件 %q 不完整：%v；本批实时及文件去重后新增 %d 条结果", batchNumber, outFile, outcome.parseErr, outcome.results))
 	}
+	// 记录本批目标规格终态：被终止视为未完成（running），异常视为 failed，正常为 done。
+	batchStatus := store.TargetDone
+	if stopped && outcome.runErr != nil {
+		batchStatus = store.TargetRunning
+	} else if outcome.runErr != nil || outcome.parseErr != nil || outcome.streamErr != nil || outcome.timedOut ||
+		outcome.storeErr != nil || outcome.groupUnreaped || outcome.drainClosed || outcome.truncatedStdout ||
+		outcome.oversizedLines > 0 || outcome.resolutionFailures > 0 || outcome.malformedLines > 0 {
+		batchStatus = store.TargetFailed
+	}
+	_ = r.st.MarkBatchTargetStatus(scanID, batchIndex, batchStatus)
 	prog.completeBatch()
 	if err := r.persistProgress(scanID, prog, commandText); err != nil {
 		prog.addMessage(fmt.Sprintf("批次 %d 完成后保存进度失败：%v", batchNumber, err))
@@ -1199,19 +1220,41 @@ func appendProcessOutput(out *strings.Builder, line string) {
 
 // runSplitTask 串行执行拆分任务的各个子任务。
 // 每个子任务独立计算容量、执行扫描、更新状态。
-// 所有子任务完成后才进行告警控制。
-func (r *Runner) runSplitTask(scanID int64, batches [][]store.TargetSpec, mode, customPorts string, settings NaabuSettings) {
+// 所有子任务完成后聚合结果到主扫描，统一执行白名单比对与告警生成。
+func (r *Runner) runSplitTask(scanID int64, batches [][]store.TargetSpec, mode, customPorts string, settings NaabuSettings, engine string, fs FscanSettings) {
 	defer r.setRunning(false)
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("扫描 %d panic 恢复: %v", scanID, rec)
-			_ = r.st.ForceStopScanIfActive(scanID, fmt.Sprintf("扫描进程异常（panic）：%v；已保留入库结果，不生成告警。", rec))
+			_ = r.st.ForceStopScanIfActive(scanID, fmt.Sprintf("扫描进程异常（panic）：%v；已保留入库结果，已完成子任务的结果待聚合。", rec))
 		}
 	}()
 
 	start := time.Now()
 	totalBatches := len(batches)
+
+	// 读取主扫描记录，获取名称和任务 ID 供子任务沿用
+	var parentName string
+	var parentTaskID int64
+	if parentScan, err := r.st.Scan(scanID); err == nil && parentScan != nil {
+		parentName = parentScan.Name
+		parentTaskID = parentScan.TaskID
+	} else {
+		parentName = fmt.Sprintf("拆分任务#%d", scanID)
+	}
+
 	log.Printf("扫描 %d 拆分任务启动：共 %d 个子任务，串行执行", scanID, totalBatches)
+
+	// 主任务也记录每个目标规格状态（按拆分批粒度），供终止后续扫。
+	var allSpecs []store.TargetSpec
+	for _, b := range batches {
+		allSpecs = append(allSpecs, b...)
+	}
+	splitBatch := 1
+	if len(batches) > 0 {
+		splitBatch = len(batches[0])
+	}
+	_ = r.st.InitTargetStatus(scanID, allSpecs, splitBatch)
 
 	// 记录开始执行事件
 	_ = r.st.AddScanEvent(scanID, "info", "split_start", fmt.Sprintf("拆分任务开始执行，共 %d 个子任务", totalBatches))
@@ -1246,8 +1289,8 @@ func (r *Runner) runSplitTask(scanID int64, batches [][]store.TargetSpec, mode, 
 		log.Printf("扫描 %d 子任务 %d/%d 开始执行（%d 个目标）", scanID, subIndex, totalBatches, len(batch))
 		_ = r.st.AddScanEvent(scanID, "info", "subtask_start", fmt.Sprintf("子任务 %d/%d 开始执行，%d 个目标", subIndex, totalBatches, len(batch)))
 
-		// 执行子任务扫描
-		subOpenPorts, subErr := r.runSubTask(scanID, subTask.ID, batch, mode, customPorts, settings, subIndex, totalBatches)
+		// 执行子任务扫描（名称沿用主任务，task_id 与主任务一致）
+		subOpenPorts, subErr := r.runSubTask(scanID, subTask.ID, parentName, parentTaskID, batch, mode, customPorts, settings, subIndex, totalBatches, engine, fs)
 		totalOpenPorts += subOpenPorts
 
 		if subErr != nil {
@@ -1262,21 +1305,54 @@ func (r *Runner) runSplitTask(scanID int64, batches [][]store.TargetSpec, mode, 
 
 		// 更新主任务进度
 		_ = r.st.IncrementSplitCompleted(scanID)
+		// 记录本批目标规格状态：被终止→未完成，子任务失败→failed，否则 done。
+		bStatus := store.TargetDone
+		if r.isStopped(scanID) {
+			bStatus = store.TargetRunning
+		} else if subErr != nil {
+			bStatus = store.TargetFailed
+		}
+		_ = r.st.MarkBatchTargetStatus(scanID, i, bStatus)
 	}
 
-	// 所有子任务执行完成
+	// 所有子任务执行完成（或被终止）
 	elapsed := time.Since(start).Round(time.Second)
 	status := "done"
 	var message string
 
 	if r.isStopped(scanID) {
 		status = "stopped"
-		message = fmt.Sprintf("拆分任务被用户终止，累计发现 %d 个开放端口，耗时 %s", totalOpenPorts, elapsed)
+		message = fmt.Sprintf("拆分任务被用户终止，已完成子任务的结果已聚合，累计发现 %d 个开放端口，耗时 %s", totalOpenPorts, elapsed)
 	} else if hasFailure {
 		status = "partial"
 		message = fmt.Sprintf("拆分任务部分完成，%d 个子任务失败：%s\n累计发现 %d 个开放端口，耗时 %s", len(failureMessages), strings.Join(failureMessages, "; "), totalOpenPorts, elapsed)
 	} else {
 		message = fmt.Sprintf("拆分任务全部完成，共 %d 个子任务，累计发现 %d 个开放端口，耗时 %s", totalBatches, totalOpenPorts, elapsed)
+	}
+
+	// 聚合子扫描结果到主扫描，使主扫描拥有完整结果集用于白名单比对与告警
+	subTasks, _ := r.st.SubTasksByParent(scanID)
+	var subScanIDs []int64
+	for _, sub := range subTasks {
+		if sub.SubScanID > 0 && (sub.Status == "done" || sub.Status == "running") {
+			subScanIDs = append(subScanIDs, sub.SubScanID)
+		}
+	}
+	if len(subScanIDs) > 0 {
+		copied, err := r.st.CopySubScanResults(scanID, subScanIDs)
+		if err != nil {
+			log.Printf("扫描 %d 聚合子扫描结果失败: %v", scanID, err)
+			_ = r.st.AddScanEvent(scanID, "warn", "split_aggregate", fmt.Sprintf("聚合子扫描结果失败：%v", err))
+		} else {
+			log.Printf("扫描 %d 聚合子扫描结果：从 %d 个子扫描复制 %d 条结果到主扫描", scanID, len(subScanIDs), copied)
+			_ = r.st.AddScanEvent(scanID, "info", "split_aggregate", fmt.Sprintf("已聚合 %d 个子扫描的 %d 条结果到主扫描", len(subScanIDs), copied))
+		}
+		// fscan 引擎额外聚合漏洞明细到主扫描，供统一告警与飞书汇总。
+		if engineIsFscan(engine) {
+			if nv, err := r.st.CopySubScanVulns(scanID, subScanIDs); err == nil && nv > 0 {
+				_ = r.st.AddScanEvent(scanID, "info", "split_aggregate", fmt.Sprintf("已聚合 %d 条漏洞明细到主扫描", nv))
+			}
+		}
 	}
 
 	// 更新主扫描记录状态
@@ -1287,50 +1363,59 @@ func (r *Runner) runSplitTask(scanID int64, batches [][]store.TargetSpec, mode, 
 	log.Printf("扫描 %d 拆分任务结束(%s): %s", scanID, status, message)
 	_ = r.st.AddScanEvent(scanID, "info", "split_complete", message)
 
-	// 拆分任务的告警已在各子任务完成后独立触发，这里只发送飞书汇总通知
-	r.eng.NotifyScanSummary(scanID, status, nil)
+	// 聚合子扫描结果后统一生成告警，再发送飞书汇总通知
+	var newAlerts []store.Alert
+	if status == "done" || status == "stopped" {
+		newAlerts = r.eng.AfterScan(scanID)
+	}
+	r.eng.NotifyScanSummary(scanID, status, newAlerts)
 }
 
 // runSubTask 执行单个子任务的扫描。
+// parentName 沿用主任务名称，parentTaskID 保持与主任务相同的任务关联。
 // 返回发现的开放端口数和可能的错误。
-func (r *Runner) runSubTask(parentScanID, subTaskID int64, specs []store.TargetSpec, mode, customPorts string, settings NaabuSettings, subIndex, totalSubTasks int) (int, error) {
+func (r *Runner) runSubTask(parentScanID, subTaskID int64, parentName string, parentTaskID int64, specs []store.TargetSpec, mode, customPorts string, settings NaabuSettings, subIndex, totalSubTasks int, engine string, fs FscanSettings) (int, error) {
 	// 为子任务创建数据目录
 	dataDir := filepath.Join("data", fmt.Sprintf("scan_%d_sub_%d", parentScanID, subIndex))
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return 0, fmt.Errorf("创建子任务数据目录失败: %v", err)
 	}
 
-	// 容量预检（针对这个子任务）
-	plan, err := r.planScanCapacity(settings, mode, customPorts, specs)
-	if err != nil {
-		// 子任务预检失败不终止其他子任务，直接返回错误
-		return 0, fmt.Errorf("子任务容量预检失败: %v", err)
-	}
-
-	// 更新设置使用容量计划的速率
-	subSettings := settings
-	subSettings.Rate = strconv.Itoa(plan.PerRate)
-
-	// 创建子任务的扫描记录（在 scans 表中，parent_scan_id 关联主任务）
-	subScanName := fmt.Sprintf("子任务 %d/%d", subIndex, totalSubTasks)
-	subScanID, err := r.st.CreateScan(0, subScanName, mode)
+	// 创建子任务的扫描记录：名称沿用主任务 + 子任务序号，task_id 与主任务一致
+	subScanName := fmt.Sprintf("%s · 子任务 %d/%d", parentName, subIndex, totalSubTasks)
+	subScanID, err := r.st.CreateScan(parentTaskID, subScanName, mode)
 	if err != nil {
 		return 0, fmt.Errorf("创建子任务扫描记录失败: %v", err)
 	}
+	if err := r.st.UpdateSubTaskScanID(subTaskID, subScanID); err != nil {
+		log.Printf("扫描 %d 子任务 %d 写回 sub_scan_id 失败: %v", parentScanID, subIndex, err)
+	}
 
-	// 启动子任务的实际扫描
-	// 注意：这里需要创建一个临时的执行控制
-	// 为简化实现，我们直接调用 run 方法，但需要处理并发控制
-	// 由于子任务串行执行，可以复用主任务的执行控制
+	// fscan 引擎子任务：独立容量估算 + fscan 执行（不生成告警，由主任务聚合后统一）。
+	if engineIsFscan(engine) {
+		subFs := fs
+		subFs.CustomPorts = customPorts
+		estimated := estimateFscanDuration(len(specs), subFs.Workers, subFs.Mode)
+		if subFs.Timeout > 0 && estimated > subFs.Timeout && len(specs) > capacitySmallBatchSpecs {
+			return 0, fmt.Errorf("子任务 fscan 容量预检失败：预计 %s 超过超时 %s", estimated.Round(time.Second), subFs.Timeout)
+		}
+		return r.runFscanBatch(subScanID, specs, subFs)
+	}
+
+	// naabu 引擎子任务：容量预检（针对这个子任务）
+	plan, err := r.planScanCapacity(settings, mode, customPorts, specs)
+	if err != nil {
+		return 0, fmt.Errorf("子任务容量预检失败: %v", err)
+	}
+	subSettings := settings
+	subSettings.Rate = strconv.Itoa(plan.PerRate)
 
 	// 执行扫描（复用核心执行逻辑，但不修改 running 状态）
 	r.executeScan(subScanID, mode, customPorts, specs, subSettings, plan)
 
-	// 获取子任务结果
 	subScan, err := r.st.Scan(subScanID)
 	if err != nil {
 		return 0, fmt.Errorf("获取子任务结果失败: %v", err)
 	}
-
 	return subScan.OpenPorts, nil
 }

@@ -16,8 +16,8 @@ import (
 // 容量预检的固定预算参数。所有数值都是显式常量，避免“多个 naabu 进程无界放大配置”。
 const (
 	// defaultTotalRate 是平台级总发包速率默认预算（所有并行 naabu 进程之和）。
-	// 与默认单进程速率 2000、默认并发 3 的乘积一致，保证默认配置行为不变。
-	defaultTotalRate = 6000
+	// 与调优后单进程速率 5000、默认并发 6 的乘积一致，保证默认配置行为不变。
+	defaultTotalRate = 30000
 	// defaultProcessBudget 是平台同时运行的 naabu 进程数默认预算（上限）。
 	defaultProcessBudget = 16
 	// naabuDefaultRetries 是本机 naabu 2.7.0 的 -retries 契约：
@@ -39,6 +39,10 @@ const (
 	capacityMinFreeDisk int64 = 64 << 20
 	// capacityWarnRatio 是预计耗时占任务超时的告警比例。
 	capacityWarnRatio = 0.8
+	// capacitySmallBatchSpecs 是小批量豁免阈值：目标规格数 ≤ 该值时，耗时估算超时只告警不拒绝。
+	// 理由：估算模型按最坏情况（所有端口×所有重试轮数）计算，实际 naabu 对开放端口立即响应、
+	// 对 RST 端口不重试，真实耗时远低于估算；小批量属常规运维规模，运行时超时仍是安全网。
+	capacitySmallBatchSpecs = 500
 	// capacityStartupOverhead 是每个批次进程启动、收尾与入库的固定开销估算。
 	capacityStartupOverhead = 3 * time.Second
 	// capacityTargetCap 是目标展开计数上限，超过后按"至少这么多目标"估算，避免超大网段耗尽内存。
@@ -250,14 +254,21 @@ func evaluateCapacity(in capacityInput) (capacityPlan, error) {
 	plan.Estimated = estimateCapacityDuration(in.BatchWork, in.Ports, naabuRetries, concurrency, perRate)
 
 	if in.Timeout > 0 && plan.Estimated > in.Timeout {
-		requiredRate := int(math.Ceil(float64(plan.Probes) / in.Timeout.Seconds()))
-		if requiredRate < 1 {
-			requiredRate = 1
+		// 小批量豁免：≤ capacitySmallBatchSpecs 条规格属常规运维规模，估算为最坏情况，
+		// 运行时超时仍会保护（超时后保留已发现结果），不应在预检阶段硬拒绝。
+		if plan.Batches*scanBatchSize <= capacitySmallBatchSpecs {
+			plan.Warnings = append(plan.Warnings, fmt.Sprintf("预计耗时 %s 超过任务超时 %s（最坏情况估算），但目标规模较小（≤%d 条规格），已放行执行；运行时超时仍会保护，超时后保留已发现结果并标记为部分完成",
+				plan.Estimated.Round(time.Second), in.Timeout, capacitySmallBatchSpecs))
+		} else {
+			requiredRate := int(math.Ceil(float64(plan.Probes) / in.Timeout.Seconds()))
+			if requiredRate < 1 {
+				requiredRate = 1
+			}
+			requiredMinutes := int(math.Ceil(plan.Estimated.Minutes()))
+			return plan, fmt.Errorf("容量预检未通过：%d 个目标（展开估算）× %d 端口 × naabu %d 轮，共 %d 个真实批次，按生效并发 %d、每进程速率 %d/s 预计约 %s，超过任务超时 %s。平台不会自动缩小目标端口范围，也不会静默接受必然被截断的执行。可行调整（任选其一）：1) 把“单次任务超时”提高到至少 %d 分钟；2) 把平台总速率预算提高到至少 %d/s（当前 %d/s）；3) 降低 naabu 重试轮数（当前设置 %d，0 表示工具默认 %d 轮；估算按 %d 轮发包）；4) 减少目标数量。另：平台自身的批次异常重启（最多 %d 次）属于异常兜底，不计入此估算。",
+				targets, in.Ports, naabuRetries, plan.Batches, concurrency, perRate, plan.Estimated.Round(time.Second), in.Timeout,
+				requiredMinutes, requiredRate, in.TotalRate, in.Retries, naabuDefaultRetries, naabuRetries, plan.PlatformRestarts)
 		}
-		requiredMinutes := int(math.Ceil(plan.Estimated.Minutes()))
-		return plan, fmt.Errorf("容量预检未通过：%d 个目标（展开估算）× %d 端口 × naabu %d 轮，共 %d 个真实批次，按生效并发 %d、每进程速率 %d/s 预计约 %s，超过任务超时 %s。平台不会自动缩小目标端口范围，也不会静默接受必然被截断的执行。可行调整（任选其一）：1) 把“单次任务超时”提高到至少 %d 分钟；2) 把平台总速率预算提高到至少 %d/s（当前 %d/s）；3) 降低 naabu 重试轮数（当前设置 %d，0 表示工具默认 %d 轮；估算按 %d 轮发包）；4) 减少目标数量。另：平台自身的批次异常重启（最多 %d 次）属于异常兜底，不计入此估算。",
-			targets, in.Ports, naabuRetries, plan.Batches, concurrency, perRate, plan.Estimated.Round(time.Second), in.Timeout,
-			requiredMinutes, requiredRate, in.TotalRate, in.Retries, naabuDefaultRetries, naabuRetries, plan.PlatformRestarts)
 	}
 	if in.Timeout > 0 && float64(plan.Estimated) > float64(in.Timeout)*capacityWarnRatio {
 		plan.Warnings = append(plan.Warnings, fmt.Sprintf("预计耗时 %s 已接近任务超时 %s，建议提高超时或平台总速率预算，否则可能只完成部分批次", plan.Estimated.Round(time.Second), in.Timeout))
@@ -663,15 +674,22 @@ func CalculateSplitBatches(specs []store.TargetSpec, batchSize int) [][]store.Ta
 //   - portsPerTarget: 每个目标的目标的端口数
 //   - ratePerSecond: 每秒探测速率
 //   - timeout: 任务超时时间
+//   - retries: naabu 重试轮数（0 表示工具默认 3 轮）
 //
 // 返回：推荐的批次大小（至少为 1）
-func CalculateSmartBatchSize(targetCount, portsPerTarget, ratePerSecond int, timeout time.Duration) int {
+func CalculateSmartBatchSize(targetCount, portsPerTarget, ratePerSecond int, timeout time.Duration, retries ...int) int {
 	if targetCount <= 0 || portsPerTarget <= 0 || ratePerSecond <= 0 {
 		return defaultSplitBatchSize
 	}
 
-	// 计算单个目标的预估耗时（秒）
-	singleTargetDuration := float64(portsPerTarget) / float64(ratePerSecond)
+	// naabu 轮数契约：0 表示未设置（工具默认 3 轮），>0 即为实际轮数
+	naabuRetries := naabuDefaultRetries
+	if len(retries) > 0 && retries[0] > 0 {
+		naabuRetries = retries[0]
+	}
+
+	// 计算单个目标的预估耗时（秒），包含重试轮数
+	singleTargetDuration := float64(portsPerTarget) * float64(naabuRetries) / float64(ratePerSecond)
 
 	// 目标超时时间的 80%（留 20% 余量）
 	effectiveTimeout := float64(timeout.Seconds()) * 0.8

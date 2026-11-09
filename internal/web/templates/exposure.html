@@ -7,6 +7,7 @@
     <label class="field grow">IP 或服务<input name="q" value="{{.Query}}" placeholder="例如 1.2.3.4"></label>
     <label class="field">端口<input type="number" name="port" min="1" max="65535" value="{{if .Port}}{{.Port}}{{end}}" placeholder="全部"></label>
     <label class="field">协议<select name="proto"><option value="">全部</option><option value="tcp" {{if eq .Proto "tcp"}}selected{{end}}>TCP</option><option value="udp" {{if eq .Proto "udp"}}selected{{end}}>UDP</option></select></label>
+    <label class="field">域名<input name="domain" value="{{.Domain}}" placeholder="按域名反查开放端口"></label>
     <button class="btn primary" type="submit">查询</button>
     <a class="btn ghost" href="/exposure">重置</a>
     <a class="btn" href="/exposure/export?q={{urlquery .Query}}&proto={{.Proto}}&port={{.Port}}">导出 CSV</a>
@@ -29,21 +30,22 @@
 <div class="section-head"><h2>开放端口资产（{{len .Items}} 条，最多展示 1000 条）</h2></div>
 <div class="table-wrap">
 <table>
-  <thead><tr>{{if ne .Role "viewer"}}<th style="width:36px"><input type="checkbox" onclick="toggleAllChecks(this,'exposure-check');updateExposureBatch()" title="全选/取消"></th>{{end}}<th>资产</th><th>协议</th><th>服务</th><th>白名单</th><th>告警</th><th>首次发现</th><th>最近发现</th><th>出现次数</th><th>操作</th></tr></thead>
+  <thead><tr>{{if ne .Role "viewer"}}<th style="width:36px"><input type="checkbox" onclick="toggleAllChecks(this,'exposure-check');updateExposureBatch()" title="全选/取消"></th>{{end}}<th>资产</th><th>域名</th><th>协议</th><th>服务</th><th>白名单</th><th>告警</th><th>首次发现</th><th>最近发现</th><th>出现次数</th><th>操作</th></tr></thead>
   <tbody>
-  {{range .Items}}
+  {{range $i, $it := .Items}}
   <tr>
-    {{if ne $.Role "viewer"}}<td><input type="checkbox" class="exposure-check" data-ip="{{.IP}}" data-port="{{.Port}}" data-proto="{{.Proto}}" data-service="{{.Service}}" onclick="updateExposureBatch()"></td>{{end}}
-    <td><strong>{{.IP}}:{{.Port}}</strong></td>
-    <td>{{.Proto}}</td>
-    <td>{{if .Service}}{{.Service}}{{else}}<span class="muted">未识别</span>{{end}}</td>
-    <td>{{if .Whitelisted}}<span class="pill ok">已加白</span>{{else}}<span class="pill run">未加白</span>{{end}}</td>
-    <td>{{if .AlertStatus}}{{if eq .AlertStatus "new"}}<span class="pill err">{{alertStatusName .AlertStatus}}</span>{{else if eq .AlertStatus "acked"}}<span class="pill run">{{alertStatusName .AlertStatus}}</span>{{else}}<span class="pill mute">{{alertStatusName .AlertStatus}}</span>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
-    <td>{{fmtTime .FirstSeenAt}}</td><td>{{fmtTime .LastSeenAt}}</td><td class="num-cell">{{.SeenCount}}</td>
-    <td><div class="btn-group"><a class="btn small ghost" href="/scans/{{.LastScanID}}">最近扫描</a> <a class="btn small ghost" href="/alerts?q={{urlquery .IP}}">相关告警</a>{{if and (ne $.Role "viewer") (not .Whitelisted)}}<button class="btn small" type="button" onclick="whitelistOne('{{.IP}}','{{.Port}}','{{.Proto}}','{{.Service}}')">加白</button>{{end}}</div></td>
+    {{if ne $.Role "viewer"}}<td><input type="checkbox" class="exposure-check" data-ip="{{$it.IP}}" data-port="{{$it.Port}}" data-proto="{{$it.Proto}}" data-service="{{$it.Service}}" onclick="updateExposureBatch()"></td>{{end}}
+    <td><strong>{{$it.IP}}:{{$it.Port}}</strong></td>
+    <td>{{with index $.Domains $i}}{{range $j, $d := .}}{{if $j}}, {{end}}<span class="command-text">{{$d}}</span>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{$it.Proto}}</td>
+    <td>{{if $it.Service}}{{$it.Service}}{{else}}<span class="muted">未识别</span>{{end}}</td>
+    <td>{{if $it.Whitelisted}}<span class="pill ok">已加白</span>{{else}}<span class="pill run">未加白</span>{{end}}</td>
+    <td>{{if $it.AlertStatus}}{{if eq $it.AlertStatus "new"}}<span class="pill err">{{alertStatusName $it.AlertStatus}}</span>{{else if eq $it.AlertStatus "acked"}}<span class="pill run">{{alertStatusName $it.AlertStatus}}</span>{{else}}<span class="pill mute">{{alertStatusName $it.AlertStatus}}</span>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{fmtTime $it.FirstSeenAt}}</td><td>{{fmtTime $it.LastSeenAt}}</td><td class="num-cell">{{$it.SeenCount}}</td>
+    <td><div class="btn-group"><a class="btn small ghost" href="/scans/{{$it.LastScanID}}">最近扫描</a> <a class="btn small ghost" href="/alerts?q={{urlquery $it.IP}}">相关告警</a>{{if and (ne $.Role "viewer") (not $it.Whitelisted)}}<button class="btn small" type="button" onclick="whitelistOne('{{$it.IP}}','{{$it.Port}}','{{$it.Proto}}','{{$it.Service}}')">加白</button>{{end}}</div></td>
   </tr>
   {{else}}
-  <tr><td colspan="10"><div class="empty"><div class="big">没有匹配的暴露面记录</div>先运行扫描任务，或调整查询条件</div></td></tr>
+  <tr><td colspan="11"><div class="empty"><div class="big">没有匹配的暴露面记录</div>先运行扫描任务，或调整查询条件</div></td></tr>
   {{end}}
   </tbody>
 </table>

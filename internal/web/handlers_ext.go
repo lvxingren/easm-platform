@@ -428,13 +428,43 @@ func (s *Server) pageExposure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query, proto, port := exposureFilters(r)
+
+	// 域名反向检索：domain 参数→解析 IP 集合→过滤暴露面。
+	domainFilter := strings.TrimSpace(r.URL.Query().Get("domain"))
+	if domainFilter != "" {
+		ips, _ := s.st.IPsForDomain(domainFilter)
+		ipSet := map[string]bool{}
+		for _, ip := range ips {
+			ipSet[ip] = true
+		}
+		filtered := items[:0]
+		for _, it := range items {
+			if ipSet[it.IP] {
+				filtered = append(filtered, it)
+			}
+		}
+		items = filtered
+	}
+
+	// 域名列：每个 IP 反查关联域名（有界，最多展示前 3 个）。
+	domains := make([][]string, len(items))
+	for i, it := range items {
+		ds, _ := s.st.DomainsForIP(it.IP)
+		if len(ds) > 3 {
+			ds = ds[:3]
+		}
+		domains[i] = ds
+	}
+
 	s.render(w, "exposure.html", struct {
 		pageData
-		Items []store.Exposure
-		Query string
-		Proto string
-		Port  int
-	}{bd, items, query, proto, port})
+		Items   []store.Exposure
+		Domains [][]string
+		Query   string
+		Proto   string
+		Port    int
+		Domain  string
+	}{bd, items, domains, query, proto, port, domainFilter})
 }
 
 func writeCSVDownload(w http.ResponseWriter, filename string, records [][]string) {

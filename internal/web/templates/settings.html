@@ -6,6 +6,7 @@
   <a href="#set-cert">TLS 证书</a>
   <a href="#set-notify">通知与告警</a>
   <a href="#set-naabu">naabu 参数</a>
+  <a href="#set-fscan">fscan / 域名</a>
   <a href="#set-ai">AI 分析</a>
   <a href="#set-help">异常排查</a>
 </div>
@@ -25,7 +26,7 @@
       <span class="muted">保存后需重启服务生效</span>
     </div>
   </form>
-  <div id="network-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+  <div id="network-result" class="codeblock command-text form-result"></div>
 </div>
 
 <!-- ② TLS 证书 -->
@@ -42,7 +43,7 @@
   <p class="panel-note">尚未生成证书。启用 HTTPS 后首次启动会自动生成约 100 年有效期的自签名证书到 <code>{{.TLSCert}}</code>；也可在下方上传正式证书。</p>
   {{end}}
 
-  <div class="panel-title full" style="margin-top:14px">上传自定义证书（热生效，无需重启）</div>
+  <div class="panel-sub">上传自定义证书（热生效，无需重启）</div>
   <form id="cert-form" class="grid" enctype="multipart/form-data">
     <label class="field">证书文件（.crt/.pem/.cer）<input type="file" name="cert_file" accept=".crt,.pem,.cer,.txt"></label>
     <label class="field">私钥文件（.key/.pem）<input type="file" name="key_file" accept=".key,.pem,.txt"></label>
@@ -53,7 +54,7 @@
       <span class="muted">证书与私钥必须匹配；上传后立即对新连接生效。</span>
     </div>
   </form>
-  <div id="cert-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+  <div id="cert-result" class="codeblock command-text form-result"></div>
 </div>
 
 <!-- ③ 通知与告警 -->
@@ -70,7 +71,7 @@
       <button type="button" class="btn" onclick="testFeishu()">发送飞书测试</button>
     </div>
   </form>
-  <div id="notify-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+  <div id="notify-result" class="codeblock command-text form-result"></div>
 </div>
 
 <!-- ④ naabu 参数（含资源监测） -->
@@ -79,27 +80,27 @@
   <p class="panel-note">扫描引擎路径与发包参数，保存后立即生效；点「检测 naabu」会实际执行 <code>naabu -version</code> 并校验全部参数。</p>
   <form id="naabu-form" class="grid">
     <label class="field full">naabu 路径<input name="naabu_path" value="{{.NaabuPath}}" placeholder="/usr/local/bin/naabu" required><span class="field-help">可执行文件路径，不是安装目录；后台服务建议填写绝对路径。</span></label>
-    <label class="field">发包速率（pps）<input type="number" name="naabu_rate" min="1" max="1000000" value="{{.NaabuRate}}" required><span class="field-help">每秒发包数。过高容易丢包或触发网络限流。</span></label>
+    <label class="field">发包速率（pps）<input type="number" name="naabu_rate" min="1" max="1000000" value="{{.NaabuRate}}" required><span class="field-help">每秒发包数（单进程），默认 5000 以提高吞吐；过高容易丢包或触发网络限流。</span></label>
     <label class="field">重试次数<input type="number" name="naabu_retries" min="0" max="10" value="{{.NaabuRetries}}" required><span class="field-help">无响应端口的重试次数；增加后更稳，但扫描更慢。</span></label>
-    <label class="field">任务总超时（分钟）<input type="number" name="scan_timeout_min" min="1" max="1440" value="{{.ScanTimeout}}" required><span class="field-help">整个任务的有效扫描时间；暂停时长不计入，超时后终止并保留已输出结果。</span></label>
-    <label class="field">扫描并发度（并行 naabu 批次数）<input type="number" name="scan_concurrency" min="1" max="16" value="{{.ScanConcurrency}}" required><span class="field-help">同时运行的 naabu 批次数，越大总吞吐越高（≈并发度×发包速率）但 CPU/内存/网络占用上升；填 1 为串行。默认 3。</span></label>
+    <label class="field">任务总超时（分钟，0=不限制）<input type="number" name="scan_timeout_min" min="0" max="1440" value="{{.ScanTimeout}}" required><span class="field-help">默认 0 不限制超时，任务跑到完成（符合使用习惯）；填写上限分钟数才启用超时保护，超时后终止并保留已输出结果。暂停时长不计入。</span></label>
+    <label class="field">扫描并发度（并行 naabu 批次数）<input type="number" name="scan_concurrency" min="1" max="16" value="{{.ScanConcurrency}}" required><span class="field-help">同时运行的 naabu 进程数，默认 6 以充分利用 CPU/内存（≈并发度×发包速率）；填 1 为串行。</span></label>
     <label class="field">扫描方式
       <select name="naabu_scan_type"><option value="c" {{if eq .NaabuScanType "c"}}selected{{end}}>CONNECT（默认）</option><option value="s" {{if eq .NaabuScanType "s"}}selected{{end}}>SYN</option></select>
       <span class="field-help">CONNECT 权限要求低；SYN 通常更快，但需要 root 或 CAP_NET_RAW。</span>
     </label>
     <label class="field">响应等待时间<input name="naabu_timeout" value="{{.NaabuTimeout}}" placeholder="1s" required><span class="field-help">单次探测等待时长，如 500ms、1s、2s；过短可能漏报。</span></label>
-    <label class="field">内部并发线程<input type="number" name="naabu_workers" min="1" max="1000" value="{{.NaabuWorkers}}" required><span class="field-help">naabu 内部 worker 数，默认 25；过高会增加 CPU 和连接压力。</span></label>
+    <label class="field">内部并发线程<input type="number" name="naabu_workers" min="1" max="1000" value="{{.NaabuWorkers}}" required><span class="field-help">naabu 内部 worker 数，默认 100 以提高 CPU/内存利用与出结果速度；过高会增加连接压力。</span></label>
     <label class="field">排除端口（可选）<input name="naabu_exclude_ports" value="{{.NaabuExcludePorts}}" placeholder="22,8000-9000"><span class="field-help">本次以后所有任务都跳过这些端口，支持逗号和范围。</span></label>
     <label class="field">指定网卡（可选）<input name="naabu_interface" value="{{.NaabuInterface}}" placeholder="eth0 或 en0"><span class="field-help">多网卡服务器使用；留空由 naabu 自动选择。</span></label>
     <label class="check full" style="align-self:end"><input type="checkbox" name="naabu_verify" {{if .NaabuVerify}}checked{{end}}> 使用 TCP 二次验证开放端口<span class="field-help">降低误报，但会增加连接数和扫描耗时。</span></label>
 
-    <div class="panel-title full" style="margin-top:16px">资源监测（naabu 进程）</div>
+    <div class="panel-sub">资源监测（naabu 进程）</div>
     <label class="check full"><input type="checkbox" name="resource_monitor" {{if .ResourceMonitor}}checked{{end}}> 监测当前 naabu 进程资源占用<span class="field-help">每 5 秒采样 CPU 和 RSS；仅告警，不自动暂停或终止。</span></label>
     <label class="field">CPU 告警阈值（%）<input type="number" name="resource_cpu_percent" min="1" max="100" value="{{.ResourceCPU}}" required><span class="field-help">100% 表示占满一个逻辑核，默认 90%。</span></label>
     <label class="field">内存告警阈值（MiB）<input type="number" name="resource_memory_mb" min="1" max="1048576" value="{{.ResourceMemory}}" required><span class="field-help">naabu 进程 RSS，默认 1024 MiB。</span></label>
     <label class="field">持续时长（秒）<input type="number" name="resource_duration_sec" min="5" max="3600" value="{{.ResourceDuration}}" required><span class="field-help">CPU 或内存任一指标持续超阈值才告警，默认 30 秒。</span></label>
 
-    <div class="panel-title full" style="margin-top:16px">🧩 容量预检自动拆分降级</div>
+    <div class="panel-sub">容量预检自动拆分降级</div>
     <p class="panel-note full">当容量预检因预估耗时超过任务超时而拒绝启动时，平台可自动将任务按目标数量拆分为多个子批次串行执行，而非直接拒绝。其他预检失败（如 FD 不足、磁盘空间不够）仍会直接拒绝。</p>
     <label class="check full"><input type="checkbox" name="auto_split_on_timeout" {{if .AutoSplitOnTimeout}}checked{{end}}> 启用自动拆分降级<span class="field-help">开启后，超时类预检失败会自动拆分为多个子任务执行；关闭则保持原有直接拒绝行为。</span></label>
     <label class="field">每批目标数量<input type="number" name="split_batch_size" min="1" max="10000" value="{{.SplitBatchSize}}" required><span class="field-help">自动拆分时每个子任务处理的目标数量，默认 50。数值越小每个子任务越轻量，但子任务总数越多。</span></label>
@@ -109,7 +110,31 @@
       <button type="button" class="btn" onclick="checkNaabu()">检测 naabu</button>
     </div>
   </form>
-  <div id="naabu-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+  <div id="naabu-result" class="codeblock command-text form-result"></div>
+</div>
+
+<!-- ④-b fscan 与域名扫描 -->
+<div class="panel" id="set-fscan">
+  <div class="panel-title">fscan 多工具引擎 / 域名扫描</div>
+  <p class="panel-note">fscan 与 naabu 并列可选（新建任务时选择扫描引擎）；域名扫描通过 DNS 解析/子域枚举把域名衍生 IP 纳入扫描。未安装对应工具时不影响 naabu 现有任务。</p>
+  <form id="fscan-form" class="grid">
+    <label class="field full">fscan 路径<input name="fscan_path" value="{{.FscanPath}}" placeholder="/usr/local/bin/fscan"><span class="field-help">可执行文件路径；保存后可在任务中选择 fscan/混合引擎。</span></label>
+    <label class="field">fscan 内部线程<input type="number" name="fscan_workers" min="1" max="1000" value="{{.FscanWorkers}}"><span class="field-help">fscan -t 并发线程，默认 100；用于容量估算摊薄。</span></label>
+    <label class="field">fscan 默认模式
+      <select name="fscan_mode">
+        <option value="port" {{if eq .FscanMode "port"}}selected{{end}}>纯端口扫描（默认，轻量）</option>
+        <option value="vuln" {{if eq .FscanMode "vuln"}}selected{{end}}>漏洞检测（高危 PoC）</option>
+        <option value="mixed" {{if eq .FscanMode "mixed"}}selected{{end}}>混合（端口+漏洞）</option>
+      </select>
+      <span class="field-help">纯端口不启用 PoC；漏洞/混合覆盖 SmbGhost/Struts2/Log4j/Shiro/WebLogic。任务表单可单独覆盖。</span>
+    </label>
+    <label class="field full">Subfinder 路径（可选）<input name="subfinder_path" value="{{.SubfinderPath}}" placeholder="留空则仅用种子文件枚举子域"><span class="field-help">配置后对主域名做子域爆破；子域种子文件为 data/subdomains.txt。</span></label>
+    <label class="check full"><input type="checkbox" name="domain_resolve_enabled" {{if .DomainResolve}}checked{{end}}> 启用域名衍生 IP 扫描<span class="field-help">开启后把台账域名经 DNS/子域枚举解析出的 IP 自动纳入扫描（来源 domain_resolver）；默认关闭，不影响现有任务。</span></label>
+    <div class="row full">
+      <button type="submit" class="btn primary">保存 fscan / 域名配置</button>
+    </div>
+  </form>
+  <div id="fscan-result" class="codeblock command-text form-result"></div>
 </div>
 
 <!-- ⑤ AI 分析 -->
@@ -127,7 +152,7 @@
       <button type="button" class="btn" onclick="testAI()">测试 AI 连接</button>
     </div>
   </form>
-  <div id="ai-result" class="codeblock command-text" style="display:none;margin-top:14px"></div>
+  <div id="ai-result" class="codeblock command-text form-result"></div>
 </div>
 
 <!-- ⑥ 异常排查说明 -->
@@ -157,6 +182,7 @@ function bindSettingsForm(formId, boxId, okMsg) {
 }
 bindSettingsForm('notify-form', 'notify-result', '通知与告警配置已保存并生效。');
 bindSettingsForm('naabu-form', 'naabu-result', 'naabu 参数已保存并生效。');
+bindSettingsForm('fscan-form', 'fscan-result', 'fscan / 域名配置已保存并生效。');
 bindSettingsForm('ai-form', 'ai-result', 'AI 分析配置已保存并生效。');
 
 document.getElementById('network-form').addEventListener('submit', async (e) => {

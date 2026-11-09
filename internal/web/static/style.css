@@ -126,6 +126,15 @@ code {
 }
 .nav-item:hover { background: var(--surface-2); color: var(--text); }
 .nav-item.active { background: var(--accent-soft); color: var(--accent-text); box-shadow: inset 2px 0 0 var(--accent); }
+/* 可折叠导航分组（安全运营）：复用现有 nav-item 视觉，仅增加折叠交互 */
+.nav-sec { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.nav-sec-toggle { width: 100%; justify-content: space-between; cursor: pointer; background: transparent; border: none; font: inherit; text-align: left; }
+.nav-sec-toggle:hover { background: var(--surface-2); color: var(--text); }
+.nav-caret { font-size: 12px; color: var(--muted); transition: transform .15s; }
+.nav-sec.collapsed .nav-caret { transform: rotate(-90deg); }
+.nav-sec-body { display: flex; flex-direction: column; gap: 2px; }
+.nav-sec.collapsed .nav-sec-body { display: none; }
+.nav-sec-body .nav-item { padding-left: 28px; }
 .sidebar-foot { margin-top: auto; padding: 14px 12px 4px; color: var(--muted); font-size: 11px; }
 
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -173,6 +182,13 @@ h2 { font-size: 15px; margin: 26px 0 12px; color: var(--text-dim); font-weight: 
   transition: border-color .15s, color .15s, background .15s;
 }
 .subnav a:hover { border-color: var(--accent); color: var(--accent-text); background: var(--accent-soft); }
+
+/* 设置页与安全运营页视觉对齐：表单结果框与面板内子分区统一间距/分隔线，替代内联样式 */
+.form-result { display: none; margin-top: 14px; }
+.panel-sub {
+  grid-column: 1 / -1; font-size: 13px; font-weight: 700; color: var(--text-strong);
+  margin: 6px 0 0; padding-top: 14px; border-top: 1px solid var(--border-soft);
+}
 
 .panel {
   background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius);

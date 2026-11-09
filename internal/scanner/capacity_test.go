@@ -39,17 +39,29 @@ func fullPort500Input() capacityInput {
 	}
 }
 
-// TestEvaluateCapacityRejectsDefaultTimeoutFor500FullPorts 验证默认 60 分钟对 500 全端口
-// 不会被静默接受，而是给出包含可操作调整项的错误。
+// TestEvaluateCapacityUnlimitedTimeout 验证超时为 0（不限制）时容量预检不做超时拒绝，
+// 即使预估耗时很长也放行（符合「任务不设超时」的使用习惯）。
+func TestEvaluateCapacityUnlimitedTimeout(t *testing.T) {
+	in := fullPort500Input()
+	in.Timeout = 0
+	plan, err := evaluateCapacity(in)
+	if err != nil {
+		t.Fatalf("超时=0 不应拒绝: %v", err)
+	}
+	if plan.Timeout != 0 {
+		t.Fatalf("plan.Timeout 应为 0: %+v", plan)
+	}
+}
+
+// TestEvaluateCapacityRejectsDefaultTimeoutFor500FullPorts 验证 500 目标全端口在小批量豁免下放行执行（仅告警），
+// 运行时超时仍会保护；超过 500 条规格的大规模任务仍被拒绝。
 func TestEvaluateCapacityRejectsDefaultTimeoutFor500FullPorts(t *testing.T) {
 	plan, err := evaluateCapacity(fullPort500Input())
-	if err == nil {
-		t.Fatalf("500 目标全端口 + 默认 60 分钟不应通过容量预检，实际 plan=%+v", plan)
+	if err != nil {
+		t.Fatalf("500 目标全端口属小批量豁免范围，应放行执行（仅告警），实际报错: %v", err)
 	}
-	for _, marker := range []string{"容量预检未通过", "超过任务超时", "分钟", "总速率", "重试"} {
-		if !strings.Contains(err.Error(), marker) {
-			t.Fatalf("拒绝原因缺少可操作提示 %q: %v", marker, err)
-		}
+	if !warningsContain(plan.Warnings, "小批量") && !warningsContain(plan.Warnings, "已放行执行") {
+		t.Fatalf("小批量豁免应产生告警提示，实际 warnings=%v", plan.Warnings)
 	}
 	if plan.Batches != 25 || plan.Ports != 65535 || plan.Targets != 500 {
 		t.Fatalf("预检计划基础字段错误: %+v", plan)
@@ -331,8 +343,8 @@ func TestEvaluateCapacityNaabuRetriesContract(t *testing.T) {
 }
 
 // TestEvaluateCapacitySingleCIDRUsesRealBatches 验证 CIDR/范围按真实 specs 批次估时：
-// 单个 /24 只产生 1 个批次（254 个展开目标），不能因为展开出 254 个地址就假定额外并行，
-// 因此“单 /24 + 全端口 + 60 分钟”必须被明确拒绝。
+// 单个 /24 只产生 1 个批次（254 个展开目标），不能因为展开出 254 个地址就假定额外并行。
+// 小批量豁免下放行执行（仅告警），但并发仍收敛为 1。
 func TestEvaluateCapacitySingleCIDRUsesRealBatches(t *testing.T) {
 	work, capped := batchWorkload([]store.TargetSpec{{Raw: "192.0.2.0/24", Kind: "cidr"}})
 	if capped || len(work) != 1 || work[0] != 254 {
@@ -344,11 +356,11 @@ func TestEvaluateCapacitySingleCIDRUsesRealBatches(t *testing.T) {
 		Concurrency: 3, Timeout: 60 * time.Minute,
 	}
 	plan, err := evaluateCapacity(in)
-	if err == nil {
-		t.Fatalf("单个 /24 全端口在 60 分钟内不可能完成，应拒绝: %+v", plan)
+	if err != nil {
+		t.Fatalf("单个 /24 属小批量豁免范围，应放行执行: %v", err)
 	}
-	if !strings.Contains(err.Error(), "超过任务超时") {
-		t.Fatalf("拒绝原因应说明超时: %v", err)
+	if !warningsContain(plan.Warnings, "已放行执行") {
+		t.Fatalf("小批量豁免应产生告警提示: warnings=%v", plan.Warnings)
 	}
 	if plan.Batches != 1 || plan.Concurrency != 1 {
 		t.Fatalf("单个 /24 不应被当成多批次并行: %+v", plan)

@@ -40,8 +40,8 @@ func TestCalculateSmartBatchSize(t *testing.T) {
 			portsPerTarget: 65535,
 			ratePerSecond:  2000,
 			timeout:        60 * time.Minute,
-			expectedMin:    50, // 智能计算约 87
-			expectedMax:    100,
+			expectedMin:    20, // 智能计算约 29（含默认 3 轮重试）
+			expectedMax:    50,
 		},
 		{
 			name:           "超大规模任务（5000目标，全端口，120分钟超时）",

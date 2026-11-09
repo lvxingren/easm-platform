@@ -89,6 +89,9 @@ func (r *Runner) StartTask(taskID int64) (int64, error) {
 	} else if mode == "custom" {
 		modeLabel = "自定义端口"
 	}
+	if engineIsFscan(task.Engine) {
+		modeLabel = "fscan-" + fscanModeLabel(engineFscanMode(task.Engine))
+	}
 	name = fmt.Sprintf("%s · %s · %s", name, modeLabel, time.Now().Format("20060102-150405"))
 	scanID, err := r.st.CreateScan(task.ID, name, mode)
 	if err != nil {
@@ -112,13 +115,18 @@ func (r *Runner) StartTask(taskID int64) (int64, error) {
 	// 设置快照只读取一次：自检、容量预检与实际执行必须使用同一份设置，
 	// 否则执行阶段重新读取可能拿到用户刚改过的值，导致 argv 与容量结论不一致。
 	settings := r.naabuSettings()
-	if _, _, err := r.checkNaabu(settings); err != nil {
-		return failStart(err)
+	// 仅 naabu 引擎需要 naabu 自检；fscan/混合引擎走独立自检，避免未装 naabu 时误拒。
+	if task.Engine == "naabu" {
+		if _, _, err := r.checkNaabu(settings); err != nil {
+			return failStart(err)
+		}
 	}
 	specs, err := r.resolveSpecs(task)
 	if err != nil {
 		return failStart(fmt.Errorf("解析扫描目标失败: %v", err))
 	}
+	// 域名衍生目标（可选增强，默认关闭）：把域名解析为 IP 并入扫描范围，不影响原有目标。
+	specs = r.expandDomainDerived(specs)
 	if len(specs) == 0 {
 		if task.TargetType == "tag" {
 			return failStart(fmt.Errorf("目标为空：标签 %q 下没有资产，请调整标签或导入资产后重新执行", task.TargetTag))
@@ -130,6 +138,19 @@ func (r *Runner) StartTask(taskID int64) (int64, error) {
 		if _, err := r.st.ImportTargets(specs, "", "任务导入"); err != nil {
 			return failStart(fmt.Errorf("手工目标并入资产台账失败，扫描未启动: %v", err))
 		}
+	}
+
+	// fscan 系列引擎：独立于 naabu 的容量估算与执行路径（不修改现有 naabu 流程）。
+	if engineIsFscan(task.Engine) {
+		customPorts := strings.TrimSpace(task.CustomPorts)
+		if customPorts != "" {
+			if err := ValidatePortList(customPorts, "fscan 自定义端口"); err != nil {
+				return failStart(err)
+			}
+		}
+		fs := r.fscanSettings()
+		fs.Mode = engineFscanMode(task.Engine)
+		return r.startFscanTask(scanID, specs, fs, customPorts)
 	}
 
 	// 容量预检：结合并发（1-16）、单进程速率、任务超时、FD 与磁盘预算给出可执行结论。
@@ -266,10 +287,10 @@ func (r *Runner) naabuSettings() NaabuSettings {
 		Path:             r.naabuPath(),
 		Rate:             r.setting("naabu_rate", r.cfg.NaabuRate),
 		Retries:          r.setting("naabu_retries", "2"),
-		Workers:          r.setting("naabu_workers", "25"),
+		Workers:          r.setting("naabu_workers", "100"),
 		ResponseTimeout:  r.setting("naabu_timeout", "1s"),
-		OverallTimeout:   r.setting("scan_timeout_min", "60"),
-		Concurrency:      r.setting("scan_concurrency", "3"),
+		OverallTimeout:   r.setting("scan_timeout_min", "0"),
+		Concurrency:      r.setting("scan_concurrency", "6"),
 		ScanType:         strings.ToLower(r.setting("naabu_scan_type", "c")),
 		ExcludePorts:     r.setting("naabu_exclude_ports", ""),
 		Interface:        r.setting("naabu_interface", ""),
@@ -353,7 +374,7 @@ func (s NaabuSettings) Validate() error {
 		{"发包速率", s.Rate, 1, 1000000},
 		{"重试次数", s.Retries, 0, 10},
 		{"内部并发线程", s.Workers, 1, 1000},
-		{"单次任务超时（分钟）", s.OverallTimeout, 1, 1440},
+		{"单次任务超时（分钟）", s.OverallTimeout, 0, 1440},
 	}
 	for _, check := range checks {
 		if err := validateInteger(check.label, check.value, check.min, check.max); err != nil {
@@ -607,13 +628,16 @@ func (r *Runner) startSplitTask(taskID int64, name, mode, customPorts string, sp
 		rate = rateVal
 	}
 
+	// 解析重试轮数（传入智能批次计算，避免低估单目标耗时）
+	retries, _ := strconv.Atoi(settings.Retries)
+
 	// 获取超时时间
 	timeout := settings.overallTimeout()
 	if timeout <= 0 {
 		timeout = 60 * time.Minute // 默认 60 分钟
 	}
 
-	smartBatchSize := CalculateSmartBatchSize(len(specs), ports, rate, timeout)
+	smartBatchSize := CalculateSmartBatchSize(len(specs), ports, rate, timeout, retries)
 
 	// 使用智能计算的批次大小（如果用户配置了自定义值，优先使用用户配置）
 	userBatchSize := r.getSplitBatchSize()
@@ -661,7 +685,7 @@ func (r *Runner) startSplitTask(taskID int64, name, mode, customPorts string, sp
 			len(batches), batchSize))
 
 	// 启动执行协程
-	go r.runSplitTask(scanID, batches, mode, customPorts, settings)
+	go r.runSplitTask(scanID, batches, mode, customPorts, settings, "naabu", FscanSettings{})
 
 	return scanID, nil
 }

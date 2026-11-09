@@ -86,6 +86,26 @@ function toggleSidebar(force) {
   if (mask) mask.style.display = open ? 'block' : 'none';
 }
 
+// 侧边可折叠分组（安全运营）开关，状态记忆到本地；当前页在组内时强制展开。
+function toggleNavGroup(id) {
+  const sec = document.getElementById(id);
+  if (!sec) return;
+  const collapsed = sec.classList.toggle('collapsed');
+  const btn = sec.querySelector('.nav-sec-toggle');
+  if (btn) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  try { localStorage.setItem('easm-nav-' + id, collapsed ? '0' : '1'); } catch (e) {}
+}
+(function () {
+  const sec = document.getElementById('sec-ops');
+  if (!sec) return;
+  let collapsed = false;
+  try { collapsed = localStorage.getItem('easm-nav-sec-ops') === '0'; } catch (e) {}
+  if (sec.querySelector('.nav-sec-body .nav-item.active')) collapsed = false;
+  sec.classList.toggle('collapsed', collapsed);
+  const btn = sec.querySelector('.nav-sec-toggle');
+  if (btn) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+})();
+
 // 通用模态：显示/隐藏 .modal-mask 容器（复用改密弹窗样式）
 function openModal(id) { const m = document.getElementById(id); if (m) m.style.display = 'flex'; }
 function closeModal(id) { const m = document.getElementById(id); if (m) m.style.display = 'none'; }
@@ -100,9 +120,9 @@ function checkedValues(cls) {
   return Array.from(document.querySelectorAll('.' + cls + ':checked')).map(c => c.value);
 }
 
-// 改密弹窗
-function pwModal() { const m = document.getElementById('pw-modal'); if (m) m.style.display = 'flex'; }
-function pwClose() { const m = document.getElementById('pw-modal'); if (m) m.style.display = 'none'; }
+// 改密弹窗（复用通用模态开关，避免重复逻辑）
+function pwModal() { openModal('pw-modal'); }
+function pwClose() { closeModal('pw-modal'); }
 async function pwSubmit() {
   const oldp = document.getElementById('pw-old').value;
   const newp = document.getElementById('pw-new').value;

@@ -20,6 +20,7 @@ func (s *Server) pageLogs(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	entries := applog.Query(level, query, 0, 500)
 	infoCount, warnCount, errorCount := applog.Counts()
+	tlsToday, tlsWeek, tlsTop := applog.TLSNoiseStats()
 	s.render(w, "logs.html", struct {
 		pageData
 		Entries    []applog.Entry
@@ -28,7 +29,10 @@ func (s *Server) pageLogs(w http.ResponseWriter, r *http.Request) {
 		InfoCount  int
 		WarnCount  int
 		ErrorCount int
-	}{bd, entries, level, query, infoCount, warnCount, errorCount})
+		TLSToday   int
+		TLSWeek    int
+		TLSTop     []applog.SegmentCount
+	}{bd, entries, level, query, infoCount, warnCount, errorCount, tlsToday, tlsWeek, tlsTop})
 }
 
 // apiLogs 返回增量日志，供页面实时追加（after_id 之后的新记录）。

@@ -894,12 +894,13 @@ func isDocAddress(value string) bool {
 	return false
 }
 
-// TestFakeNaabu32767500RejectedWithoutPartialWrite 是 32,767,500 结果（500 目标 × 65535 端口）
+// TestFakeNaabu32767500RejectedWithoutPartialWrite 是超过小批量豁免阈值（501 目标 × 65535 端口）
 // 压力档的默认安全验证：不得真的执行，必须由容量保护阈值明确拒绝，且零部分写入。
 func TestFakeNaabu32767500RejectedWithoutPartialWrite(t *testing.T) {
 	// 生产默认预算：单进程 2000/s、总速率 6000/s、并发 3、重试 2、任务超时 60 分钟。
-	// 500 × 65535 × 3 次尝试约 9800 万探测，按 6000/s 需要数小时，必然被容量预检拒绝。
+	// 501 × 65535 × 2 次尝试约 6500 万探测，按 6000/s 需要数小时，必然被容量预检拒绝。
 	// 禁用自动拆分功能，以验证容量预检的拒绝逻辑。
+	// 使用 501 目标（超过 capacitySmallBatchSpecs=500 豁免阈值）确保触发拒绝。
 	h := newCapacityHarness(t, matrixScript, map[string]string{
 		"naabu_rate":            "2000",
 		"naabu_total_rate":      "6000",
@@ -908,7 +909,7 @@ func TestFakeNaabu32767500RejectedWithoutPartialWrite(t *testing.T) {
 		"scan_concurrency":      "3",
 		"auto_split_on_timeout": "0", // 禁用自动拆分，测试容量拒绝
 	})
-	taskID := newManualTask(t, h.st, "full", docIPv4(capacityTargets))
+	taskID := newManualTask(t, h.st, "full", docIPv4(capacityTargets+1))
 
 	started := time.Now()
 	scanID, rejectErr := h.runner.StartTask(taskID)
