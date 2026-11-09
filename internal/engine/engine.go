@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"easm-platform/internal/config"
@@ -13,13 +15,122 @@ import (
 	"easm-platform/internal/store"
 )
 
+// 扫描后处理的容量约束。一次执行的结果可能达到数十万行，AfterScan / Baseline
+// 必须按页流式处理：任一时刻驻留内存的结果行不超过一页，违规缓冲不超过一个分块，
+// 告警明细不超过固定条数（其余只累加计数）。
+const (
+	// postScanPageSize 后处理每页读取的结果行数，取 store 的分页硬上限。
+	postScanPageSize = store.ResultPageMaxLimit
+	// postScanViolationChunk 单批处理的违规行数上限。
+	postScanViolationChunk = 500
+	// postScanAlertSampleLimit 通知层保留的告警明细条数硬上限，超出部分仅计数。
+	postScanAlertSampleLimit = 100
+	// summaryAlertListLimit 飞书汇总正文最多逐条列出的告警条数。
+	summaryAlertListLimit = 50
+)
+
+// resultPager 抽象后处理所需的键集分页读取能力。生产环境由 *store.Store 实现；
+// 容量测试可注入有界 fake，在不落库的前提下模拟 50 万级结果集。
+type resultPager interface {
+	ResultsPage(scanID, afterID int64, limit int) (store.ResultPage, error)
+}
+
 type Engine struct {
 	st  *store.Store
 	cfg *config.Config
+	// pager 结果分页读取入口，为空时回退到 st。
+	pager resultPager
+	// addWL 白名单写入入口，为空时回退到 st.AddWhitelist。
+	// 故障注入测试用它模拟单条写入失败，无需改动 store。
+	addWL func(store.WLEntry) (int64, error)
+
+	digestMu sync.Mutex
+	// lastDigest 最近一次后处理的聚合统计：只保留一份，不随扫描次数增长。
+	// AfterScan 与 NotifyScanSummary 在同一扫描流程内串行调用，用于把
+	// 「有界明细 + 完整总数」传递给通知层。
+	lastDigest *postScanDigest
 }
 
 func New(st *store.Store, cfg *config.Config) *Engine {
-	return &Engine{st: st, cfg: cfg}
+	return &Engine{st: st, cfg: cfg, pager: st}
+}
+
+// postScanDigest 是一次后处理的聚合结果：全量计数 + 有界告警样本。
+// 结果行与告警都只累加计数，不驻留明细，因此内存占用与结果规模无关。
+type postScanDigest struct {
+	ScanID       int64
+	TotalResults int           // 实际读取到的结果行数
+	Whitelisted  int           // 命中白名单的行数
+	Violations   int           // 未命中白名单的行数
+	OutOfScope   int           // 范围外且未开启范围外告警而跳过的行数
+	Suppressed   int           // 命中忽略状态或重复提醒间隔而跳过的行数
+	Touched      int           // 成功刷新 last_seen_at 的已有告警数
+	Created      int           // 新建告警数
+	Reopened     int           // 重开告警数
+	Failed       int           // 单条告警操作失败次数
+	AlertTotal   int           // 需要通知的告警总数（新建 + 重开）
+	MaxChunk     int           // 单批处理过的最大违规行数（用于证明分块硬上限）
+	Alerts       []store.Alert // 有界样本，最多 postScanAlertSampleLimit 条
+}
+
+// addAlert 记录一条待通知告警：总数始终累加，明细到上限即停止追加。
+// 样本切片创建时即按上限预分配，容量也不会超过硬上限。
+func (d *postScanDigest) addAlert(a store.Alert) {
+	d.AlertTotal++
+	if d.Alerts == nil {
+		d.Alerts = make([]store.Alert, 0, postScanAlertSampleLimit)
+	}
+	if len(d.Alerts) >= postScanAlertSampleLimit {
+		return
+	}
+	d.Alerts = append(d.Alerts, a)
+}
+
+func (e *Engine) rememberDigest(d *postScanDigest) {
+	e.digestMu.Lock()
+	e.lastDigest = d
+	e.digestMu.Unlock()
+}
+
+// takeDigest 取出并清空摘要；scanID 不匹配（迟到的旧摘要）时返回 nil。
+func (e *Engine) takeDigest(scanID int64) *postScanDigest {
+	e.digestMu.Lock()
+	d := e.lastDigest
+	e.lastDigest = nil
+	e.digestMu.Unlock()
+	if d == nil || d.ScanID != scanID {
+		return nil
+	}
+	return d
+}
+
+// walkPages 用键集游标逐页遍历某次执行的结果。页切片在回调返回后即可回收，
+// 因此遍历期间的额外内存上限是一页结果（≤ store.ResultPageMaxLimit 行）。
+func (e *Engine) walkPages(scanID int64, fn func([]store.Result) error) error {
+	pager := e.pager
+	if pager == nil {
+		pager = e.st
+	}
+	var cursor int64
+	for {
+		page, err := pager.ResultsPage(scanID, cursor, postScanPageSize)
+		if err != nil {
+			return err
+		}
+		if len(page.Results) == 0 {
+			return nil
+		}
+		if err := fn(page.Results); err != nil {
+			return err
+		}
+		if !page.HasMore {
+			return nil
+		}
+		if page.NextCursor <= cursor {
+			return fmt.Errorf("结果分页游标未前进: scan=%d cursor=%d next=%d", scanID, cursor, page.NextCursor)
+		}
+		cursor = page.NextCursor
+	}
 }
 
 type portSet struct {
@@ -309,13 +420,15 @@ func matchAnyTarget(ms []targetMatcher, ip string) bool {
 	return false
 }
 
-// AfterScan 在扫描入库后执行：白名单比对 → 告警去重，返回本次新增/重开的告警（不直接推送飞书，由结束汇总统一发送）。
+// AfterScan 在扫描入库后执行：白名单比对 → 告警去重，返回本次新增/重开的告警
+// （不直接推送飞书，由结束汇总统一发送）。
+//
+// 结果通过 ResultsPage 键集游标逐页读取，并按 postScanViolationChunk 分块处理：
+// 不再全量加载结果，也不会构造覆盖整次扫描的 violations 切片。返回的告警明细
+// 以 postScanAlertSampleLimit 为硬上限，完整总数记录在内部摘要中，供
+// NotifyScanSummary 生成「有界明细 + 总数」的汇总。
 func (e *Engine) AfterScan(scanID int64) []store.Alert {
-	results, err := e.st.ResultsByScan(scanID)
-	if err != nil {
-		log.Printf("读取扫描结果失败: %v", err)
-		return nil
-	}
+	d := &postScanDigest{ScanID: scanID}
 	rules, err := e.loadRules()
 	if err != nil {
 		log.Printf("读取白名单失败: %v", err)
@@ -326,65 +439,129 @@ func (e *Engine) AfterScan(scanID int64) []store.Alert {
 		log.Printf("读取台账失败: %v", err)
 		return nil
 	}
+	// 台账规模由资产数决定（与结果行数无关）；解析为匹配器后立即释放原始切片。
 	tmatchers := buildTargetMatchers(tgts)
+	tgts = nil
 	realert := time.Duration(e.realertDays()) * 24 * time.Hour
 	now := time.Now()
+	alertOutOfScope := e.outOfScopeAlert()
 
-	violations := []store.Result{}
-	for _, r := range results {
-		if !e.matchAny(r.IP, r.Port, r.Proto, rules) {
-			violations = append(violations, r)
+	// violations 复用同一个缓冲，长度不超过 postScanViolationChunk。
+	violations := make([]store.Result, 0, postScanViolationChunk)
+	flush := func() {
+		if len(violations) == 0 {
+			return
 		}
+		e.processViolations(violations, d, tmatchers, realert, now, alertOutOfScope)
+		violations = violations[:0]
 	}
+	if err := e.walkPages(scanID, func(page []store.Result) error {
+		d.TotalResults += len(page)
+		for _, r := range page {
+			if e.matchAny(r.IP, r.Port, r.Proto, rules) {
+				d.Whitelisted++
+				continue
+			}
+			violations = append(violations, r)
+			if len(violations) >= postScanViolationChunk {
+				flush()
+			}
+		}
+		return nil
+	}); err != nil {
+		// 分页读取失败：已处理的批次不回滚，保留已产生的告警继续汇总，
+		// 避免把已经落库的告警信息丢掉。
+		log.Printf("读取扫描结果分页失败（已读 %d 行，违规 %d 条）: %v", d.TotalResults, d.Violations, err)
+	}
+	flush()
+	e.rememberDigest(d)
+	log.Printf("扫描 %d: 结果 %d 条（白名单 %d，违规 %d，范围外跳过 %d），新增告警 %d 条（明细样本 %d 条，单批最大 %d 行）",
+		scanID, d.TotalResults, d.Whitelisted, d.Violations, d.OutOfScope, d.AlertTotal, len(d.Alerts), d.MaxChunk)
+	if len(d.Alerts) == 0 {
+		return nil
+	}
+	return d.Alerts
+}
 
-	var newAlerts []store.Alert
-	for _, v := range violations {
+// processViolations 处理一段违规结果（长度 ≤ postScanViolationChunk）：范围内判定 →
+// 告警去重/刷新/重开/新建。单条失败只记录日志并继续，与原全量版本的错误处理一致；
+// 告警明细只保留有界样本，计数始终完整。
+func (e *Engine) processViolations(chunk []store.Result, d *postScanDigest, tmatchers []targetMatcher, realert time.Duration, now time.Time, alertOutOfScope bool) {
+	if len(chunk) > d.MaxChunk {
+		d.MaxChunk = len(chunk)
+	}
+	for _, v := range chunk {
+		d.Violations++
 		inScope := matchAnyTarget(tmatchers, v.IP)
-		if !inScope && !e.outOfScopeAlert() {
+		if !inScope && !alertOutOfScope {
+			d.OutOfScope++
 			continue
 		}
 		existing, err := e.st.AlertFind(v.IP, v.Port, v.Proto)
 		if err != nil {
 			log.Printf("查询告警失败: %v", err)
+			d.Failed++
 			continue
 		}
 		if existing != nil {
 			last, _ := time.Parse(time.RFC3339, existing.LastSeenAt)
 			if err := e.st.TouchAlert(existing.ID); err != nil {
 				log.Printf("更新告警失败: %v", err)
+				d.Failed++
+			} else {
+				d.Touched++
 			}
 			// 忽略代表确认放行；已解决但再次被探明则立即重开，其余状态按间隔重复提醒。
 			if existing.Status == "ignored" || (existing.Status != "resolved" && now.Sub(last) < realert) {
+				d.Suppressed++
 				continue
 			}
 			if err := e.st.ReopenAlert(existing.ID); err != nil {
 				log.Printf("重开告警失败: %v", err)
+				d.Failed++
 				continue
 			}
 			existing.Status = "new"
 			existing.SentFeishu = false
-			newAlerts = append(newAlerts, *existing)
+			d.Reopened++
+			d.addAlert(*existing)
 			continue
 		}
 		id, err := e.st.CreateAlert(v.IP, v.Port, v.Proto, v.Service, inScope)
 		if err != nil {
 			log.Printf("创建告警失败: %v", err)
+			d.Failed++
 			continue
 		}
-		newAlerts = append(newAlerts, store.Alert{ID: id, IP: v.IP, Port: v.Port, Proto: v.Proto, Service: v.Service, InScope: inScope})
+		d.Created++
+		d.addAlert(store.Alert{ID: id, IP: v.IP, Port: v.Port, Proto: v.Proto, Service: v.Service, InScope: inScope})
 	}
+}
 
-	if len(newAlerts) == 0 {
-		log.Printf("扫描 %d: 结果 %d 条，违规 %d 条，新增告警 0 条", scanID, len(results), len(violations))
-		return nil
+// WhitelistStatusPages 按页流式判定某次执行结果的白名单状态：每页回调一次，
+// 页内 map 在回调返回后即可回收。供暴露面聚合、资产导出等可能遍历大量结果的
+// 调用方使用，避免「先全量加载结果 → 再构造全量状态 map」。
+func (e *Engine) WhitelistStatusPages(scanID int64, fn func([]store.Result, map[string]bool) error) error {
+	rules, err := e.loadRules()
+	if err != nil {
+		return err
 	}
-	log.Printf("扫描 %d: 结果 %d 条，违规 %d 条，新增告警 %d 条", scanID, len(results), len(violations), len(newAlerts))
-	return newAlerts
+	return e.walkPages(scanID, func(page []store.Result) error {
+		status := make(map[string]bool, len(page))
+		for _, r := range page {
+			status[ResultKey(r.IP, r.Port, r.Proto)] = e.matchAny(r.IP, r.Port, r.Proto, rules)
+		}
+		return fn(page, status)
+	})
 }
 
 // NotifyScanSummary 在任务结束时发送唯一一条飞书汇总（执行结果 + 资源峰值 + 新增风险告警）。
 // 扫描过程中的资源告警只记录执行事件与日志，不再单独推送飞书。
+//
+// newAlerts 是 AfterScan 返回的有界明细样本；完整告警总数从 AfterScan 留下的
+// 摘要中取，因此即使告警量超过样本上限，汇总里的总数也不会失真。
 func (e *Engine) NotifyScanSummary(scanID int64, status string, newAlerts []store.Alert) {
+	digest := e.takeDigest(scanID)
 	scan, err := e.st.Scan(scanID)
 	if err != nil || scan == nil {
 		log.Printf("读取扫描记录失败，跳过结束汇总: %v", err)
@@ -396,14 +573,24 @@ func (e *Engine) NotifyScanSummary(scanID int64, status string, newAlerts []stor
 		// 未配置飞书：仅保留页面事件与日志，不视为失败，也不标记告警已推送。
 		return
 	}
-	if err := nf.Send(e.buildSummaryText(scan, status, newAlerts, resourceAlerts)); err != nil {
+	alertTotal := len(newAlerts)
+	if digest != nil && digest.AlertTotal > alertTotal {
+		alertTotal = digest.AlertTotal
+	}
+	if err := nf.Send(e.buildSummaryText(scan, status, newAlerts, alertTotal, resourceAlerts)); err != nil {
 		log.Printf("飞书发送失败: %v", err)
 		return
 	}
+	// 仅对汇总里实际列出的样本逐条标记已推送：超出样本上限的告警已计入汇总总数，
+	// 不逐条回调标记，以免为数十万级告警构造无界 ID 序列。
 	for _, a := range newAlerts {
 		if err := e.st.MarkAlertSent(a.ID); err != nil {
 			log.Printf("标记告警已发送失败: %v", err)
 		}
+	}
+	if alertTotal > len(newAlerts) {
+		log.Printf("扫描 %d: 告警 %d 条，汇总逐条标记已推送 %d 条，其余 %d 条仅计入总数",
+			scanID, alertTotal, len(newAlerts), alertTotal-len(newAlerts))
 	}
 }
 
@@ -428,8 +615,9 @@ func scanStatusText(status string) string {
 	}
 }
 
-// buildSummaryText 生成任务结束时的唯一一条飞书汇总。
-func (e *Engine) buildSummaryText(scan *store.Scan, status string, newAlerts []store.Alert, resourceAlerts int) string {
+// buildSummaryText 生成任务结束时的唯一一条飞书汇总。alertTotal 是本次新增告警的
+// 完整总数，newAlerts 只是有界明细样本，正文最多逐条列出 summaryAlertListLimit 条。
+func (e *Engine) buildSummaryText(scan *store.Scan, status string, newAlerts []store.Alert, alertTotal, resourceAlerts int) string {
 	var b strings.Builder
 	b.WriteString("【扫描任务结束】执行 #" + strconv.FormatInt(scan.ID, 10) + " " + scan.Name + "\n")
 	b.WriteString("状态：" + scanStatusText(status) + "\n")
@@ -457,21 +645,24 @@ func (e *Engine) buildSummaryText(scan *store.Scan, status string, newAlerts []s
 	case "partial", "failed":
 		b.WriteString("说明：结果不完整，未执行白名单比对与端口风险告警，详见执行详情异常。\n")
 	}
-	if len(newAlerts) > 0 {
-		fmt.Fprintf(&b, "新增风险告警：%d 条\n", len(newAlerts))
-		list := newAlerts
-		if len(list) > 50 {
-			list = list[:50]
+	if alertTotal < len(newAlerts) {
+		alertTotal = len(newAlerts)
+	}
+	if alertTotal > 0 {
+		fmt.Fprintf(&b, "新增风险告警：%d 条\n", alertTotal)
+		listed := len(newAlerts)
+		if listed > summaryAlertListLimit {
+			listed = summaryAlertListLimit
 		}
-		for _, a := range list {
+		for _, a := range newAlerts[:listed] {
 			mark := "范围内"
 			if !a.InScope {
 				mark = "范围外"
 			}
 			fmt.Fprintf(&b, " - %s:%d %s %s [%s]\n", a.IP, a.Port, a.Proto, a.Service, mark)
 		}
-		if len(newAlerts) > 50 {
-			fmt.Fprintf(&b, " …其余 %d 条见平台\n", len(newAlerts)-50)
+		if alertTotal > listed {
+			fmt.Fprintf(&b, " …其余 %d 条见平台\n", alertTotal-listed)
 		}
 	} else {
 		b.WriteString("新增风险告警：0 条\n")
@@ -480,36 +671,93 @@ func (e *Engine) buildSummaryText(scan *store.Scan, status string, newAlerts []s
 	return b.String()
 }
 
-// Baseline 把最近一次扫描结果中不在白名单的条目全部加入白名单
+// baselineWriteError 标记「基线白名单写入失败」，与结果分页读取错误区分开。
+// 写入失败时读取流并未耗尽，但其成功前缀已落库并明确消费，因此调用方
+// 绝不能再做一次收尾 flush，否则会把成功前缀重复写入。
+type baselineWriteError struct {
+	written int
+	entry   store.WLEntry
+	err     error
+}
+
+func (w *baselineWriteError) Error() string {
+	return fmt.Sprintf("写入基线白名单失败（已成功 %d 条，失败条目 %s 端口 %s 协议 %s）: %v",
+		w.written, w.entry.IPSpec, w.entry.PortSpec, w.entry.Proto, w.err)
+}
+
+func (w *baselineWriteError) Unwrap() error { return w.err }
+
+// addWhitelistEntry 统一白名单写入入口：存在注入入口时优先使用。
+func (e *Engine) addWhitelistEntry(entry store.WLEntry) (int64, error) {
+	if e.addWL != nil {
+		return e.addWL(entry)
+	}
+	return e.st.AddWhitelist(entry)
+}
+
+// Baseline 把最近一次扫描结果中不在白名单的条目全部加入白名单。
+// 结果按页读取、按 postScanViolationChunk 分块写入：既不全量加载结果，
+// 也不构造覆盖整次扫描的待写入切片。
+//
+// 写入进度由 consumed 游标显式跟踪：每成功写入一条就前移，失败条目仍留在
+// 游标位置。因此「已成功写入的前缀」只会被提交一次，不会因为收尾 flush
+// 而重复；写入错误用 baselineWriteError 标记，与分页读取错误区分处理。
 func (e *Engine) Baseline() (int, error) {
 	scanID, err := e.st.LatestDoneScan()
 	if err != nil {
 		return 0, fmt.Errorf("没有已完成的扫描: %v", err)
-	}
-	results, err := e.st.ResultsByScan(scanID)
-	if err != nil {
-		return 0, err
 	}
 	rules, err := e.loadRules()
 	if err != nil {
 		return 0, err
 	}
 	n := 0
-	for _, r := range results {
-		if e.matchAny(r.IP, r.Port, r.Proto, rules) {
-			continue
+	pending := make([]store.WLEntry, 0, postScanViolationChunk)
+	// consumed 是 pending 中已成功写入的前缀长度；写失败时停在失败条目上。
+	consumed := 0
+	flush := func() error {
+		for consumed < len(pending) {
+			entry := pending[consumed]
+			if _, err := e.addWhitelistEntry(entry); err != nil {
+				return &baselineWriteError{written: n, entry: entry, err: err}
+			}
+			n++
+			consumed++
 		}
-		proto := r.Proto
-		if proto == "" {
-			proto = "tcp"
-		}
-		if _, err := e.st.AddWhitelist(store.WLEntry{
-			IPSpec: r.IP, PortSpec: strconv.Itoa(r.Port), Proto: proto,
-			Service: r.Service, Owner: "baseline",
-		}); err != nil {
-			return n, err
-		}
-		n++
+		pending = pending[:0]
+		consumed = 0
+		return nil
 	}
-	return n, nil
+	walkErr := e.walkPages(scanID, func(page []store.Result) error {
+		for _, r := range page {
+			if e.matchAny(r.IP, r.Port, r.Proto, rules) {
+				continue
+			}
+			proto := r.Proto
+			if proto == "" {
+				proto = "tcp"
+			}
+			pending = append(pending, store.WLEntry{
+				IPSpec: r.IP, PortSpec: strconv.Itoa(r.Port), Proto: proto,
+				Service: r.Service, Owner: "baseline",
+			})
+			if len(pending) >= postScanViolationChunk {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	var writeErr *baselineWriteError
+	if errors.As(walkErr, &writeErr) {
+		// 写入失败：成功前缀已落库并计入 n，立即返回，绝不再 flush 一次。
+		return n, walkErr
+	}
+	// 读取失败只说明后面还有未读到的结果，已读到的尾部条目仍需落盘一次；
+	// flush 从 consumed 处继续，因此不会重复已成功的条目。
+	if err := flush(); err != nil {
+		return n, err
+	}
+	return n, walkErr
 }

@@ -236,7 +236,9 @@ sleep 0.2
 // 共享状态（去重集/开放端口/已处理）在加锁下正确聚合，无重复计数。
 func TestParallelBatchesAggregateResults(t *testing.T) {
 	runner, st, _ := newControlledRunner(t, parallelScript)
-	if err := st.SaveSettings(map[string]string{"scan_concurrency": "3"}); err != nil {
+	// 容量估算按 naabu 契约把 -retries 0 视为工具默认 3 轮，45 个目标 × 1000 端口
+	// 约需 63s；这里显式放宽任务超时，避免本用例被执行前的容量预检拒绝。
+	if err := st.SaveSettings(map[string]string{"scan_concurrency": "3", "scan_timeout_min": "10"}); err != nil {
 		t.Fatal(err)
 	}
 	ips := make([]string, 0, 45)

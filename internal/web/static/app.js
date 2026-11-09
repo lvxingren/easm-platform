@@ -28,6 +28,46 @@ async function postEmpty(url, method) {
   return { ok: r.ok, status: r.status, json: j };
 }
 
+// 轮询后台启动状态：启动 API 立即返回 preparing + request_id，naabu 自检 / 目标解析 /
+// 容量预检在后台完成，最终错误（含可操作建议）只能按该请求编号拿到。
+// onDone(scanID) 表示启动成功；onError(error, advice, scanID) 表示启动失败或状态不可知。
+// 约束：没有 request_id、编号未知（404）、状态已过期（410）、编号不匹配，一律按失败处理，
+// 绝不把“查不到状态”误报为启动成功。
+async function pollRunStatus(url, requestID, onDone, onError) {
+  if (!requestID) {
+    onError('启动接口未返回 request_id，无法跟踪本次启动结果，请到执行记录查看', [], 0);
+    return;
+  }
+  const target = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'request_id=' + encodeURIComponent(requestID);
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    let r, j = {};
+    try { r = await fetch(target, { cache: 'no-store' }); j = await r.json(); } catch (e) {
+      await new Promise(res => setTimeout(res, 1200));
+      continue;
+    }
+    if (!r.ok) {
+      // 404 未知编号 / 410 已过期：明确失败，不重试、不表示成功。
+      const message = j.error || (r.status === 404 || r.status === 410
+        ? '启动请求编号未知或已过期，请到执行记录确认本次结果'
+        : '读取启动状态失败');
+      onError(message, j.advice || [], j.scan_id || 0);
+      return;
+    }
+    if (j.request_id && j.request_id !== requestID) {
+      onError('启动状态与请求编号不匹配，请到执行记录确认本次结果', [], 0);
+      return;
+    }
+    if (j.done) {
+      if (j.error) onError(j.error, j.advice || [], j.scan_id || 0);
+      else onDone(j.scan_id || 0);
+      return;
+    }
+    await new Promise(res => setTimeout(res, 800));
+  }
+  onError('等待启动结果超时，请到执行记录查看本次请求的结果', [], 0);
+}
+
 // 深浅主题切换：写入 <html data-theme> 并持久化到 localStorage
 function toggleTheme() {
   const root = document.documentElement;

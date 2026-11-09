@@ -4,6 +4,12 @@
 {{if .Running}}<div class="run-banner">● 当前有扫描运行或暂停中，需等它结束后才能启动新任务。{{if .RunningScan}}<br><strong>{{.RunningScan.Name}}</strong>：{{scanStatusName .RunningScan.Status}}，已处理 {{.RunningScan.ProcessedTargets}}/{{.RunningScan.TargetCount}}，待处理 {{.RunningScan.RemainingTargets}}，当前第 {{.RunningScan.CurrentBatch}}/{{.RunningScan.TotalBatches}} 批。
   {{if ne .Role "viewer"}}<div class="row" style="margin-top:10px">{{if eq .RunningScan.Status "running"}}<button class="btn small" onclick="controlRunning({{.RunningScan.ID}},'pause')">暂停</button>{{else}}<button class="btn small primary" onclick="controlRunning({{.RunningScan.ID}},'resume')">恢复</button>{{end}}<button class="btn small danger" onclick="controlRunning({{.RunningScan.ID}},'stop')">终止扫描</button></div>{{end}}{{end}}</div>{{end}}
 
+<div id="run-error-banner" class="error-banner" style="display:none">
+  <strong>启动失败（后台准备阶段未通过）</strong><br><span id="run-error-text"></span>
+  <div id="run-error-advice-wrap" style="display:none;margin-top:10px"><strong>可操作建议</strong><ol id="run-error-advice" style="margin:8px 0 0 18px;line-height:1.8"></ol></div>
+  <p id="run-error-link" class="hint" style="margin:10px 0 0;display:none"></p>
+</div>
+
 <div class="section-head">
   <h2>任务列表（{{len .Tasks}} 个）</h2>
   <div class="row"><a class="btn ghost" href="/scans">全部执行记录</a>{{if ne .Role "viewer"}}<a class="btn primary" href="/tasks/new">+ 新建任务</a>{{end}}</div>
@@ -45,10 +51,40 @@
 </table>
 </div>
 <script>
+// startingTask 为真时表示正在等待后台启动结果，期间暂停自动刷新，避免页面重载丢掉错误提示。
+let startingTask = false;
+// showRunError 完整展示后台启动失败原因与容量预检建议（不吞错误），并保留跳转到执行记录入口。
+function showRunError(message, advice, scanID) {
+  const box = document.getElementById('run-error-banner');
+  if (!box) { toast(message || '启动失败', 'err'); return; }
+  document.getElementById('run-error-text').textContent = message || '启动失败';
+  const list = document.getElementById('run-error-advice');
+  list.textContent = '';
+  const items = advice || [];
+  for (const item of items) { const li = document.createElement('li'); li.textContent = item; list.appendChild(li); }
+  document.getElementById('run-error-advice-wrap').style.display = items.length ? '' : 'none';
+  const link = document.getElementById('run-error-link');
+  link.textContent = '';
+  if (scanID) {
+    const a = document.createElement('a');
+    a.href = '/scans/' + scanID; a.textContent = '查看执行记录详情（含完整错误与容量建议）';
+    link.appendChild(a); link.style.display = '';
+  } else { link.style.display = 'none'; }
+  box.style.display = '';
+  box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  toast('启动失败，请查看上方原因', 'err');
+}
 async function runTask(id) {
   const res = await postEmpty('/api/tasks/' + id + '/run');
-  if (res.json.scan_id) { location.href = '/scans/' + res.json.scan_id; return; }
-  toast(res.json.error || '启动失败，未创建执行记录', 'err');
+  if (!res.ok) { showRunError(res.json.error || '启动请求未被受理', res.json.advice || [], res.json.scan_id || 0); return; }
+  const requestID = res.json.request_id || '';
+  toast('已受理，正在后台检查 naabu 与容量预检…', 'ok');
+  startingTask = true;
+  // 启动 API 立即返回 preparing + request_id，实质性错误只能按该编号由 run-status 轮询拿到；
+  // 多次启动各自的 request_id 相互独立，后一次启动不会覆盖前一次的错误。
+  pollRunStatus(res.json.status_url || ('/api/tasks/' + id + '/run-status'), requestID,
+    (scanID) => { startingTask = false; if (scanID) location.href = '/scans/' + scanID; else location.reload(); },
+    (error, advice, scanID) => { startingTask = false; showRunError(error, advice, scanID); });
 }
 async function controlRunning(scanID, action) {
   if (action === 'stop' && !confirm('确定终止当前扫描？已发现结果会保留。')) return;
@@ -64,6 +100,7 @@ async function delTask(id) {
 setInterval(async () => {
   const r = await fetch('/api/status'); const j = await r.json();
   const banner = document.querySelector('.run-banner');
+  if (startingTask) return;
   if (j.running || banner) location.reload();
 }, 5000);
 </script>

@@ -26,6 +26,17 @@
     <div><div class="muted">实时连接</div><strong id="live-state" class="muted">{{if .Running}}每 2 秒更新{{else}}执行已结束{{end}}</strong></div>
   </div>
   <div id="scan-error" class="error-banner" style="margin-top:16px;{{if not .Scan.Err}}display:none{{end}}"><strong>执行说明 / 异常详情</strong><br><span id="scan-error-text">{{.Scan.Err}}</span></div>
+  {{if .CapacityRejected}}
+  <div id="capacity-banner" class="error-banner" style="margin-top:16px">
+    <strong>容量预检拒绝，本次执行未启动（原始错误完整保留如下，未被吞并）</strong>
+    <div id="capacity-error" class="codeblock" style="margin-top:10px;white-space:pre-wrap">{{.Scan.Err}}</div>
+    <div style="margin-top:12px"><strong>可操作建议</strong></div>
+    <ol id="capacity-advice" style="margin:8px 0 0 18px;line-height:1.8">
+      {{range .CapacityAdvice}}<li>{{.}}</li>{{end}}
+    </ol>
+    <p class="hint" style="margin:10px 0 0">{{if .IsAdmin}}<a href="/settings">前往系统设置调整扫描参数后重新运行</a>{{else}}请把以上信息转交管理员，在「系统设置」中调整扫描参数后重新运行。{{end}}</p>
+  </div>
+  {{end}}
   <div id="stopped-note" class="run-banner" style="margin-top:16px;{{if ne .Scan.Status "stopped"}}display:none{{end}}">本次由用户或平台停止，列表仅包含停止前已经发现并入库的结果，不生成白名单比对和端口风险告警。</div>
 </div>
 
@@ -69,33 +80,81 @@
   <div id="events-empty" class="muted" {{if .Events}}style="display:none"{{end}}>暂停、恢复、终止和资源超阈值告警会显示在这里。</div>
 </div>
 
-<div class="section-head"><h2>开放端口列表（<span id="result-count">{{len .Results}}</span> 条）</h2><div class="row"><a class="btn small ghost" href="/results?scan_id={{.Scan.ID}}">独立结果页面</a><a class="btn small ghost" href="/exposure">进入聚合暴露面</a></div></div>
+<div class="section-head"><h2>开放端口列表（已加载 <span id="result-loaded">{{len .Results}}</span> / 共 <span id="result-total">{{.ResultTotal}}</span> 条）</h2><div class="row"><a class="btn small ghost" href="/results?scan_id={{.Scan.ID}}">独立结果页面</a><a class="btn small ghost" href="/exposure">进入聚合暴露面</a></div></div>
 <div class="table-wrap">
 <table>
   <thead><tr><th>序号</th><th>IP</th><th>端口</th><th>协议</th><th>状态</th></tr></thead>
-  <tbody id="results-body">
+  <tbody id="results-body" data-cursor="{{.NextCursor}}" data-has-more="{{if .HasMore}}1{{else}}0{{end}}">
   {{range $i, $r := .Results}}
   <tr data-result-id="{{$r.ID}}"><td class="num-cell">{{add1 $i}}</td><td>{{$r.IP}}</td><td class="num-cell">{{$r.Port}}</td><td>{{$r.Proto}}</td><td>{{if eq $r.Status 1}}<span class="pill ok">开放</span>{{else}}<span class="pill mute">未开放</span>{{end}}</td></tr>
   {{end}}
   </tbody>
 </table>
-<div id="results-empty" class="empty" {{if .Results}}style="display:none"{{end}}><div class="big">本次执行暂时没有已保存的开放端口</div>运行中结果会逐批、逐行实时追加；无结果不代表异常，也可能是目标无开放端口或端口被过滤。</div>
+<div id="results-window-note" class="hint" style="display:none;padding:10px 14px;border-top:1px solid var(--border-soft)">为控制页面内存，表格最多保留最近 <span id="result-dom-limit">400</span> 行；游标仍在继续拉取，被回收的行不影响顺序与完整性。完整列表请打开 <a href="/results?scan_id={{.Scan.ID}}">独立结果页面</a>。</div>
+<div id="results-empty" class="empty" {{if or .Results .ResultTotal}}style="display:none"{{end}}><div class="big">本次执行暂时没有已保存的开放端口</div>运行中结果会逐批、逐行实时追加；无结果不代表异常，也可能是目标无开放端口或端口被过滤。</div>
 </div>
 <script>
 const scanID = {{.Scan.ID}};
-let lastResultID = {{.LastResultID}};
+// 结果游标：只由服务端 next_cursor 推进，DOM 回收不影响游标（保证不遗漏、不重复）。
+let lastResultID = {{.NextCursor}};
 let lastEventID = {{.LastEventID}};
+let resultLoaded = {{len .Results}};
+let resultTotal = {{.ResultTotal}};
+let hasMoreResults = {{if .HasMore}}true{{else}}false{{end}};
 let scanActive = {{if .Running}}true{{else}}false{{end}};
+let terminal = {{if .Running}}false{{else}}true{{end}};
+// 只有真正终态（done/failed/partial/stopped）才允许写入 terminalStatus 并粘滞。
+// running/paused 绝不写入：否则首屏或首个轮询响应就会把页面永久钉在运行中/暂停，
+// 恢复按钮、暂停按钮与终态提示都会失效（服务重启后的悬空 running 状态同样不得粘滞）。
+const TERMINAL_STATUSES = ['done', 'partial', 'stopped', 'failed'];
+function isTerminalStatus(status) { return TERMINAL_STATUSES.indexOf(status) >= 0; }
+let terminalStatus = {{if and (not .Running) (or (eq .Scan.Status "done") (eq .Scan.Status "partial") (eq .Scan.Status "stopped") (eq .Scan.Status "failed"))}}'{{.Scan.Status}}'{{else}}''{{end}};
+// 终态且首屏已排空时无需继续拉取。
+let drained = {{if or .Running .HasMore}}false{{else}}true{{end}};
 const canControl = {{if and .Running (ne .Role "viewer")}}true{{else}}false{{end}};
-let polling = false;
-let resultCount = {{len .Results}};
+// DOM 行数硬上限与单次拉取条数：超出上限只回收最早的行，游标与已加载计数继续增长。
+const RESULT_DOM_LIMIT = 400;
+const RESULT_PAGE_LIMIT = 500;
 const statusNames = {done:'完成', running:'运行中', paused:'已暂停', partial:'部分完成', stopped:'已终止', failed:'失败'};
 const statusClasses = {done:'ok', running:'run', paused:'run', partial:'run', stopped:'mute', failed:'err'};
+// 进度下限：processed/failed/open_ports/result_count 等计数只接受更大的值，
+// 迟到的旧响应（或乱序响应）不能让页面上的进度回退。
+const progressFloor = {
+  target_count: {{.Scan.TargetCount}},
+  processed_targets: {{.Scan.ProcessedTargets}},
+  failed_targets: {{.Scan.FailedTargets}},
+  current_batch: {{.Scan.CurrentBatch}},
+  open_ports: {{.Scan.OpenPorts}},
+  result_count: {{.Scan.ResultCount}},
+  max_cpu_percent: {{printf "%.4f" .Scan.MaxCPUPercent}},
+  max_memory_rss: {{.Scan.MaxMemoryRSS}}
+};
+let polling = false;
+let liveTimer = null;
+let domTrimmed = false;
+// 终态且 has_more=false 后仍做一次确认拉取，捕获「标记终态后最后一小批结果才提交」的尾巴。
+let drainConfirmChecks = 0;
 
 function setText(id, value) { const el = document.getElementById(id); if (el) el.textContent = value; }
+function monoMax(previous, next) { return Math.max(Number(previous || 0), Number(next || 0)); }
 function formatMemory(bytes) { return (Number(bytes || 0) / 1048576).toFixed(1); }
 function remaining(scan) { return Math.max(0, Number(scan.target_count || 0) - Number(scan.processed_targets || 0)); }
 function percent(scan) { if (!scan.target_count) return 0; return Math.min(100, Math.floor(scan.processed_targets * 100 / scan.target_count)); }
+// mergeScan 以单调方式合并一次进度快照：所有累计计数取 max，终态一旦呈现不再回退到运行中。
+function mergeScan(scan) {
+  const merged = Object.assign({}, scan);
+  for (const key in progressFloor) {
+    if (!(key in scan)) continue;
+    if (key === 'max_cpu_percent' || key === 'max_memory_rss') {
+      merged[key] = monoMax(progressFloor[key], scan[key]);
+    } else {
+      merged[key] = Math.floor(monoMax(progressFloor[key], scan[key]));
+    }
+    progressFloor[key] = merged[key];
+  }
+  if (terminalStatus && (scan.status === 'running' || scan.status === 'paused')) merged.status = terminalStatus;
+  return merged;
+}
 function updateControls(status) {
   const pause = document.getElementById('pause-btn');
   const resume = document.getElementById('resume-btn');
@@ -104,7 +163,8 @@ function updateControls(status) {
   if (resume) resume.style.display = canControl && status === 'paused' ? '' : 'none';
   if (stop) stop.style.display = canControl && (status === 'running' || status === 'paused') ? '' : 'none';
 }
-function updateScan(scan) {
+function updateScan(raw) {
+  const scan = mergeScan(raw || {});
   const status = statusNames[scan.status] || '失败';
   const statusClass = statusClasses[scan.status] || 'err';
   const statusEl = document.getElementById('scan-status');
@@ -127,21 +187,40 @@ function updateScan(scan) {
   const error = document.getElementById('scan-error'); error.style.display = scan.error ? '' : 'none'; setText('scan-error-text', scan.error || '');
   document.getElementById('stopped-note').style.display = scan.status === 'stopped' ? '' : 'none';
   scanActive = scan.status === 'running' || scan.status === 'paused';
+  if (terminalStatus === '' && isTerminalStatus(scan.status)) terminalStatus = scan.status;
   setText('live-state', scanActive ? '每 2 秒更新' : '执行已结束');
   updateControls(scan.status);
 }
+// trimResultsDom 只回收最早的 DOM 行来控制内存；不修改 lastResultID，
+// 因此后续游标拉取与已加载计数完全不受影响。
+function trimResultsDom() {
+  const body = document.getElementById('results-body');
+  while (body.children.length > RESULT_DOM_LIMIT) {
+    body.removeChild(body.firstElementChild);
+    domTrimmed = true;
+  }
+  if (domTrimmed) document.getElementById('results-window-note').style.display = '';
+}
+function updateResultMeta() {
+  resultTotal = monoMax(resultTotal, resultLoaded);
+  setText('result-loaded', resultLoaded);
+  setText('result-total', resultTotal);
+  document.getElementById('results-empty').style.display = (resultLoaded || resultTotal) ? 'none' : '';
+  trimResultsDom();
+}
+// appendResults 按游标顺序追加，id <= 游标的结果一律丢弃，保证不重复插入。
 function appendResults(results) {
   const body = document.getElementById('results-body');
   for (const result of results) {
     if (!result.id || result.id <= lastResultID) continue;
-    lastResultID = Math.max(lastResultID, result.id); resultCount++;
+    lastResultID = result.id; resultLoaded++;
     const row = document.createElement('tr'); row.dataset.resultId = result.id;
-    const values = [resultCount, result.ip, result.port, result.proto || 'tcp'];
+    const values = [resultLoaded, result.ip, result.port, result.proto || 'tcp'];
     for (let i = 0; i < values.length; i++) { const cell = document.createElement('td'); cell.textContent = values[i]; if (i === 0 || i === 2) cell.className = 'num-cell'; row.appendChild(cell); }
     const state = document.createElement('td'); const pill = document.createElement('span'); pill.className = 'pill ' + (result.status === 1 ? 'ok' : 'mute'); pill.textContent = result.status === 1 ? '开放' : '未开放'; state.appendChild(pill); row.appendChild(state);
     body.appendChild(row);
   }
-  setText('result-count', resultCount); document.getElementById('results-empty').style.display = resultCount ? 'none' : '';
+  updateResultMeta();
 }
 function appendEvents(events) {
   const list = document.getElementById('event-list');
@@ -155,17 +234,48 @@ function appendEvents(events) {
   }
   document.getElementById('events-empty').style.display = list.children.length ? 'none' : '';
 }
+function scheduleRefresh(delay) { clearTimeout(liveTimer); liveTimer = setTimeout(refreshLive, delay); }
 async function refreshLive() {
-  if (!scanActive || polling) return;
+  if (polling || drained) return;
   polling = true;
+  let delay = 2000;
   try {
-    const response = await fetch(`/api/scans/${scanID}/live?after_id=${lastResultID}&event_after_id=${lastEventID}`, {cache:'no-store'});
+    const url = `/api/scans/${scanID}/live?after_id=${lastResultID}&event_after_id=${lastEventID}&limit=${RESULT_PAGE_LIMIT}`;
+    const response = await fetch(url, {cache:'no-store'});
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '读取实时状态失败');
-    appendResults(data.results || []); appendEvents(data.events || []); updateScan(data.scan);
+    appendResults(data.results || []); appendEvents(data.events || []);
+    lastResultID = Math.max(lastResultID, Number(data.next_cursor || 0));
+    resultTotal = monoMax(resultTotal, Number(data.result_count || 0));
+    hasMoreResults = !!data.has_more;
+    terminal = !!data.terminal;
+    // 终态粘滞只由 updateScan 内的 isTerminalStatus 判定，这里不得直接赋值：
+    // data.scan.status 可能是 running/paused，一旦写入就会把状态永久钉住。
+    if (data.scan) updateScan(data.scan);
+    updateResultMeta();
+    // 终态后仍要继续拉取直到游标排空：只要 has_more 为真就立刻续拉，不因状态完成提前停止。
+    if (terminal && !hasMoreResults) {
+      if (drainConfirmChecks < 1) {
+        drainConfirmChecks++;
+        delay = 1500;
+        setText('live-state', '执行已结束，正在确认结果是否全部入库…');
+      } else {
+        drained = true;
+        setText('live-state', '执行已结束，结果已全部加载（' + resultLoaded + ' 条）');
+      }
+    } else if (terminal) {
+      setText('live-state', '执行已结束，正在按游标补齐结果…');
+      delay = 30;
+    } else if (hasMoreResults) {
+      delay = 30;
+    }
   } catch (error) {
     setText('live-state', '连接失败，自动重试');
-  } finally { polling = false; }
+    delay = 3000;
+  } finally {
+    polling = false;
+    if (!drained) scheduleRefresh(delay);
+  }
 }
 async function controlScan(action) {
   if (action === 'stop' && !confirm('确定终止当前扫描？naabu 进程会被停止，已发现的结果保留，但不会生成端口风险告警。')) return;
@@ -174,7 +284,7 @@ async function controlScan(action) {
   const res = await postEmpty(`/api/scans/${scanID}/${action}`);
   buttons.forEach(button => button.disabled = false);
   toast(res.ok ? '操作已提交' : (res.json.error || '操作失败'), res.ok ? 'ok' : 'err');
-  scanActive = true; await refreshLive();
+  if (res.ok) { drained = false; drainConfirmChecks = 0; await refreshLive(); }
 }
 // resyncScan 手动修正悬空状态：服务重启或进程异常退出后，执行可能仍显示运行中/暂停。
 async function resyncScan() {
@@ -183,7 +293,6 @@ async function resyncScan() {
   toast(res.ok ? '状态已同步' : (res.json.error || '同步失败'), res.ok ? 'ok' : 'err');
   if (res.ok) setTimeout(() => location.reload(), 600);
 }
-if (scanActive) { refreshLive(); }
-setInterval(refreshLive, 2000);
+if (drained) { setText('live-state', '执行已结束，结果已全部加载（' + resultLoaded + ' 条）'); } else { scheduleRefresh(0); }
 </script>
 {{template "foot" .}}{{end}}

@@ -48,6 +48,12 @@ type Server struct {
 	tpl      *template.Template
 	sessions map[string]session
 	mu       sync.Mutex
+
+	// startGate 按 request_id 保存后台启动状态，并承担「防重复启动」闸门职责；
+	// 完成态按有限 TTL/容量保留，B 请求不会覆盖 A 请求的结果。
+	startGate startRegistry
+	// startFn 是后台启动入口，默认指向 scanner.Runner.StartTask，测试可替换以隔离真实扫描。
+	startFn func(int64) (int64, error)
 }
 
 type pageData struct {
@@ -125,7 +131,11 @@ func New(st *store.Store, cfg *config.Config, sc *scanner.Runner, eng *engine.En
 		},
 	}
 	tpl := template.Must(template.New("").Funcs(funcs).ParseFS(assets, "templates/*.html"))
-	return &Server{st: st, cfg: cfg, sc: sc, eng: eng, tpl: tpl, sessions: map[string]session{}}
+	srv := &Server{st: st, cfg: cfg, sc: sc, eng: eng, tpl: tpl, sessions: map[string]session{}}
+	if sc != nil {
+		srv.startFn = sc.StartTask
+	}
+	return srv
 }
 
 func (s *Server) Handler() http.Handler {
@@ -176,6 +186,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/targets/{id}", s.requireWrite(s.apiDeleteTarget))
 	mux.HandleFunc("POST /api/tasks", s.requireWrite(s.apiCreateTask))
 	mux.HandleFunc("POST /api/tasks/{id}/run", s.requireWrite(s.apiRunTask))
+	// 后台启动状态：启动 API 立即返回 preparing，最终结果（含容量预检拒绝原因）由此读取。
+	mux.HandleFunc("GET /api/tasks/{id}/run-status", s.auth(s.apiRunStatus))
 	mux.HandleFunc("POST /api/tasks/{id}", s.requireWrite(s.apiUpdateTask))
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.requireWrite(s.apiDeleteTask))
 	mux.HandleFunc("POST /api/baseline", s.requireWrite(s.apiBaseline))
@@ -497,7 +509,9 @@ func (s *Server) pageScanDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "扫描记录不存在", http.StatusNotFound)
 		return
 	}
-	results, err := s.st.ResultsByScan(id)
+	// 首屏结果只取固定硬上限一页；剩余结果由页面按游标续拉，
+	// 因此 50 万行量级的执行也只会装载这一页，不会全量读入内存并拼进 HTML。
+	results, err := s.st.ResultsPage(id, 0, scanDetailInitialResults)
 	if err != nil {
 		http.Error(w, "读取执行结果失败: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -507,27 +521,33 @@ func (s *Server) pageScanDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "读取执行事件失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	var lastResultID, lastEventID int64
-	for _, result := range results {
-		if result.ID > lastResultID {
-			lastResultID = result.ID
-		}
-	}
+	var lastEventID int64
 	for _, event := range events {
 		if event.ID > lastEventID {
 			lastEventID = event.ID
 		}
 	}
+	// 总数来自 scans.result_count（单调累计），不以首屏行数为准；
+	// 旧库 result_count 尚未回填时以后一页行数兜底，保证「已加载 / 共 N 条」不倒退。
+	resultTotal := sc.ResultCount
+	if resultTotal < len(results.Results) {
+		resultTotal = len(results.Results)
+	}
 	bd, _ := s.baseData(r, "执行详情 #"+r.PathValue("id"), "scans")
 	bd.Running = s.sc.IsRunning() && s.sc.CurrentScanID() == id
 	s.render(w, "scan_detail.html", struct {
 		pageData
-		Scan         store.Scan
-		Results      []store.Result
-		Events       []store.ScanEvent
-		LastResultID int64
-		LastEventID  int64
-	}{bd, *sc, results, events, lastResultID, lastEventID})
+		Scan             store.Scan
+		Results          []store.Result
+		ResultTotal      int
+		NextCursor       int64
+		HasMore          bool
+		Events           []store.ScanEvent
+		LastEventID      int64
+		CapacityRejected bool
+		CapacityAdvice   []string
+	}{bd, *sc, results.Results, resultTotal, results.NextCursor, results.HasMore, events, lastEventID,
+		isCapacityRejection(sc.Err), capacitySuggestions(sc.Err)})
 }
 
 func (s *Server) pageResults(w http.ResponseWriter, r *http.Request) {
@@ -1002,27 +1022,20 @@ func (s *Server) apiCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{"id": id}
 	if r.FormValue("run_now") == "on" {
-		if scanID, rerr := s.sc.StartTask(id); rerr != nil {
-			resp["run_error"] = rerr.Error()
-			if scanID > 0 {
-				resp["scan_id"] = scanID
-			}
+		// 与「运行」接口一致：启动流程放后台，立即返回 preparing + request_id，
+		// 错误只能按该编号通过 run-status 读取，不会被后续启动请求覆盖。
+		if requestID, msg, ok := s.beginBackgroundStart(id); !ok {
+			resp["run_error"] = msg
+			resp["request_id"] = ""
 		} else {
-			resp["scan_id"] = scanID
+			s.launchBackgroundStart(requestID, id)
+			resp["task_id"] = id
+			resp["request_id"] = requestID
+			resp["preparing"] = true
+			resp["status_url"] = startStatusPath(id, requestID)
 		}
 	}
 	writeJSON(w, 200, resp)
-}
-
-func (s *Server) apiRunTask(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	s.audit(r, "运行扫描任务", "#"+r.PathValue("id"), "")
-	scanID, err := s.sc.StartTask(id)
-	if err != nil {
-		writeJSON(w, 400, map[string]interface{}{"error": err.Error(), "scan_id": scanID})
-		return
-	}
-	writeJSON(w, 200, map[string]interface{}{"scan_id": scanID})
 }
 
 func (s *Server) apiUpdateTask(w http.ResponseWriter, r *http.Request) {

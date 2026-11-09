@@ -57,6 +57,7 @@ type Scan struct {
 	MemoryRSS        int64   `json:"memory_rss"`
 	MaxCPUPercent    float64 `json:"max_cpu_percent"`
 	MaxMemoryRSS     int64   `json:"max_memory_rss"`
+	ResultCount      int     `json:"result_count"` // 已入库结果行累计数（单调不减）
 }
 
 // ScanResultRow 是带执行来源的端口结果，供跨任务查询和按扫描模式区分。
@@ -233,7 +234,7 @@ func Open(path string) (*Store, error) {
 	}
 	schema := `
 CREATE TABLE IF NOT EXISTS targets (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL UNIQUE, kind TEXT DEFAULT 'ip', tags TEXT DEFAULT '', source TEXT DEFAULT '', created_at TEXT, domain TEXT DEFAULT '', owner TEXT DEFAULT '', security_device TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER DEFAULT 0, name TEXT DEFAULT '', mode TEXT, status TEXT, started_at TEXT, finished_at TEXT, open_ports INTEGER DEFAULT 0, error TEXT DEFAULT '', target_count INTEGER DEFAULT 0, command TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER DEFAULT 0, name TEXT DEFAULT '', mode TEXT, status TEXT, started_at TEXT, finished_at TEXT, open_ports INTEGER DEFAULT 0, error TEXT DEFAULT '', target_count INTEGER DEFAULT 0, command TEXT DEFAULT '', result_count INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS scan_results (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', status INTEGER DEFAULT 1, UNIQUE(scan_id, ip, port, proto));
 CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, ip_spec TEXT, port_spec TEXT, proto TEXT DEFAULT '*', service TEXT DEFAULT '', owner TEXT DEFAULT '', remark TEXT DEFAULT '', business TEXT DEFAULT '', created_at TEXT);
 CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', in_scope INTEGER DEFAULT 1, status TEXT DEFAULT 'new', first_seen_at TEXT, last_seen_at TEXT, sent_feishu INTEGER DEFAULT 0, created_at TEXT, handler TEXT DEFAULT '', handle_note TEXT DEFAULT '', handled_at TEXT DEFAULT '');
@@ -247,6 +248,7 @@ CREATE TABLE IF NOT EXISTS analysis (id INTEGER PRIMARY KEY AUTOINCREMENT, name 
 CREATE TABLE IF NOT EXISTS analysis_files (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_id INTEGER NOT NULL, filename TEXT DEFAULT '', size INTEGER DEFAULT 0, format TEXT DEFAULT '', stored_path TEXT DEFAULT '', rows_parsed INTEGER DEFAULT 0, uploaded_at TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS analysis_edges (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_id INTEGER NOT NULL, src_ip TEXT DEFAULT '', dst_ip TEXT DEFAULT '', dst_port INTEGER DEFAULT 0, proto TEXT DEFAULT '', action TEXT DEFAULT '', count INTEGER DEFAULT 0, first_seen TEXT DEFAULT '', last_seen TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_results_scan ON scan_results(scan_id);
+CREATE INDEX IF NOT EXISTS idx_results_scan_id ON scan_results(scan_id, id);
 CREATE INDEX IF NOT EXISTS idx_scan_events_scan ON scan_events(scan_id, id);
 CREATE INDEX IF NOT EXISTS idx_results_exposure ON scan_results(ip, port, proto, status);
 CREATE INDEX IF NOT EXISTS idx_alerts_key ON alerts(ip, port, proto);
@@ -275,6 +277,7 @@ CREATE INDEX IF NOT EXISTS idx_analysis_edges ON analysis_edges(analysis_id);
 		`ALTER TABLE scans ADD COLUMN memory_rss INTEGER DEFAULT 0`,
 		`ALTER TABLE scans ADD COLUMN max_cpu_percent REAL DEFAULT 0`,
 		`ALTER TABLE scans ADD COLUMN max_memory_rss INTEGER DEFAULT 0`,
+		`ALTER TABLE scans ADD COLUMN result_count INTEGER DEFAULT 0`,
 		`ALTER TABLE scan_results ADD COLUMN status INTEGER DEFAULT 1`,
 		`ALTER TABLE scan_tasks ADD COLUMN target_type TEXT DEFAULT ''`,
 		`ALTER TABLE scan_tasks ADD COLUMN target_tag TEXT DEFAULT ''`,
@@ -552,19 +555,30 @@ func (s *Store) StartScanExecution(id int64, targetCount, totalBatches int) erro
 	return err
 }
 
+// UpdateScanProgress 保留旧签名，内部走单调合并：processed/failed/current_batch/open_ports
+// 只增不减，迟到的旧快照不会覆盖已写入的更高值（详见 ApplyScanProgress）。
 func (s *Store) UpdateScanProgress(id int64, processed, failed, currentBatch, openPorts int, command string) error {
-	_, err := s.db.Exec(`UPDATE scans SET processed_targets=?, failed_targets=?, current_batch=?, open_ports=?, command=? WHERE id=?`,
-		processed, failed, currentBatch, openPorts, command, id)
-	return err
+	return s.ApplyScanProgress(id, ScanProgress{
+		Processed:    processed,
+		Failed:       failed,
+		CurrentBatch: currentBatch,
+		OpenPorts:    openPorts,
+		Command:      command,
+	})
 }
 
+// FinishScanStatus 写终态。兼容旧语义：status==done 时把 processed 拉到 target_count
+// （但不低于已记录值），failed 归零；同时把 result_count 固化为扫描实际结果行数。
 func (s *Store) FinishScanStatus(id int64, status string, openPorts int, scanErr string) error {
 	if status == "done" {
 		_, err := s.db.Exec(`UPDATE scans SET status=?, finished_at=?, open_ports=?, error=?,
-			processed_targets=target_count, failed_targets=0, current_batch=total_batches WHERE id=?`, status, now(), openPorts, scanErr, id)
+			processed_targets=MAX(COALESCE(target_count,0), COALESCE(processed_targets,0)), failed_targets=0,
+			current_batch=MAX(COALESCE(total_batches,0), COALESCE(current_batch,0)),
+			result_count=(SELECT COUNT(*) FROM scan_results r WHERE r.scan_id=scans.id) WHERE id=?`, status, now(), openPorts, scanErr, id)
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE scans SET status=?, finished_at=?, open_ports=?, error=? WHERE id=?`, status, now(), openPorts, scanErr, id)
+	_, err := s.db.Exec(`UPDATE scans SET status=?, finished_at=?, open_ports=?, error=?,
+		result_count=(SELECT COUNT(*) FROM scan_results r WHERE r.scan_id=scans.id) WHERE id=?`, status, now(), openPorts, scanErr, id)
 	return err
 }
 
@@ -619,7 +633,7 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 	sqlText := `SELECT id, task_id, COALESCE(name,''), COALESCE(mode,''), COALESCE(status,''), COALESCE(started_at,''),
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
-		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0)
+		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0)
 		FROM scans WHERE ` + strings.Join(where, " AND ") + ` ORDER BY id DESC`
 	if limit > 0 {
 		sqlText += " LIMIT ?"
@@ -635,7 +649,7 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 		var sc Scan
 		if err := rows.Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
-			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS); err != nil {
+			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount); err != nil {
 			return nil, err
 		}
 		out = append(out, sc)
@@ -649,10 +663,10 @@ func (s *Store) Scan(id int64) (*Scan, error) {
 	err := s.db.QueryRow(`SELECT id, task_id, COALESCE(name,''), COALESCE(mode,''), COALESCE(status,''), COALESCE(started_at,''),
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
-		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0) FROM scans WHERE id=?`, id).
+		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0) FROM scans WHERE id=?`, id).
 		Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
-			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS)
+			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -682,19 +696,11 @@ func (s *Store) CountScans() (int, error) {
 	return n, err
 }
 
+// InsertResults 保留旧签名（兼容 scanner 现有调用），内部走 InsertResultsBatch：
+// 去重、分块事务、实际新增计数由批量接口统一负责，丢弃统计值。
 func (s *Store) InsertResults(scanID int64, results []Result) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, r := range results {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO scan_results(scan_id, ip, port, proto, service, status) VALUES(?,?,?,?,?,?)`,
-			scanID, r.IP, r.Port, r.Proto, r.Service, r.Status); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	_, err := s.InsertResultsBatch(scanID, results)
+	return err
 }
 
 // ResultsFiltered 查询跨执行端口结果，保留任务和扫描模式来源；limit<=0 表示不限制。
@@ -747,6 +753,8 @@ func (s *Store) ResultsFiltered(query, mode string, taskID, scanID int64, port, 
 	return out, rows.Err()
 }
 
+// ResultsByScan 一次性返回某次执行的全部结果（按 ip,port 排序），保留兼容。
+// 结果量可能很大：scanner 补齐、engine 后处理、web 详情请优先用键集分页 ResultsPage。
 func (s *Store) ResultsByScan(scanID int64) ([]Result, error) {
 	rows, err := s.db.Query(`SELECT id, ip, port, proto, service, status FROM scan_results WHERE scan_id=? ORDER BY ip, port`, scanID)
 	if err != nil {

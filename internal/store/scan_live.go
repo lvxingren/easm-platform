@@ -11,8 +11,9 @@ func (s *Store) SetScanActiveStatus(id int64, status string) error {
 	return err
 }
 
+// UpdateScanOpenPorts 更新开放端口累计数；单调不减，迟到的旧快照不会把已统计到的更高值减回去。
 func (s *Store) UpdateScanOpenPorts(id int64, openPorts int) error {
-	_, err := s.db.Exec(`UPDATE scans SET open_ports=? WHERE id=?`, openPorts, id)
+	_, err := s.db.Exec(`UPDATE scans SET open_ports=MAX(COALESCE(open_ports,0), ?) WHERE id=?`, openPorts, id)
 	return err
 }
 
@@ -91,27 +92,12 @@ func (s *Store) ScanEvents(scanID, afterID int64, limit int) ([]ScanEvent, error
 	return out, rows.Err()
 }
 
-// ResultsAfter 按数据库自增 ID 返回增量结果，供运行中的执行详情轮询。
+// ResultsAfter 保留旧签名：按自增 ID 返回增量结果，内部走键集分页 ResultsPage。
+// 新代码建议直接用 ResultsPage，以便拿到 NextCursor/HasMore。
 func (s *Store) ResultsAfter(scanID, afterID int64, limit int) ([]Result, error) {
-	if limit <= 0 {
-		limit = 500
-	}
-	if limit > 2000 {
-		limit = 2000
-	}
-	rows, err := s.db.Query(`SELECT id,ip,port,COALESCE(proto,'tcp'),COALESCE(service,''),status
-		FROM scan_results WHERE scan_id=? AND id>? ORDER BY id LIMIT ?`, scanID, afterID, limit)
+	page, err := s.ResultsPage(scanID, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]Result, 0)
-	for rows.Next() {
-		var result Result
-		if err := rows.Scan(&result.ID, &result.IP, &result.Port, &result.Proto, &result.Service, &result.Status); err != nil {
-			return nil, err
-		}
-		out = append(out, result)
-	}
-	return out, rows.Err()
+	return page.Results, nil
 }

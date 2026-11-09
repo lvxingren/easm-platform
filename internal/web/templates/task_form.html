@@ -135,11 +135,25 @@ async function submitForm(runNow) {
   const url = EDITING ? ('/api/tasks/' + TASK_ID) : '/api/tasks';
   const res = await postForm(url, fd);
   if (!res.ok) { toast(res.json.error || '保存失败', 'err'); return; }
-  if (res.json.run_error) toast('任务已保存，但运行失败：' + res.json.run_error, 'err');
-  else if (runNow) toast('任务已保存并启动（扫描 ID ' + res.json.scan_id + '）', 'ok');
-  else toast('任务已保存', 'ok');
-  const target = runNow && res.json.scan_id ? '/scans/' + res.json.scan_id : '/tasks';
-  setTimeout(() => location.href = target, 800);
+  if (res.json.run_error) { toast('任务已保存，但启动请求未被受理：' + res.json.run_error, 'err'); setTimeout(() => location.href = '/tasks', 1500); return; }
+  if (runNow && res.json.preparing) {
+    // 启动流程已转后台：立即返回 preparing + request_id，naabu 自检与容量预检结果只能按该编号轮询拿到。
+    toast('任务已保存，正在后台检查 naabu 与容量预检…', 'ok');
+    pollRunStatus(res.json.status_url || ('/api/tasks/' + res.json.id + '/run-status'), res.json.request_id || '',
+      (scanID) => { location.href = scanID ? '/scans/' + scanID : '/tasks'; },
+      (error, advice, scanID) => {
+        toast('任务已保存，但启动失败：' + error + (advice && advice.length ? '｜建议：' + advice[0] : ''), 'err');
+        setTimeout(() => location.href = scanID ? '/scans/' + scanID : '/tasks', 1500);
+      });
+    return;
+  }
+  if (runNow && res.json.scan_id) {
+    toast('任务已保存并启动（扫描 ID ' + res.json.scan_id + '）', 'ok');
+    setTimeout(() => location.href = '/scans/' + res.json.scan_id, 800);
+    return;
+  }
+  toast('任务已保存', 'ok');
+  setTimeout(() => location.href = '/tasks', 800);
 }
 </script>
 {{template "foot" .}}{{end}}
