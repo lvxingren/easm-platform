@@ -41,8 +41,10 @@ const (
 	capacityWarnRatio = 0.8
 	// capacityStartupOverhead 是每个批次进程启动、收尾与入库的固定开销估算。
 	capacityStartupOverhead = 3 * time.Second
-	// capacityTargetCap 是目标展开计数上限，超过后按“至少这么多目标”估算，避免超大网段耗尽内存。
+	// capacityTargetCap 是目标展开计数上限，超过后按"至少这么多目标"估算，避免超大网段耗尽内存。
 	capacityTargetCap = 1 << 22
+	// defaultSplitBatchSize 是自动拆分时每批的目标数量默认值。
+	defaultSplitBatchSize = 50
 )
 
 // capacityEnvironment 汇总容量预检需要向操作系统查询的信息。
@@ -624,4 +626,91 @@ func nearestExistingDir(path string) string {
 		}
 		current = parent
 	}
+}
+
+// IsTimeoutError 判断容量预检错误是否因预估耗时超过任务超时。
+// 只有这类错误才触发自动拆分，其他预检失败（FD/磁盘等）仍直接拒绝。
+func IsTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "超过任务超时") || strings.Contains(msg, "预估耗时")
+}
+
+// CalculateSplitBatches 将目标规格列表按 batchSize 拆分为多个批次。
+// 每批包含最多 batchSize 个目标规格（注意：这是 specs 条数，不是展开后的地址数）。
+func CalculateSplitBatches(specs []store.TargetSpec, batchSize int) [][]store.TargetSpec {
+	if len(specs) == 0 || batchSize < 1 {
+		return nil
+	}
+	var batches [][]store.TargetSpec
+	for i := 0; i < len(specs); i += batchSize {
+		end := i + batchSize
+		if end > len(specs) {
+			end = len(specs)
+		}
+		batches = append(batches, specs[i:end])
+	}
+	return batches
+}
+
+// CalculateSmartBatchSize 根据超时时间和目标数量智能计算批次大小。
+// 核心思路：确保每个子任务的预估耗时不超过任务超时时间的 80%，留出 20% 余量。
+//
+// 参数：
+//   - targetCount: 目标数量
+//   - portsPerTarget: 每个目标的目标的端口数
+//   - ratePerSecond: 每秒探测速率
+//   - timeout: 任务超时时间
+//
+// 返回：推荐的批次大小（至少为 1）
+func CalculateSmartBatchSize(targetCount, portsPerTarget, ratePerSecond int, timeout time.Duration) int {
+	if targetCount <= 0 || portsPerTarget <= 0 || ratePerSecond <= 0 {
+		return defaultSplitBatchSize
+	}
+
+	// 计算单个目标的预估耗时（秒）
+	singleTargetDuration := float64(portsPerTarget) / float64(ratePerSecond)
+
+	// 目标超时时间的 80%（留 20% 余量）
+	effectiveTimeout := float64(timeout.Seconds()) * 0.8
+
+	// 计算单个批次最多能容纳的目标数
+	maxTargetsPerBatch := int(effectiveTimeout / singleTargetDuration)
+	if maxTargetsPerBatch < 1 {
+		maxTargetsPerBatch = 1
+	}
+
+	// 如果目标总数小于单批最大目标数，不需要拆分
+	if targetCount <= maxTargetsPerBatch {
+		return targetCount
+	}
+
+	// 返回计算出的批次大小，但不超过默认值的 2 倍（避免批次过大）
+	if maxTargetsPerBatch > defaultSplitBatchSize*2 {
+		return defaultSplitBatchSize * 2
+	}
+	return maxTargetsPerBatch
+}
+
+// EncodeSpecsJSON 将目标规格列表编码为 JSON 字符串，便于存储到数据库。
+func EncodeSpecsJSON(specs []store.TargetSpec) string {
+	if len(specs) == 0 {
+		return "[]"
+	}
+	// 简单编码为 JSON 数组，每个元素是 {raw, kind}
+	var buf strings.Builder
+	buf.WriteByte('[')
+	for i, sp := range specs {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		// 转义 raw 中的特殊字符
+		raw := strings.ReplaceAll(sp.Raw, `\`, `\\`)
+		raw = strings.ReplaceAll(raw, `"`, `\"`)
+		buf.WriteString(fmt.Sprintf(`{"raw":%q,"kind":%q}`, raw, sp.Kind))
+	}
+	buf.WriteByte(']')
+	return buf.String()
 }

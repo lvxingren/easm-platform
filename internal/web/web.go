@@ -222,6 +222,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/test-ai", s.requireAdmin(s.apiTestAI))
 
 	mux.HandleFunc("GET /api/scans/{id}/live", s.auth(s.apiScanLive))
+	mux.HandleFunc("GET /api/scans/{id}/subtasks", s.auth(s.apiScanSubTasks))
 	mux.HandleFunc("GET /api/analysis/{id}", s.auth(s.apiAnalysisStatus))
 	mux.HandleFunc("GET /api/logs", s.requireAdmin(s.apiLogs))
 	mux.HandleFunc("POST /api/scans/{id}/{action}", s.requireWrite(s.apiScanControl))
@@ -631,74 +632,78 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 	certInfo, _ := cert.Inspect(s.cfg.TLSCert)
 	s.render(w, "settings.html", struct {
 		pageData
-		FeishuWebhook     string
-		FeishuSecret      string
-		NaabuPath         string
-		NaabuRate         string
-		NaabuRetries      string
-		NaabuWorkers      string
-		NaabuTimeout      string
-		NaabuScanType     string
-		NaabuExcludePorts string
-		NaabuInterface    string
-		NaabuVerify       bool
-		ScanTimeout       string
-		ScanConcurrency   string
-		RealertDays       string
-		AlertOutOfScope   bool
-		ResourceMonitor   bool
-		ResourceCPU       string
-		ResourceMemory    string
-		ResourceDuration  string
-		HTTPEnabled       bool
-		Listen            string
-		HTTPSEnabled      bool
-		HTTPSListen       string
-		TLSCert           string
-		TLSKey            string
-		TLSHosts          string
-		ConfigPath        string
-		CertInfo          *cert.Info
-		AiEndpoint        string
-		AiModel           string
-		AiTimeout         string
-		AiTemperature     string
-		AiKeySet          bool
+		FeishuWebhook      string
+		FeishuSecret       string
+		NaabuPath          string
+		NaabuRate          string
+		NaabuRetries       string
+		NaabuWorkers       string
+		NaabuTimeout       string
+		NaabuScanType      string
+		NaabuExcludePorts  string
+		NaabuInterface     string
+		NaabuVerify        bool
+		ScanTimeout        string
+		ScanConcurrency    string
+		RealertDays        string
+		AlertOutOfScope    bool
+		ResourceMonitor    bool
+		ResourceCPU        string
+		ResourceMemory     string
+		ResourceDuration   string
+		HTTPEnabled        bool
+		Listen             string
+		HTTPSEnabled       bool
+		HTTPSListen        string
+		TLSCert            string
+		TLSKey             string
+		TLSHosts           string
+		ConfigPath         string
+		CertInfo           *cert.Info
+		AiEndpoint         string
+		AiModel            string
+		AiTimeout          string
+		AiTemperature      string
+		AiKeySet           bool
+		AutoSplitOnTimeout bool
+		SplitBatchSize     string
 	}{
-		pageData:          bd,
-		FeishuWebhook:     get("feishu_webhook", ""),
-		FeishuSecret:      get("feishu_secret", ""),
-		NaabuPath:         get("naabu_path", s.cfg.NaabuPath),
-		NaabuRate:         get("naabu_rate", s.cfg.NaabuRate),
-		NaabuRetries:      get("naabu_retries", "2"),
-		NaabuWorkers:      get("naabu_workers", "25"),
-		NaabuTimeout:      get("naabu_timeout", "1s"),
-		NaabuScanType:     get("naabu_scan_type", "c"),
-		NaabuExcludePorts: get("naabu_exclude_ports", ""),
-		NaabuInterface:    get("naabu_interface", ""),
-		NaabuVerify:       get("naabu_verify", "0") == "1",
-		ScanTimeout:       get("scan_timeout_min", "60"),
-		ScanConcurrency:   get("scan_concurrency", "3"),
-		RealertDays:       get("realert_days", strconv.Itoa(s.cfg.RealertDays)),
-		AlertOutOfScope:   get("alert_out_of_scope", "1") == "1",
-		ResourceMonitor:   get("resource_monitor", "1") == "1",
-		ResourceCPU:       get("resource_cpu_percent", "90"),
-		ResourceMemory:    get("resource_memory_mb", "1024"),
-		ResourceDuration:  get("resource_duration_sec", "30"),
-		HTTPEnabled:       s.cfg.HTTPEndpointEnabled(),
-		Listen:            s.cfg.Listen,
-		HTTPSEnabled:      s.cfg.HTTPSEnabled,
-		HTTPSListen:       s.cfg.HTTPSListen,
-		TLSCert:           s.cfg.TLSCert,
-		TLSKey:            s.cfg.TLSKey,
-		TLSHosts:          strings.Join(s.cfg.TLSHosts, ", "),
-		ConfigPath:        s.cfg.Path(),
-		CertInfo:          certInfo,
-		AiEndpoint:        get("ai_endpoint", ""),
-		AiModel:           get("ai_model", "gpt-4o-mini"),
-		AiTimeout:         get("ai_timeout_sec", "60"),
-		AiTemperature:     get("ai_temperature", "0.2"),
-		AiKeySet:          s.st.Setting("ai_key") != "",
+		pageData:           bd,
+		FeishuWebhook:      get("feishu_webhook", ""),
+		FeishuSecret:       get("feishu_secret", ""),
+		NaabuPath:          get("naabu_path", s.cfg.NaabuPath),
+		NaabuRate:          get("naabu_rate", s.cfg.NaabuRate),
+		NaabuRetries:       get("naabu_retries", "2"),
+		NaabuWorkers:       get("naabu_workers", "25"),
+		NaabuTimeout:       get("naabu_timeout", "1s"),
+		NaabuScanType:      get("naabu_scan_type", "c"),
+		NaabuExcludePorts:  get("naabu_exclude_ports", ""),
+		NaabuInterface:     get("naabu_interface", ""),
+		NaabuVerify:        get("naabu_verify", "0") == "1",
+		ScanTimeout:        get("scan_timeout_min", "60"),
+		ScanConcurrency:    get("scan_concurrency", "3"),
+		RealertDays:        get("realert_days", strconv.Itoa(s.cfg.RealertDays)),
+		AlertOutOfScope:    get("alert_out_of_scope", "1") == "1",
+		ResourceMonitor:    get("resource_monitor", "1") == "1",
+		ResourceCPU:        get("resource_cpu_percent", "90"),
+		ResourceMemory:     get("resource_memory_mb", "1024"),
+		ResourceDuration:   get("resource_duration_sec", "30"),
+		HTTPEnabled:        s.cfg.HTTPEndpointEnabled(),
+		Listen:             s.cfg.Listen,
+		HTTPSEnabled:       s.cfg.HTTPSEnabled,
+		HTTPSListen:        s.cfg.HTTPSListen,
+		TLSCert:            s.cfg.TLSCert,
+		TLSKey:             s.cfg.TLSKey,
+		TLSHosts:           strings.Join(s.cfg.TLSHosts, ", "),
+		ConfigPath:         s.cfg.Path(),
+		CertInfo:           certInfo,
+		AiEndpoint:         get("ai_endpoint", ""),
+		AiModel:            get("ai_model", "gpt-4o-mini"),
+		AiTimeout:          get("ai_timeout_sec", "60"),
+		AiTemperature:      get("ai_temperature", "0.2"),
+		AiKeySet:           s.st.Setting("ai_key") != "",
+		AutoSplitOnTimeout: get("auto_split_on_timeout", "1") == "1",
+		SplitBatchSize:     get("split_batch_size", "50"),
 	})
 }
 
@@ -1308,6 +1313,18 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 		// AI Token 留空表示不修改（避免每次保存清空已存密钥）
 		if k := val("ai_key"); k != "" {
 			pairs["ai_key"] = k
+		}
+	}
+
+	// 自动拆分降级
+	if has("auto_split_on_timeout") || has("split_batch_size") {
+		pairs["auto_split_on_timeout"] = onOff("auto_split_on_timeout")
+		if v := val("split_batch_size"); v != "" {
+			if n, err := strconv.Atoi(v); err != nil || n < 1 || n > 10000 {
+				writeJSON(w, 400, map[string]string{"error": "配置未保存：每批目标数量必须是 1-10000 的整数"})
+				return
+			}
+			pairs["split_batch_size"] = v
 		}
 	}
 

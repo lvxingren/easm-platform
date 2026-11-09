@@ -899,12 +899,14 @@ func isDocAddress(value string) bool {
 func TestFakeNaabu32767500RejectedWithoutPartialWrite(t *testing.T) {
 	// 生产默认预算：单进程 2000/s、总速率 6000/s、并发 3、重试 2、任务超时 60 分钟。
 	// 500 × 65535 × 3 次尝试约 9800 万探测，按 6000/s 需要数小时，必然被容量预检拒绝。
+	// 禁用自动拆分功能，以验证容量预检的拒绝逻辑。
 	h := newCapacityHarness(t, matrixScript, map[string]string{
-		"naabu_rate":       "2000",
-		"naabu_total_rate": "6000",
-		"naabu_retries":    "2",
-		"scan_timeout_min": "60",
-		"scan_concurrency": "3",
+		"naabu_rate":            "2000",
+		"naabu_total_rate":      "6000",
+		"naabu_retries":         "2",
+		"scan_timeout_min":      "60",
+		"scan_concurrency":      "3",
+		"auto_split_on_timeout": "0", // 禁用自动拆分，测试容量拒绝
 	})
 	taskID := newManualTask(t, h.st, "full", docIPv4(capacityTargets))
 

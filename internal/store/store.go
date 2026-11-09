@@ -58,6 +58,10 @@ type Scan struct {
 	MaxCPUPercent    float64 `json:"max_cpu_percent"`
 	MaxMemoryRSS     int64   `json:"max_memory_rss"`
 	ResultCount      int     `json:"result_count"` // 已入库结果行累计数（单调不减）
+	// 拆分任务相关字段
+	IsSplitTask    bool `json:"is_split_task"`   // 是否拆分为多个子任务
+	SplitTotal     int  `json:"split_total"`     // 子任务总数
+	SplitCompleted int  `json:"split_completed"` // 已完成子任务数
 }
 
 // ScanResultRow 是带执行来源的端口结果，供跨任务查询和按扫描模式区分。
@@ -212,6 +216,19 @@ type Schedule struct {
 	LastRun   string
 }
 
+// ScanSubTask 是自动拆分降级时的子任务记录，每个子任务独立执行一批目标。
+type ScanSubTask struct {
+	ID           int64
+	ParentScanID int64
+	SubIndex     int
+	Status       string // pending | running | done | failed
+	SpecsJSON    string // 本批目标规格 JSON 编码
+	StartedAt    string
+	FinishedAt   string
+	OpenPorts    int
+	Error        string
+}
+
 type Store struct {
 	db *sql.DB
 }
@@ -247,6 +264,7 @@ CREATE TABLE IF NOT EXISTS scan_events (id INTEGER PRIMARY KEY AUTOINCREMENT, sc
 CREATE TABLE IF NOT EXISTS analysis (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', source_type TEXT DEFAULT '', status TEXT DEFAULT 'pending', created_at TEXT DEFAULT '', finished_at TEXT DEFAULT '', error TEXT DEFAULT '', flow_count INTEGER DEFAULT 0, edge_count INTEGER DEFAULT 0, file_count INTEGER DEFAULT 0, ai_model TEXT DEFAULT '', ai_endpoint TEXT DEFAULT '', summary TEXT DEFAULT '', readable TEXT DEFAULT '', topology_json TEXT DEFAULT '', anomalies_json TEXT DEFAULT '', trace_json TEXT DEFAULT '', used_mock INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS analysis_files (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_id INTEGER NOT NULL, filename TEXT DEFAULT '', size INTEGER DEFAULT 0, format TEXT DEFAULT '', stored_path TEXT DEFAULT '', rows_parsed INTEGER DEFAULT 0, uploaded_at TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS analysis_edges (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_id INTEGER NOT NULL, src_ip TEXT DEFAULT '', dst_ip TEXT DEFAULT '', dst_port INTEGER DEFAULT 0, proto TEXT DEFAULT '', action TEXT DEFAULT '', count INTEGER DEFAULT 0, first_seen TEXT DEFAULT '', last_seen TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS scan_sub_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_scan_id INTEGER NOT NULL, sub_index INTEGER NOT NULL, status TEXT DEFAULT 'pending', specs_json TEXT DEFAULT '', started_at TEXT DEFAULT '', finished_at TEXT DEFAULT '', open_ports INTEGER DEFAULT 0, error TEXT DEFAULT '', UNIQUE(parent_scan_id, sub_index));
 CREATE INDEX IF NOT EXISTS idx_results_scan ON scan_results(scan_id);
 CREATE INDEX IF NOT EXISTS idx_results_scan_id ON scan_results(scan_id, id);
 CREATE INDEX IF NOT EXISTS idx_scan_events_scan ON scan_events(scan_id, id);
@@ -286,6 +304,9 @@ CREATE INDEX IF NOT EXISTS idx_analysis_edges ON analysis_edges(analysis_id);
 		`ALTER TABLE alerts ADD COLUMN handler TEXT DEFAULT ''`,
 		`ALTER TABLE alerts ADD COLUMN handle_note TEXT DEFAULT ''`,
 		`ALTER TABLE alerts ADD COLUMN handled_at TEXT DEFAULT ''`,
+		`ALTER TABLE scans ADD COLUMN is_split_task INTEGER DEFAULT 0`,
+		`ALTER TABLE scans ADD COLUMN split_total INTEGER DEFAULT 0`,
+		`ALTER TABLE scans ADD COLUMN split_completed INTEGER DEFAULT 0`,
 	} {
 		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			log.Printf("schema 迁移忽略: %v", err)
@@ -555,6 +576,86 @@ func (s *Store) StartScanExecution(id int64, targetCount, totalBatches int) erro
 	return err
 }
 
+// CreateSplitScan 创建拆分任务的主扫描记录，同时设置拆分相关字段。
+func (s *Store) CreateSplitScan(taskID int64, name, mode string, splitTotal int) (int64, error) {
+	res, err := s.db.Exec(`INSERT INTO scans(task_id, name, mode, status, started_at, is_split_task, split_total, split_completed) VALUES(?,?,?,?,?,?,?,?)`,
+		taskID, name, mode, "running", now(), 1, splitTotal, 0)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// CreateSubTasks 批量创建子任务记录。
+func (s *Store) CreateSubTasks(parentScanID int64, specsJSON []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i, specs := range specsJSON {
+		_, err := tx.Exec(`INSERT INTO scan_sub_tasks(parent_scan_id, sub_index, status, specs_json) VALUES(?,?,?,?)`,
+			parentScanID, i+1, "pending", specs)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// NextPendingSubTask 获取下一个待执行的子任务（按 sub_index 升序）。
+func (s *Store) NextPendingSubTask(parentScanID int64) (*ScanSubTask, error) {
+	var sub ScanSubTask
+	err := s.db.QueryRow(`SELECT id, parent_scan_id, sub_index, COALESCE(status,''), COALESCE(specs_json,''), COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,'')
+		FROM scan_sub_tasks WHERE parent_scan_id=? AND status='pending' ORDER BY sub_index LIMIT 1`, parentScanID).
+		Scan(&sub.ID, &sub.ParentScanID, &sub.SubIndex, &sub.Status, &sub.SpecsJSON, &sub.StartedAt, &sub.FinishedAt, &sub.OpenPorts, &sub.Error)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &sub, nil
+}
+
+// UpdateSubTaskStatus 更新子任务状态。
+func (s *Store) UpdateSubTaskStatus(id int64, status string, openPorts int, errMsg string) error {
+	_, err := s.db.Exec(`UPDATE scan_sub_tasks SET status=?, open_ports=?, error=?, finished_at=CASE WHEN ? IN ('done','failed') THEN ? ELSE finished_at END WHERE id=?`,
+		status, openPorts, errMsg, status, now(), id)
+	return err
+}
+
+// MarkSubTaskRunning 将子任务标记为运行中，并记录开始时间。
+func (s *Store) MarkSubTaskRunning(id int64) error {
+	_, err := s.db.Exec(`UPDATE scan_sub_tasks SET status='running', started_at=? WHERE id=?`, now(), id)
+	return err
+}
+
+// SubTasksByParent 获取主任务下的所有子任务。
+func (s *Store) SubTasksByParent(parentScanID int64) ([]ScanSubTask, error) {
+	rows, err := s.db.Query(`SELECT id, parent_scan_id, sub_index, COALESCE(status,''), COALESCE(specs_json,''), COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,'')
+		FROM scan_sub_tasks WHERE parent_scan_id=? ORDER BY sub_index`, parentScanID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScanSubTask
+	for rows.Next() {
+		var sub ScanSubTask
+		if err := rows.Scan(&sub.ID, &sub.ParentScanID, &sub.SubIndex, &sub.Status, &sub.SpecsJSON, &sub.StartedAt, &sub.FinishedAt, &sub.OpenPorts, &sub.Error); err != nil {
+			return nil, err
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}
+
+// IncrementSplitCompleted 原子增加已完成子任务计数。
+func (s *Store) IncrementSplitCompleted(scanID int64) error {
+	_, err := s.db.Exec(`UPDATE scans SET split_completed=split_completed+1 WHERE id=?`, scanID)
+	return err
+}
+
 // UpdateScanProgress 保留旧签名，内部走单调合并：processed/failed/current_batch/open_ports
 // 只增不减，迟到的旧快照不会覆盖已写入的更高值（详见 ApplyScanProgress）。
 func (s *Store) UpdateScanProgress(id int64, processed, failed, currentBatch, openPorts int, command string) error {
@@ -633,7 +734,8 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 	sqlText := `SELECT id, task_id, COALESCE(name,''), COALESCE(mode,''), COALESCE(status,''), COALESCE(started_at,''),
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
-		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0)
+		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0),
+		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0)
 		FROM scans WHERE ` + strings.Join(where, " AND ") + ` ORDER BY id DESC`
 	if limit > 0 {
 		sqlText += " LIMIT ?"
@@ -649,7 +751,8 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 		var sc Scan
 		if err := rows.Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
-			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount); err != nil {
+			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount,
+			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted); err != nil {
 			return nil, err
 		}
 		out = append(out, sc)
@@ -663,10 +766,12 @@ func (s *Store) Scan(id int64) (*Scan, error) {
 	err := s.db.QueryRow(`SELECT id, task_id, COALESCE(name,''), COALESCE(mode,''), COALESCE(status,''), COALESCE(started_at,''),
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
-		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0) FROM scans WHERE id=?`, id).
+		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0),
+		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0) FROM scans WHERE id=?`, id).
 		Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
-			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount)
+			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount,
+			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

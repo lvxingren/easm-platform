@@ -183,3 +183,32 @@ func (s *Server) apiScanControl(w http.ResponseWriter, r *http.Request) {
 	scan, _ := s.st.Scan(scanID)
 	writeJSON(w, 200, map[string]interface{}{"ok": "1", "scan": scan})
 }
+
+// apiScanSubTasks 返回拆分任务的子任务列表。
+func (s *Server) apiScanSubTasks(w http.ResponseWriter, r *http.Request) {
+	scanID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if scanID <= 0 {
+		writeJSON(w, 400, map[string]string{"error": "扫描 ID 格式错误"})
+		return
+	}
+	scan, err := s.st.Scan(scanID)
+	if err != nil || scan == nil {
+		writeJSON(w, 404, map[string]string{"error": "扫描执行不存在"})
+		return
+	}
+	if !scan.IsSplitTask {
+		writeJSON(w, 200, map[string]interface{}{"subtasks": []interface{}{}, "is_split_task": false})
+		return
+	}
+	subTasks, err := s.st.SubTasksByParent(scanID)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": fmt.Sprintf("查询子任务失败: %v", err)})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"subtasks":        subTasks,
+		"is_split_task":   true,
+		"split_total":     scan.SplitTotal,
+		"split_completed": scan.SplitCompleted,
+	})
+}

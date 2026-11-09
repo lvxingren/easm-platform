@@ -99,6 +99,11 @@
     <label class="field">内存告警阈值（MiB）<input type="number" name="resource_memory_mb" min="1" max="1048576" value="{{.ResourceMemory}}" required><span class="field-help">naabu 进程 RSS，默认 1024 MiB。</span></label>
     <label class="field">持续时长（秒）<input type="number" name="resource_duration_sec" min="5" max="3600" value="{{.ResourceDuration}}" required><span class="field-help">CPU 或内存任一指标持续超阈值才告警，默认 30 秒。</span></label>
 
+    <div class="panel-title full" style="margin-top:16px">🧩 容量预检自动拆分降级</div>
+    <p class="panel-note full">当容量预检因预估耗时超过任务超时而拒绝启动时，平台可自动将任务按目标数量拆分为多个子批次串行执行，而非直接拒绝。其他预检失败（如 FD 不足、磁盘空间不够）仍会直接拒绝。</p>
+    <label class="check full"><input type="checkbox" name="auto_split_on_timeout" {{if .AutoSplitOnTimeout}}checked{{end}}> 启用自动拆分降级<span class="field-help">开启后，超时类预检失败会自动拆分为多个子任务执行；关闭则保持原有直接拒绝行为。</span></label>
+    <label class="field">每批目标数量<input type="number" name="split_batch_size" min="1" max="10000" value="{{.SplitBatchSize}}" required><span class="field-help">自动拆分时每个子任务处理的目标数量，默认 50。数值越小每个子任务越轻量，但子任务总数越多。</span></label>
+
     <div class="row full">
       <button type="submit" class="btn primary">保存 naabu 配置</button>
       <button type="button" class="btn" onclick="checkNaabu()">检测 naabu</button>

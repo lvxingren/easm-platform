@@ -53,6 +53,25 @@
   <p class="hint" style="margin-top:12px;margin-bottom:0">每批最多 20 个目标规格；端口结果在批处理运行中即时入库，目标进度在每批结束后更新。终止时，未完成的当前批次不会伪记为全部处理。</p>
 </div>
 
+{{if .Scan.IsSplitTask}}
+<div id="split-task-panel" class="panel">
+  <div class="panel-title">🧩 拆分任务进度</div>
+  <div class="run-banner" style="margin-bottom:12px">
+    本次扫描因容量预检预估超时，已自动拆分为 <strong>{{.Scan.SplitTotal}}</strong> 个子任务串行执行。
+    已完成 <strong id="split-completed">{{.Scan.SplitCompleted}}</strong> / <strong>{{.Scan.SplitTotal}}</strong> 个。
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>子任务</th><th>状态</th><th>开放端口</th><th>开始时间</th><th>结束时间</th><th>异常说明</th></tr></thead>
+      <tbody id="subtasks-body">
+        <tr><td colspan="6" class="muted" style="text-align:center">正在加载子任务列表…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="hint" style="margin-top:10px;margin-bottom:0">每个子任务独立执行一批目标，串行处理以避免资源竞争。全部完成后才执行白名单比对和风险告警。</p>
+</div>
+{{end}}
+
 <div class="panel">
   <div class="panel-title">naabu 资源占用</div>
   <div class="grid">
@@ -294,5 +313,55 @@ async function resyncScan() {
   if (res.ok) setTimeout(() => location.reload(), 600);
 }
 if (drained) { setText('live-state', '执行已结束，结果已全部加载（' + resultLoaded + ' 条）'); } else { scheduleRefresh(0); }
+
+// 加载子任务列表（仅拆分任务时执行）
+{{if .Scan.IsSplitTask}}
+let subtaskPolling = false;
+let subtaskTimer = null;
+const subtaskStatusNames = {pending:'待执行', running:'执行中', done:'已完成', failed:'失败'};
+const subtaskStatusClasses = {pending:'mute', running:'run', done:'ok', failed:'err'};
+
+async function loadSubTasks() {
+  if (subtaskPolling) return;
+  subtaskPolling = true;
+  try {
+    const response = await fetch(`/api/scans/${scanID}/subtasks`, {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '加载子任务失败');
+    const body = document.getElementById('subtasks-body');
+    if (!data.subtasks || data.subtasks.length === 0) {
+      body.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center">暂无子任务数据</td></tr>';
+      return;
+    }
+    body.innerHTML = '';
+    for (const sub of data.subtasks) {
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td>子任务 ${sub.sub_index}</td>
+        <td><span class="pill ${subtaskStatusClasses[sub.status] || 'mute'}">${subtaskStatusNames[sub.status] || sub.status}</span></td>
+        <td class="num-cell">${sub.open_ports || 0}</td>
+        <td>${sub.started_at ? new Date(sub.started_at).toLocaleString() : '-'}</td>
+        <td>${sub.finished_at ? new Date(sub.finished_at).toLocaleString() : '-'}</td>
+        <td>${sub.error || '-'}</td>
+      `;
+      body.appendChild(row);
+    }
+    // 更新完成计数
+    setText('split-completed', data.split_completed || 0);
+    // 如果还有未完成的子任务，继续轮询
+    const allDone = data.subtasks.every(s => s.status === 'done' || s.status === 'failed');
+    if (!allDone && scanActive) {
+      subtaskTimer = setTimeout(loadSubTasks, 3000);
+    }
+  } catch (error) {
+    console.error('加载子任务失败:', error);
+    subtaskTimer = setTimeout(loadSubTasks, 5000);
+  } finally {
+    subtaskPolling = false;
+  }
+}
+// 启动子任务加载
+loadSubTasks();
+{{end}}
 </script>
 {{template "foot" .}}{{end}}

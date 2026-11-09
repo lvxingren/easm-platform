@@ -138,6 +138,11 @@ func (r *Runner) StartTask(taskID int64) (int64, error) {
 	// 批次数按真实 specs 分批（每 scanBatchSize 条一批），不按展开出的地址数假定额外并行。
 	plan, err := r.planScanCapacity(settings, mode, customPorts, specs)
 	if err != nil {
+		// 检查是否启用自动拆分：仅当错误类型为超时且配置允许时才尝试拆分
+		if r.shouldAutoSplit() && IsTimeoutError(err) && len(specs) > r.getSplitBatchSize() {
+			log.Printf("容量预检未通过（%v），但已启用自动拆分且目标数量（%d）超过单批大小（%d），尝试拆分执行", err, len(specs), r.getSplitBatchSize())
+			return r.startSplitTask(task.ID, name, mode, customPorts, specs, settings)
+		}
 		return failStart(fmt.Errorf("容量预检未通过，扫描未启动：%v", err))
 	}
 	if plan.Capped {
@@ -276,6 +281,20 @@ func (r *Runner) naabuSettings() NaabuSettings {
 		ResourceMemory:   r.setting("resource_memory_mb", "1024"),
 		ResourceDuration: r.setting("resource_duration_sec", "30"),
 	}
+}
+
+// shouldAutoSplit 返回是否启用自动拆分功能（从 settings 表读取配置）。
+func (r *Runner) shouldAutoSplit() bool {
+	return r.setting("auto_split_on_timeout", "1") == "1"
+}
+
+// getSplitBatchSize 返回自动拆分时每批的目标数量。
+func (r *Runner) getSplitBatchSize() int {
+	n, err := strconv.Atoi(r.setting("split_batch_size", strconv.Itoa(defaultSplitBatchSize)))
+	if err != nil || n < 1 {
+		return defaultSplitBatchSize
+	}
+	return n
 }
 
 func validateInteger(label, value string, min, max int) error {
@@ -568,4 +587,81 @@ func (r *Runner) fail(scanID int64, err error) {
 	if ferr := r.st.FinishScan(scanID, 0, err.Error()); ferr != nil {
 		log.Printf("更新扫描状态失败: %v", ferr)
 	}
+}
+
+// startSplitTask 创建拆分任务的主扫描记录和子任务记录，然后启动执行协程。
+// 当容量预检因超时失败且启用自动拆分时调用。
+func (r *Runner) startSplitTask(taskID int64, name, mode, customPorts string, specs []store.TargetSpec, settings NaabuSettings) (int64, error) {
+	// 智能计算批次大小：根据超时时间、端口数、速率自动计算
+	ports := 1000 // 默认 top-1000
+	if mode == "full" {
+		ports = 65535
+	} else if mode == "custom" && customPorts != "" {
+		// 简单估算自定义端口数（逗号分隔）
+		ports = len(strings.Split(customPorts, ","))
+	}
+
+	// 解析速率（字符串转整数）
+	rate := 2000 // 默认值
+	if rateVal, err := strconv.Atoi(settings.Rate); err == nil && rateVal > 0 {
+		rate = rateVal
+	}
+
+	// 获取超时时间
+	timeout := settings.overallTimeout()
+	if timeout <= 0 {
+		timeout = 60 * time.Minute // 默认 60 分钟
+	}
+
+	smartBatchSize := CalculateSmartBatchSize(len(specs), ports, rate, timeout)
+
+	// 使用智能计算的批次大小（如果用户配置了自定义值，优先使用用户配置）
+	userBatchSize := r.getSplitBatchSize()
+	batchSize := smartBatchSize
+	if userBatchSize != defaultSplitBatchSize {
+		// 用户明确配置了非默认值，优先使用
+		batchSize = userBatchSize
+	}
+
+	batches := CalculateSplitBatches(specs, batchSize)
+	if len(batches) == 0 {
+		return 0, fmt.Errorf("拆分批次计算结果为空")
+	}
+
+	// 创建主扫描记录
+	scanID, err := r.st.CreateSplitScan(taskID, name+" [自动拆分]", mode, len(batches))
+	if err != nil {
+		return 0, fmt.Errorf("创建拆分扫描记录失败: %v", err)
+	}
+
+	r.mu.Lock()
+	r.scanID = scanID
+	r.active = newExecutionControl()
+	r.mu.Unlock()
+
+	// 编码每个批次的目标规格为 JSON
+	specsJSON := make([]string, len(batches))
+	for i, batch := range batches {
+		specsJSON[i] = EncodeSpecsJSON(batch)
+	}
+
+	// 创建子任务记录
+	if err := r.st.CreateSubTasks(scanID, specsJSON); err != nil {
+		r.fail(scanID, fmt.Errorf("创建子任务记录失败: %v", err))
+		r.setRunning(false)
+		return scanID, err
+	}
+
+	// 记录拆分事件（智能化，减少用户确认）
+	estimatedDurationPerBatch := timeout / time.Duration(len(batches))
+	log.Printf("扫描 %d 自动拆分：目标 %d 个，每批 %d 个（智能计算），共 %d 个子任务，预计每批耗时 %s",
+		scanID, len(specs), batchSize, len(batches), estimatedDurationPerBatch.Round(time.Second))
+	_ = r.st.AddScanEvent(scanID, "info", "split",
+		fmt.Sprintf("容量预检未通过，已自动拆分为 %d 个子任务（每批最多 %d 个目标，智能计算）",
+			len(batches), batchSize))
+
+	// 启动执行协程
+	go r.runSplitTask(scanID, batches, mode, customPorts, settings)
+
+	return scanID, nil
 }
