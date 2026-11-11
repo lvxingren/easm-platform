@@ -7,7 +7,7 @@
     <div class="btn-group">
       {{if ne .Role "viewer"}}
       <button class="btn primary" type="button" onclick="openModal('wl-add-modal')">单条添加</button>
-      <button class="btn" type="button" onclick="openModal('wl-import-modal')">批量导入</button>
+      <button class="btn" type="button" onclick="openWlImport()">批量导入</button>
       <button class="btn" type="button" onclick="genBaseline()">生成基线</button>
       {{end}}
       <button class="btn ghost" type="button" onclick="openModal('wl-help-modal')">帮助 / 说明</button>
@@ -24,16 +24,16 @@
 <div class="section-head"><h2>条目（{{len .Entries}} 条）</h2></div>
 <div class="table-wrap">
 <table>
-  <thead><tr><th>IP/网段</th><th>端口</th><th>协议</th><th>服务</th><th>负责人</th><th>业务</th><th>备注</th><th>创建时间</th>{{if ne .Role "viewer"}}<th></th>{{end}}</tr></thead>
+  <thead><tr><th>IP/网段</th><th>端口</th><th>协议</th><th>服务</th><th>负责人</th><th>业务</th><th>原因</th><th>备注</th><th>创建时间</th>{{if ne .Role "viewer"}}<th></th>{{end}}</tr></thead>
   <tbody id="wl-body">
   {{range .Entries}}
-  <tr data-business="{{.Business}}" data-spec="{{.IPSpec}} {{.PortSpec}} {{.Proto}} {{.Service}} {{.Owner}} {{.Business}} {{.Remark}}">
-    <td>{{.IPSpec}}</td><td>{{.PortSpec}}</td><td>{{.Proto}}</td><td>{{.Service}}</td>
-    <td>{{.Owner}}</td><td>{{if .Business}}{{.Business}}{{else}}<span class="muted">—</span>{{end}}</td><td>{{.Remark}}</td><td>{{fmtTime .CreatedAt}}</td>
-    {{if ne $.Role "viewer"}}<td><button class="btn small danger" type="button" onclick="delWl({{.ID}})">删除</button></td>{{end}}
+  <tr data-id="{{.ID}}" data-remark="{{.Remark}}" data-reason="{{.Reason}}" data-business="{{.Business}}" data-spec="{{.IPSpec}} {{.PortSpec}} {{.Proto}} {{.Service}} {{.Owner}} {{.Business}} {{.Reason}} {{.Remark}}">
+    <td>{{.IPSpec}}{{if eq .Source "auto_match"}} <span class="pill info" title="自动匹配已识别端口">auto</span>{{end}}</td><td>{{.PortSpec}}</td><td>{{.Proto}}</td><td>{{.Service}}</td>
+    <td>{{.Owner}}</td><td>{{if .Business}}{{.Business}}{{else}}<span class="muted">—</span>{{end}}</td><td class="wl-reason">{{if .Reason}}{{.Reason}}{{else}}<span class="muted">—</span>{{end}}</td><td class="wl-remark">{{if .Remark}}{{.Remark}}{{else}}<span class="muted">—</span>{{end}}</td><td>{{fmtTime .CreatedAt}}</td>
+    {{if ne $.Role "viewer"}}<td><div class="btn-group"><button class="btn small" type="button" onclick="editWlRemark({{.ID}})">原因/备注</button><button class="btn small danger" type="button" onclick="delWl({{.ID}})">删除</button></div></td>{{end}}
   </tr>
   {{else}}
-  <tr><td colspan="9"><div class="empty"><div class="big">白名单为空</div>可单条添加、批量导入，或用「生成基线」把最近一次完成扫描的暴露面全部入白{{if ne $.Role "viewer"}}<div class="btn-group" style="justify-content:center;margin-top:14px"><button class="btn primary" type="button" onclick="openModal('wl-add-modal')">单条添加</button><button class="btn" type="button" onclick="openModal('wl-import-modal')">批量导入</button></div>{{end}}</div></td></tr>
+  <tr><td colspan="10"><div class="empty"><div class="big">白名单为空</div>可单条添加、批量导入，或用「生成基线」把最近一次完成扫描的暴露面全部入白{{if ne $.Role "viewer"}}<div class="btn-group" style="justify-content:center;margin-top:14px"><button class="btn primary" type="button" onclick="openModal('wl-add-modal')">单条添加</button><button class="btn" type="button" onclick="openWlImport()">批量导入</button></div>{{end}}</div></td></tr>
   {{end}}
   </tbody>
 </table>
@@ -52,6 +52,7 @@
         <label class="field">服务名<input name="service" placeholder="备注，如 HTTPS"></label>
         <label class="field">负责人<input name="owner" placeholder="可选"></label>
         <label class="field">业务归属<input name="business" placeholder="可选，如 核心业务"></label>
+        <label class="field full">加白原因（必填）<input name="reason" placeholder="如 业务官方服务 / 已确认合规 / 工单 #1024" required></label>
         <label class="field full">备注<input name="remark" placeholder="可选"></label>
       </form>
     </div>
@@ -67,15 +68,56 @@
   <div class="modal lg">
     <div class="modal-head"><h3>批量导入白名单</h3><button class="modal-close" type="button" onclick="closeModal('wl-import-modal')">×</button></div>
     <div class="modal-body">
-      <p class="hint">每行一条：<code>IP + 端口</code>，多端口用逗号隔开。支持 <code>1.2.3.4 22,80,443</code>、<code>1.2.3.4,22,80</code>、<code>1.2.3.4:3306</code>、端口范围 <code>10.0.0.5 1000-2000</code>，行尾可加 <code>udp</code>（默认 tcp）。IP 支持单 IP / CIDR / *。</p>
+      <p class="hint">导入分两步：填好后点「解析预览」核对清单，再「确认导入」写库（整表导入不会一步生效）。两种录入方式可单独或同时提交（同时提交时合并解析）：<br>
+        ① <b>文本行</b>：每行一条 <code>IP + 端口</code>，多端口用逗号隔开。支持 <code>1.2.3.4 22,80,443</code>、<code>1.2.3.4,22,80</code>、<code>1.2.3.4:3306</code>、端口范围 <code>10.0.0.5 1000-2000</code>，行尾可加 <code>udp</code>（默认 tcp）。IP 支持单 IP / CIDR / *。<br>
+        ② <b>Excel / CSV 模板</b>：列固定为 <code>IP/网段、端口、服务、备注</code>（一行一条规则，端口列可写 <code>22,80,443</code> 或 <code>1000-2000</code>）；需区分 UDP 或补充维护信息时，可自行加表头列 <code>协议</code>、<code>负责人</code>、<code>业务</code>。首行表头自动识别，删掉表头则按上述列序解析。</p>
       <form id="wl-import-form" class="stack">
-        <textarea name="entries" rows="6" placeholder="1.2.3.4 22,80,443&#10;10.0.0.5 3306&#10;10.0.0.0/24 1000-2000 udp"></textarea>
+        <textarea name="entries" rows="6" placeholder="1.2.3.4 22,80,443&#10;10.0.0.5 3306&#10;10.0.0.9&#10;10.0.0.0/24 1000-2000 udp"></textarea>
+        <label class="field">或上传 Excel / CSV 模板<input type="file" name="file" accept=".xlsx,.xlsm,.csv,.txt"><span class="field-help">逐行容错：非法 IP/端口、协议或端口留空（未勾选自动匹配）的行会被跳过并在提示中给出原因，不影响其余行入库。</span></label>
+        <label class="field">批量备注（可选）<input name="remark" placeholder="仅用于本批未填备注的条目（含自动匹配），导入后可在列表逐条编辑"><span class="field-help">单元格已填备注时以单元格为准，批量备注只作兜底。</span></label>
+        <label class="check"><input type="checkbox" name="auto_match"> 自动匹配已识别端口<span class="field-help">勾选后，纯 IP 行（无端口）会自动查询该 IP 历史扫描的开放端口并加白（source=auto_match）；仅台账内单 IP 生效，CIDR/范围外跳过并提示。</span></label>
       </form>
-      <div class="btn-group" style="margin-top:10px"><a class="btn small ghost" href="/api/sample/whitelist.txt">下载样例文件</a></div>
+      <div class="btn-group" style="margin-top:10px">
+        <a class="btn small ghost" href="/api/sample/whitelist.xlsx">下载 Excel 模板</a>
+        <a class="btn small ghost" href="/api/sample/whitelist.csv">下载 CSV 模板</a>
+        <a class="btn small ghost" href="/api/sample/whitelist.txt">下载文本样例</a>
+      </div>
+      <div id="wl-import-preview" style="display:none">
+        <div id="wl-preview-summary" class="hint" style="margin-top:14px"></div>
+        <div id="wl-preview-skipped" class="result-box" style="display:none"></div>
+        <div class="row between" style="margin:12px 0 8px">
+          <label class="check"><input type="checkbox" id="wl-preview-all" checked onchange="toggleWlPreviewAll(this)"> 全选</label>
+          <span class="muted" id="wl-preview-count">共 0 条，已选 0 条</span>
+        </div>
+        <div class="table-wrap" style="max-height:38vh;overflow:auto">
+          <table>
+            <thead><tr><th style="width:36px"></th><th>IP/网段</th><th>端口</th><th>协议</th><th>服务</th><th>负责人</th><th>业务</th><th>原因</th><th>备注</th><th>状态</th></tr></thead>
+            <tbody id="wl-preview-body"></tbody>
+          </table>
+        </div>
+        <p class="hint" style="margin-top:8px">取消勾选即可从本批剔除；状态为「已在白名单」的规则重复提交也不会再次入库。</p>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn ghost" type="button" onclick="closeModal('wl-import-modal')">取消</button>
-      <button class="btn primary" type="button" onclick="submitWlImport()">导入白名单</button>
+      <button class="btn" type="button" id="wl-preview-btn" onclick="previewWlImport()">解析预览</button>
+      <button class="btn primary" type="button" id="wl-apply-btn" onclick="applyWlImport()" disabled>确认导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 行内编辑原因/备注 -->
+<div class="modal-mask" id="wl-remark-modal" style="display:none" onclick="modalBackdrop(event,'wl-remark-modal')">
+  <div class="modal">
+    <div class="modal-head"><h3>编辑加白原因 / 备注</h3><button class="modal-close" type="button" onclick="closeModal('wl-remark-modal')">×</button></div>
+    <div class="modal-body">
+      <label class="field">加白原因（必填）<textarea id="wl-reason-input" rows="2" placeholder="业务/合规层面的加白原因"></textarea></label>
+      <label class="field">备注<textarea id="wl-remark-input" rows="3" placeholder="放行依据、工单号、业务说明等（可留空清除）"></textarea></label>
+      <p class="hint" style="margin:8px 0 0">仅修改原因与备注，不改动 IP/端口/协议匹配规则；保存后记录审计流水。</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('wl-remark-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitWlRemark()">保存</button>
     </div>
   </div>
 </div>
@@ -121,7 +163,19 @@
         </tbody>
       </table></div>
       <p class="hint" style="margin-top:12px">匹配逻辑：扫描完成后逐个开放端口与白名单比对，命中任意一条即放行、不告警；未命中的登记为告警并可推送飞书。IP 规则不支持 <code>a-b</code> 范围写法（范围仅用于资产台账），连续网段请用 CIDR。</p>
-      <div class="btn-group"><a class="btn small" href="/api/sample/whitelist.txt">下载导入样例</a></div>
+      <div class="panel-title" style="margin-top:14px">Excel / CSV 模板导入</div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>列名</th><th>必填</th><th>说明</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td>IP/网段</td><td>是</td><td>单 IP / CIDR / *，也可写 <code>1.2.3.4:3306</code></td><td><code>1.2.3.4</code></td></tr>
+          <tr><td>端口</td><td>否</td><td>单端口 / 范围 / 逗号分隔 / *；留空且勾选自动匹配则取该 IP 已识别端口</td><td><code>22,80,443</code></td></tr>
+          <tr><td>服务</td><td>否</td><td>服务名备注，不参与匹配</td><td><code>MySQL</code></td></tr>
+          <tr><td>备注</td><td>否</td><td>放行依据/工单号，导入后可行内编辑</td><td><code>工单 #1024</code></td></tr>
+          <tr><td>协议 / 负责人 / 业务</td><td>可选列</td><td>自行加表头列即可识别（协议仅 tcp/udp/*）</td><td><code>udp</code></td></tr>
+        </tbody>
+      </table></div>
+      <div class="btn-group"><a class="btn small" href="/api/sample/whitelist.xlsx">下载 Excel 模板</a><a class="btn small" href="/api/sample/whitelist.csv">下载 CSV 模板</a><a class="btn small" href="/api/sample/whitelist.txt">下载文本样例</a></div>
+      <p class="hint" style="margin-top:10px">批量导入分两步：「解析预览」只解析不写库，可逐条勾选剔除（已在白名单的规则默认不勾选）；「确认导入」只写入勾选行。</p>
     </div>
     <div class="modal-foot">
       <a class="btn ghost" href="/help/whitelist">查看完整文档</a>
@@ -134,15 +188,107 @@
 <script>
 async function submitWlAdd() {
   const form = document.getElementById('wl-form');
+  const reason = (form.querySelector('[name="reason"]').value || '').trim();
+  if (!reason) { toast('请填写加白原因（必填）', 'err'); return; }
   const res = await postForm('/api/whitelist', new FormData(form));
   if (res.ok) { toast('已添加', 'ok'); closeModal('wl-add-modal'); setTimeout(() => location.reload(), 600); }
   else toast(res.json.error || '添加失败', 'err');
 }
-async function submitWlImport() {
-  const form = document.getElementById('wl-import-form');
-  const res = await postForm('/api/whitelist/import', new FormData(form));
-  if (res.ok) { toast(`解析 ${res.json.parsed} 条，导入 ${res.json.added} 条`, 'ok'); closeModal('wl-import-modal'); setTimeout(() => location.reload(), 700); }
-  else toast(res.json.error || '导入失败', 'err');
+// 批量导入分两步：先解析预览（不写库），核对并勾选后确认写入，避免整表误放行。
+let wlPreviewEntries = [];
+function openWlImport() { resetWlPreview(); openModal('wl-import-modal'); }
+function resetWlPreview() {
+  wlPreviewEntries = [];
+  const box = document.getElementById('wl-import-preview');
+  if (box) box.style.display = 'none';
+  const body = document.getElementById('wl-preview-body');
+  if (body) body.innerHTML = '';
+  const sk = document.getElementById('wl-preview-skipped');
+  if (sk) { sk.style.display = 'none'; sk.textContent = ''; }
+  const btn = document.getElementById('wl-apply-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '确认导入'; }
+}
+async function previewWlImport() {
+  const btn = document.getElementById('wl-preview-btn');
+  btn.disabled = true; const label = btn.textContent; btn.textContent = '解析中…';
+  const res = await postForm('/api/whitelist/import/preview', new FormData(document.getElementById('wl-import-form')));
+  btn.disabled = false; btn.textContent = label;
+  if (!res.ok) { resetWlPreview(); toast(res.json.error || '解析失败', 'err'); return; }
+  wlPreviewEntries = res.json.entries || [];
+  renderWlPreview(res.json);
+  if (!wlPreviewEntries.length) toast('未解析到可入库的条目，请查看跳过原因', 'err');
+}
+function wlCell(text, cls) {
+  const td = document.createElement('td');
+  if (cls) td.className = cls;
+  td.textContent = text;
+  return td;
+}
+function renderWlPreview(data) {
+  document.getElementById('wl-import-preview').style.display = 'block';
+  let note = `解析完成：共 ${data.total} 条候选规则，新增 ${(data.total || 0) - (data.existing || 0)} 条，已在白名单 ${data.existing || 0} 条（默认不勾选）。`;
+  if (data.truncated) note += ` 表格仅展示前 ${wlPreviewEntries.length} 条，请减少行数分批导入。`;
+  document.getElementById('wl-preview-summary').textContent = note;
+  const skipped = data.skipped || [];
+  const sk = document.getElementById('wl-preview-skipped');
+  if (skipped.length) {
+    sk.style.display = 'block';
+    sk.textContent = `已跳过 ${skipped.length} 行：` + skipped.slice(0, 20).join('；') + (skipped.length > 20 ? ' …' : '');
+  } else { sk.style.display = 'none'; sk.textContent = ''; }
+  const body = document.getElementById('wl-preview-body');
+  body.innerHTML = '';
+  wlPreviewEntries.forEach((e, idx) => {
+    const tr = document.createElement('tr');
+    const tdCheck = document.createElement('td');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'wl-preview-check'; cb.dataset.idx = String(idx); cb.checked = !e.exists; cb.onchange = updateWlPreviewCount;
+    tdCheck.appendChild(cb);
+    tr.append(tdCheck, wlCell(e.ip_spec), wlCell(e.port_spec, 'num-cell'), wlCell(e.proto || 'tcp'), wlCell(e.service || '—'),
+      wlCell(e.owner || '—'), wlCell(e.business || '—'), wlCell(e.reason || '—'), wlCell(e.remark || '—'));
+    const pill = document.createElement('span');
+    pill.className = e.exists ? 'pill mute' : (e.source === 'auto_match' ? 'pill info' : 'pill ok');
+    pill.textContent = e.exists ? '已在白名单' : (e.source === 'auto_match' ? '自动匹配' : '新增');
+    const tdState = document.createElement('td');
+    tdState.appendChild(pill);
+    tr.append(tdState);
+    body.appendChild(tr);
+  });
+  updateWlPreviewCount();
+}
+function toggleWlPreviewAll(master) {
+  document.querySelectorAll('.wl-preview-check').forEach(c => { c.checked = master.checked; });
+  updateWlPreviewCount();
+}
+function updateWlPreviewCount() {
+  const total = document.querySelectorAll('.wl-preview-check').length;
+  const sel = document.querySelectorAll('.wl-preview-check:checked').length;
+  document.getElementById('wl-preview-count').textContent = `共 ${total} 条，已选 ${sel} 条`;
+  const btn = document.getElementById('wl-apply-btn');
+  btn.disabled = sel === 0;
+  btn.textContent = sel ? `确认导入 ${sel} 条` : '确认导入';
+  const all = document.getElementById('wl-preview-all');
+  if (all) all.checked = total > 0 && sel === total;
+}
+async function applyWlImport() {
+  const checked = Array.from(document.querySelectorAll('.wl-preview-check:checked'));
+  if (!checked.length) { toast('请至少勾选一条', 'err'); return; }
+  const body = new FormData();
+  checked.forEach(c => {
+    const e = wlPreviewEntries[Number(c.dataset.idx)];
+    if (!e) return;
+    body.append('ip', e.ip_spec); body.append('port', e.port_spec); body.append('proto', e.proto || 'tcp');
+    body.append('service', e.service || ''); body.append('owner', e.owner || ''); body.append('business', e.business || '');
+    body.append('reason', e.reason || ''); body.append('remark', e.remark || ''); body.append('source', e.source || 'manual');
+  });
+  const btn = document.getElementById('wl-apply-btn');
+  btn.disabled = true; const label = btn.textContent; btn.textContent = '写入中…';
+  const res = await postForm('/api/whitelist/import/apply', body);
+  btn.textContent = label;
+  if (!res.ok) { btn.disabled = false; toast(res.json.error || '导入失败', 'err'); return; }
+  let msg = `已导入 ${res.json.added} 条（手动 ${res.json.manual_added}，自动匹配 ${res.json.auto_added}）`;
+  if (res.json.skipped && res.json.skipped.length) msg += `；跳过 ${res.json.skipped.length} 条已存在规则`;
+  toast(msg, 'ok');
+  closeModal('wl-import-modal'); setTimeout(() => location.reload(), 700);
 }
 // 生成基线：先拉取最近一次完成扫描中尚未加白的端口预览，勾选确认后写入。
 let baselineEntries = [];
@@ -205,9 +351,44 @@ async function submitBaseline() {
   else toast(res.json.error || '生成失败', 'err');
 }
 async function delWl(id) {
-  if (!confirm('删除该白名单条目？')) return;
+  if (!(await appConfirm('删除该白名单条目？', {title: '删除白名单', danger: true, okText: '删除'}))) return;
   const res = await postEmpty('/api/whitelist/' + id, 'DELETE');
   if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.reload(), 600); } else toast(res.json.error || '失败', 'err');
+}
+// 行内编辑原因/备注：导入/单条添加/基线/告警加白产生的条目均可改，只改原因与备注不动匹配规则。
+let remarkEditId = 0;
+function editWlRemark(id) {
+  remarkEditId = id;
+  const tr = document.querySelector('#wl-body tr[data-id="' + id + '"]');
+  document.getElementById('wl-reason-input').value = tr ? (tr.dataset.reason || '') : '';
+  document.getElementById('wl-remark-input').value = tr ? (tr.dataset.remark || '') : '';
+  openModal('wl-remark-modal');
+}
+async function submitWlRemark() {
+  const reason = document.getElementById('wl-reason-input').value.trim();
+  if (!reason) { toast('请填写加白原因（必填）', 'err'); return; }
+  const remark = document.getElementById('wl-remark-input').value.trim();
+  const body = new FormData();
+  body.append('reason', reason);
+  body.append('remark', remark);
+  const res = await postForm('/api/whitelist/' + remarkEditId + '/remark', body);
+  if (!res.ok) { toast(res.json.error || '更新失败', 'err'); return; }
+  const tr = document.querySelector('#wl-body tr[data-id="' + remarkEditId + '"]');
+  if (tr) {
+    tr.dataset.reason = reason;
+    tr.dataset.remark = remark;
+    const rCell = tr.querySelector('.wl-reason');
+    if (rCell) rCell.textContent = reason || '—';
+    const cell = tr.querySelector('.wl-remark');
+    if (cell) cell.textContent = remark || '—';
+    // 同步检索文本（前 8 列：IP/端口/协议/服务/负责人/业务/原因/备注）。
+    const cells = tr.querySelectorAll('td');
+    const parts = [];
+    for (let i = 0; i < 8 && i < cells.length; i++) parts.push(cells[i].textContent.trim());
+    tr.dataset.spec = parts.join(' ');
+  }
+  toast('已更新', 'ok');
+  closeModal('wl-remark-modal');
 }
 function filterWl() {
   const q = (document.getElementById('wl-q').value || '').trim().toLowerCase();

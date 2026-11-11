@@ -45,10 +45,10 @@ func (s *Store) BackupTo(path string) error {
 	return err
 }
 
-// ClearBusinessData 清空业务数据（资产、任务、执行、结果、事件、告警、白名单、旧调度），
+// ClearBusinessData 清空业务数据（资产、任务、执行、结果、事件、告警、不可达明细、白名单、旧调度），
 // 保留账号 users、系统设置 settings 与操作审计 audit_log；同时重置相关表的自增计数。
 func (s *Store) ClearBusinessData() error {
-	tables := []string{"scan_events", "scan_results", "alerts", "scans", "scan_tasks", "whitelist", "targets", "schedules"}
+	tables := []string{"scan_events", "scan_results", "scan_unreachable", "alerts", "scans", "scan_tasks", "whitelist", "targets", "schedules"}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err

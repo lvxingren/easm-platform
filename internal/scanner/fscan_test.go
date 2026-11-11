@@ -1,9 +1,11 @@
 package scanner
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,17 +47,42 @@ func TestParseFscanOutput(t *testing.T) {
 
 func TestFscanArgs(t *testing.T) {
 	s := FscanSettings{Path: "fscan", Workers: 50, VulnScan: true}
-	args := fscanArgs("t.txt", "o.txt", s)
-	joined := joinArgs(args)
-	if !contains(joined, "-t 50") || !contains(joined, "-h t.txt") || !contains(joined, "-o o.txt") {
-		t.Fatalf("fscan 参数缺失: %v", args)
+	joined := " " + joinArgs(fscanArgs("t.txt", "o.txt", s)) + " "
+	for _, want := range []string{"-t 50", "-hf t.txt", "-o o.txt", "-nobr"} {
+		if !contains(joined, want) {
+			t.Fatalf("fscan 参数缺少 %q: %v", want, joined)
+		}
 	}
-	if contains(joined, "-np") {
-		t.Fatal("启用漏洞检测时不应加 -np")
+	// 漏洞模式保留 PoC；-h/-nobrute/-np 均不是 fscan 1.8.x 的正确用法。
+	for _, bad := range []string{" -np ", " -nobrute ", " -nopoc ", " -noredis ", " -h t.txt "} {
+		if contains(joined, bad) {
+			t.Fatalf("漏洞模式不应包含 %q: %v", bad, joined)
+		}
 	}
+
 	s.VulnScan = false
-	if !contains(joinArgs(fscanArgs("t.txt", "o.txt", s)), "-np") {
-		t.Fatal("纯主机发现应加 -np 关闭 PoC")
+	port := " " + joinArgs(fscanArgs("t.txt", "o.txt", s)) + " "
+	for _, want := range []string{" -nopoc ", " -noredis ", " -nobr "} {
+		if !contains(port, want) {
+			t.Fatalf("纯端口模式应包含 %q 关闭漏洞检测: %s", want, port)
+		}
+	}
+	if contains(port, " -np ") {
+		t.Fatal("-np 在 fscan 中是跳过 ping，不是关闭 PoC，纯端口模式不应使用")
+	}
+}
+
+// TestFscanErrorDetailKeepsOutput 回归：运行失败时不能只回传「exit status 2」，
+// 必须带上 fscan 实际打印的参数错误，便于直接定位版本/参数不兼容。
+func TestFscanErrorDetailKeepsOutput(t *testing.T) {
+	msg := fscanErrorDetail(errors.New("exit status 2"), "fscan version: 1.8.4\nflag provided but not defined: -nobrute", "")
+	if !strings.Contains(msg, "exit status 2") || !strings.Contains(msg, "flag provided but not defined") {
+		t.Fatalf("失败详情应包含错误与输出: %s", msg)
+	}
+	long := strings.Repeat("a", 5000) + "TAIL"
+	got := fscanOutputDetail(long, 100)
+	if !strings.HasSuffix(got, "TAIL") || len(got) > 200 {
+		t.Fatalf("输出应只保留有界尾部: len=%d tail=%q", len(got), got[len(got)-8:])
 	}
 }
 
@@ -163,17 +190,20 @@ func TestEngineIsFscanAndMode(t *testing.T) {
 
 func TestFscanArgsPortsAndModes(t *testing.T) {
 	port := FscanSettings{Workers: 50, Mode: FscanModePort, CustomPorts: "22,80,8000-9000"}
-	j := joinArgs(fscanArgs("t.txt", "o.txt", port))
-	if !contains(j, "-p 22,80,8000-9000") || !contains(j, "-np") {
-		t.Fatalf("纯端口应带 -p 自定义与 -np: %v", j)
+	j := " " + joinArgs(fscanArgs("t.txt", "o.txt", port)) + " "
+	if !contains(j, "-p 22,80,8000-9000") || !contains(j, " -nopoc ") || !contains(j, " -noredis ") {
+		t.Fatalf("纯端口应带 -p 自定义与 -nopoc/-noredis: %v", j)
 	}
 	full := joinArgs(fscanArgs("t.txt", "o.txt", FscanSettings{Mode: FscanModePort}))
 	if !contains(full, "-p 1-65535") {
 		t.Fatalf("留空应默认全端口: %v", full)
 	}
-	vuln := joinArgs(fscanArgs("t.txt", "o.txt", FscanSettings{Mode: FscanModeVuln}))
-	if contains(vuln, "-np") {
-		t.Fatal("漏洞模式不应加 -np")
+	vuln := " " + joinArgs(fscanArgs("t.txt", "o.txt", FscanSettings{Mode: FscanModeVuln})) + " "
+	if contains(vuln, " -nopoc ") || contains(vuln, " -np ") {
+		t.Fatalf("漏洞模式不应关闭 PoC 或跳过 ping: %v", vuln)
+	}
+	if !contains(vuln, " -nobr ") {
+		t.Fatalf("应始终关闭弱口令爆破: %v", vuln)
 	}
 }
 

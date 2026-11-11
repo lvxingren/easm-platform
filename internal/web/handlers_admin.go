@@ -55,7 +55,10 @@ func (s *Server) pageAudit(w http.ResponseWriter, r *http.Request) {
 	bd, _ := s.baseData(r, "操作审计", "audit")
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	username := strings.TrimSpace(r.URL.Query().Get("user"))
-	logs, err := s.st.AuditLogsFiltered(query, username, 2000)
+	actionType := strings.TrimSpace(r.URL.Query().Get("type"))
+	from := strings.TrimSpace(r.URL.Query().Get("from"))
+	to := strings.TrimSpace(r.URL.Query().Get("to"))
+	logs, err := s.st.AuditLogsAdvanced(query, username, actionType, from, to, 2000)
 	if err != nil {
 		http.Error(w, "读取审计流水失败: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -65,7 +68,10 @@ func (s *Server) pageAudit(w http.ResponseWriter, r *http.Request) {
 		Logs  []store.AuditLog
 		Query string
 		User  string
-	}{bd, logs, query, username})
+		Type  string
+		From  string
+		To    string
+	}{bd, logs, query, username, actionType, from, to})
 }
 
 // ---------- 账号 API ----------

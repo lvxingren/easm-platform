@@ -137,20 +137,49 @@ func settingsOverallTimeout(r *Runner) time.Duration {
 	return time.Duration(mins) * time.Minute
 }
 
-// fscanArgs 构造 fscan 命令行：-h 目标 -o 输出 -t 线程 -p 端口；纯端口模式加 -np 关闭 PoC。
+// fscanArgs 构造 fscan 1.8.x 命令行：-hf 目标文件 -o 输出 -t 线程 -p 端口。
+// 注意：fscan 的 -h 是单个主机/网段（不能传文件），目标文件必须用 -hf；
+// -nobr 关闭弱口令爆破；纯端口模式追加 -nopoc/-noredis 关闭 PoC 与 Redis 未授权检测。
+// -np 在 fscan 中表示「跳过 ping 主机发现」，与 PoC 无关，不能用于关闭漏洞检测。
 func fscanArgs(targetsFile, outFile string, s FscanSettings) []string {
 	ports := strings.TrimSpace(s.CustomPorts)
 	if ports == "" {
 		ports = fscanFullPorts
 	}
-	args := []string{"-h", targetsFile, "-o", outFile, "-t", strconv.Itoa(s.Workers), "-p", ports, "-nobrute"}
+	args := []string{"-hf", targetsFile, "-o", outFile, "-t", strconv.Itoa(s.Workers), "-p", ports, "-nobr"}
 	if !s.vulnEnabled() {
-		args = append(args, "-np")
+		args = append(args, "-nopoc", "-noredis")
 	}
 	return args
 }
 
+// fscanOutputDetail 截取输出尾部用于错误提示，避免把整屏 banner/进度写入数据库。
+func fscanOutputDetail(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if text == "" || limit <= 0 {
+		return text
+	}
+	if len(text) > limit {
+		text = "…" + text[len(text)-limit:]
+	}
+	return text
+}
+
+// fscanErrorDetail 拼接失败原因与实际输出（含 stderr/stdout 尾部），避免只剩「exit status 2」。
+func fscanErrorDetail(runErr error, stdout, stderr string) string {
+	msg := fmt.Sprintf("fscan 执行失败：%v", runErr)
+	if s := fscanOutputDetail(stderr, 1200); s != "" {
+		msg += "\n错误输出：\n" + s
+	}
+	if s := fscanOutputDetail(stdout, 1200); s != "" {
+		msg += "\n标准输出：\n" + s
+	}
+	return msg
+}
+
 // checkFscan 自检 fscan 可执行文件（执行 -h），返回路径或错误。
+// fscan 1.8.x 的 -h 是字符串参数，单独执行必然以 usage（exit 2）结束，
+// 因此以「能输出 fscan/Usage 文本」为自检通过，并识别非 fscan 可执行文件或架构不匹配。
 func checkFscan(path string) (string, error) {
 	resolved, err := exec.LookPath(path)
 	if err != nil {
@@ -159,12 +188,22 @@ func checkFscan(path string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), fscanVersionTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, resolved, "-h")
-	out, err := cmd.CombinedOutput()
+	out := newTailBuffer(64 * 1024)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	runErr := cmd.Run()
 	if ctx.Err() != nil {
 		return resolved, fmt.Errorf("fscan 自检超过 %s 已终止（路径 %q）", fscanVersionTimeout, resolved)
 	}
-	if err != nil && len(out) == 0 {
-		return resolved, fmt.Errorf("fscan 自检失败：%v", err)
+	text := out.String()
+	low := strings.ToLower(text)
+	// -h 缺少参数时 Go flag 会输出 usage 并以 2 退出，属预期行为。
+	usageErr := strings.Contains(low, "usage") || strings.Contains(low, "flag")
+	if runErr != nil && !usageErr {
+		return resolved, fmt.Errorf("fscan 自检失败：%v；输出：%s", runErr, fscanOutputDetail(text, 400))
+	}
+	if !strings.Contains(low, "fscan") && !usageErr {
+		return resolved, fmt.Errorf("fscan 自检输出异常（可能不是 fscan 可执行文件）：%s", fscanOutputDetail(text, 400))
 	}
 	return resolved, nil
 }
@@ -331,6 +370,8 @@ func (r *Runner) runFscanScan(scanID int64, specs []store.TargetSpec, fs FscanSe
 		status = scan.Status
 	}
 	_ = openPorts
+	// 网络不可达告警独立于端口告警，不受终态门禁（与 executeScan 收尾一致）。
+	r.eng.ProcessUnreachable(scanID)
 	r.eng.NotifyScanSummary(scanID, status, newAlerts)
 }
 
@@ -348,7 +389,15 @@ func (r *Runner) execFscan(scanID int64, specs []store.TargetSpec, fs FscanSetti
 	}
 	targetsFile := filepath.Join(dataDir, "fscan_targets.txt")
 	outFile := filepath.Join(dataDir, "fscan.out")
-	if err := writeTargets(targetsFile, specs); err != nil {
+	// fscan 对域名的支持依赖系统 DNS，且结果以域名作为 host 输出、平台解析器只接受 IP；
+	// 因此在平台侧先解析为 IPv4 再写入目标文件，保证域名目标能真正扫描并入结果库。
+	effective, failedDomains := r.resolveFscanDomainTargets(scanID, specs)
+	if len(effective) == 0 {
+		err := fmt.Errorf("fscan 未执行：目标域名均解析不到可扫描的 IPv4 地址，请检查 DNS 或改用 IP 目标")
+		r.fail(scanID, err)
+		return 0, err
+	}
+	if err := writeTargets(targetsFile, effective); err != nil {
 		r.fail(scanID, fmt.Errorf("写入目标文件失败：%v", err))
 		return 0, err
 	}
@@ -372,6 +421,11 @@ func (r *Runner) execFscan(scanID int64, specs []store.TargetSpec, fs FscanSetti
 	cmd := exec.CommandContext(ctx, fs.Path, args...)
 	cmd.Cancel = func() error { return killProcess(cmd) }
 	cmd.WaitDelay = pipeWaitDelay
+	// 保留有界 stdout/stderr：fscan 参数错误只打印到控制台，必须回传到执行记录。
+	stdout := newTailBuffer(64 * 1024)
+	stderr := newTailBuffer(64 * 1024)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	runErr := cmd.Run()
 
 	results, vulns := collectFscanResults(outFile)
@@ -389,15 +443,27 @@ func (r *Runner) execFscan(scanID int64, specs []store.TargetSpec, fs FscanSetti
 
 	status := "done"
 	message := fmt.Sprintf("fscan（%s）完成，发现 %d 个开放端口、%d 条漏洞", fscanModeLabel(fs.Mode), len(results), len(vulns))
+	domainNote := ""
+	if len(failedDomains) > 0 {
+		domainNote = fmt.Sprintf("；%d 个域名解析失败未扫描（fscan 仅支持 IPv4，详见执行事件）", len(failedDomains))
+		message += domainNote
+	}
 	if r.isStopped(scanID) {
 		status = "stopped"
 		message = "fscan 已被停止。已基于已入库结果完成白名单比对与风险告警，结果可能因提前终止而不完整。"
 	} else if runErr != nil && len(results) == 0 {
 		status = "failed"
-		message = fmt.Sprintf("fscan 执行失败：%v", runErr)
+		message = fscanErrorDetail(runErr, stdout.String(), stderr.String())
 	} else if runErr != nil {
 		status = "partial"
-		message = fmt.Sprintf("fscan 部分完成（%v），保留已发现结果", runErr)
+		message = fmt.Sprintf("fscan 部分完成（%v），保留已发现结果%s", runErr, domainNote)
+		if detail := fscanOutputDetail(stderr.String(), 600); detail != "" {
+			message += "\n错误输出：\n" + detail
+		}
+	}
+	// 有域名解析失败时不得虚报 done：已发现的 IP 结果保留，但本次目标范围并不完整。
+	if status == "done" && len(failedDomains) > 0 {
+		status = "partial"
 	}
 	_ = r.st.UpdateScanProgress(scanID, len(specs), 0, 1, len(results), commandText)
 	if err := r.st.FinishScanStatus(scanID, status, len(results), message); err != nil {

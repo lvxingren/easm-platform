@@ -6,9 +6,29 @@
   <form method="get" action="/audit" class="filter-bar">
     <label class="field grow">检索（操作 / 对象 / 详情 / 来源 IP）<input name="q" value="{{.Query}}" placeholder="如 删除、导入资产、10.0.0.1"></label>
     <label class="field">用户名<input name="user" value="{{.User}}" placeholder="全部用户"></label>
+    <label class="field">对象类型<select name="type">
+      <option value="">全部</option>
+      {{$t := .Type}}
+      <option value="登录" {{if eq $t "登录"}}selected{{end}}>登录</option>
+      <option value="导入资产" {{if eq $t "导入资产"}}selected{{end}}>导入资产</option>
+      <option value="删除资产" {{if eq $t "删除资产"}}selected{{end}}>删除资产</option>
+      <option value="创建任务" {{if eq $t "创建任务"}}selected{{end}}>创建任务</option>
+      <option value="启动扫描" {{if eq $t "启动扫描"}}selected{{end}}>启动扫描</option>
+      <option value="暂停" {{if eq $t "暂停"}}selected{{end}}>暂停</option>
+      <option value="恢复" {{if eq $t "恢复"}}selected{{end}}>恢复</option>
+      <option value="终止" {{if eq $t "终止"}}selected{{end}}>终止</option>
+      <option value="加白" {{if eq $t "加白"}}selected{{end}}>加白</option>
+      <option value="批量处置" {{if eq $t "批量处置"}}selected{{end}}>批量处置</option>
+      <option value="改密" {{if eq $t "改密"}}selected{{end}}>改密</option>
+      <option value="账号管理" {{if eq $t "账号管理"}}selected{{end}}>账号管理</option>
+      <option value="系统设置" {{if eq $t "系统设置"}}selected{{end}}>系统设置</option>
+      <option value="其他" {{if eq $t "其他"}}selected{{end}}>其他</option>
+    </select></label>
+    <label class="field">从<input type="date" name="from" value="{{.From}}"></label>
+    <label class="field">至<input type="date" name="to" value="{{.To}}"></label>
     <button class="btn primary" type="submit">查询</button>
     <a class="btn ghost" href="/audit">重置</a>
-    <a class="btn" href="/audit/export?q={{urlquery .Query}}&user={{urlquery .User}}">导出 CSV</a>
+    <a class="btn" href="/audit/export?q={{urlquery .Query}}&user={{urlquery .User}}&type={{urlquery .Type}}&from={{urlquery .From}}&to={{urlquery .To}}">导出 CSV</a>
   </form>
 </div>
 
@@ -20,7 +40,7 @@
   {{range .Logs}}
   <tr>
     <td>{{fmtTime .Ts}}</td><td>{{.Username}}</td><td><span class="pill mute">{{roleName .Role}}</span></td>
-    <td>{{.Action}}</td><td>{{.Target}}</td><td style="color:var(--text-dim)">{{.Detail}}</td><td>{{.IP}}</td>
+    <td>{{.Action}}</td><td>{{if isIP .Target}}<a href="/exposure?q={{urlquery .Target}}">{{.Target}}</a>{{else if scanIDFromTarget .Target}}<a href="/scans/{{scanIDFromTarget .Target}}">{{.Target}}</a>{{else}}{{.Target}}{{end}}</td><td style="color:var(--text-dim)">{{.Detail}}</td><td>{{.IP}}</td>
   </tr>
   {{else}}
   <tr><td colspan="7"><div class="empty"><div class="big">暂无审计记录</div>调整关键词或用户名后重试</div></td></tr>

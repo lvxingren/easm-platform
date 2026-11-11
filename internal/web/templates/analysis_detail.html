@@ -131,14 +131,16 @@ function renderEdges(list) {
 
 async function whitelistIP(ip, port, proto) {
   if (!ip) return;
-  if (!confirm(`将 ${ip}:${port || '*'}/${proto || 'tcp'} 加入白名单？`)) return;
-  const body = new FormData(); body.append('ip_spec', ip); body.append('port_spec', port ? String(port) : '*'); body.append('proto', proto || 'tcp'); body.append('remark', '来自流量分析');
+  const spec = `${ip}:${port || '*'}/${proto || 'tcp'}`;
+  const input = await appWhitelistDialog(spec, {defaultReason: '来自流量分析', defaultRemark: '来自流量分析'});
+  if (!input) return;
+  const body = new FormData(); body.append('ip_spec', ip); body.append('port_spec', port ? String(port) : '*'); body.append('proto', proto || 'tcp'); body.append('reason', input.reason); body.append('remark', input.remark);
   const res = await postForm('/api/whitelist', body);
   toast(res.ok ? '已加入白名单' : (res.json.error || '失败'), res.ok ? 'ok' : 'err');
 }
 async function createAlert(ip, port, proto) {
   if (!ip || !port) { toast('该关系缺少端口，无法建告警', 'err'); return; }
-  if (!confirm(`为 ${ip}:${port}/${proto || 'tcp'} 创建告警处置单？`)) return;
+  if (!(await appConfirm(`为 ${ip}:${port}/${proto || 'tcp'} 创建告警处置单？`, {title: '创建告警', okText: '创建'}))) return;
   const body = new FormData(); body.append('ip', ip); body.append('port', String(port)); body.append('proto', proto || 'tcp'); body.append('note', '来自流量分析');
   const res = await postForm('/api/alerts/manual', body);
   toast(res.ok ? '已创建告警' : (res.json.error || '失败'), res.ok ? 'ok' : 'err');
@@ -149,7 +151,7 @@ async function retryAnalysis() {
   else toast(res.json.error || '重试失败', 'err');
 }
 async function delAnalysis(id) {
-  if (!confirm('删除该分析记录及其上传文件？')) return;
+  if (!(await appConfirm('删除该分析记录及其上传文件？', {title: '删除分析记录', danger: true, okText: '删除'}))) return;
   const res = await postEmpty('/api/analysis/' + id, 'DELETE');
   if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.href = '/analysis', 500); } else toast(res.json.error || '失败', 'err');
 }

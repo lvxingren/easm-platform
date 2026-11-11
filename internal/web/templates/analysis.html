@@ -71,7 +71,7 @@ async function submitAnalysis() {
   else toast(res.json.error || '创建失败', 'err');
 }
 async function delAnalysis(id) {
-  if (!confirm('删除该分析记录及其上传的原始文件？')) return;
+  if (!(await appConfirm('删除该分析记录及其上传的原始文件？', {title: '删除分析记录', danger: true, okText: '删除'}))) return;
   const res = await postEmpty('/api/analysis/' + id, 'DELETE');
   if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.reload(), 500); }
   else toast(res.json.error || '失败', 'err');

@@ -119,13 +119,16 @@ code {
 }
 .brand .brand-sub { font-size: 11px; color: var(--muted); letter-spacing: 2px; }
 .nav { display: flex; flex-direction: column; gap: 2px; }
-.nav-group { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; padding: 16px 12px 6px; }
 .nav-item {
   display: flex; align-items: center; gap: 8px; color: var(--text-dim);
   padding: 9px 12px; border-radius: var(--radius-sm); font-weight: 500; transition: .15s;
 }
 .nav-item:hover { background: var(--surface-2); color: var(--text); }
 .nav-item.active { background: var(--accent-soft); color: var(--accent-text); box-shadow: inset 2px 0 0 var(--accent); }
+/* 功能域色条：安全运营=主色左条，系统管理=灰色左条，复用现有变量 */
+.nav-item.sec-op { box-shadow: inset 3px 0 0 var(--accent); }
+.nav-item.sys-admin { box-shadow: inset 3px 0 0 var(--muted); }
+.nav-item.sec-op.active, .nav-item.sys-admin.active { box-shadow: inset 3px 0 0 var(--accent); }
 /* 可折叠导航分组（安全运营）：复用现有 nav-item 视觉，仅增加折叠交互 */
 .nav-sec { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
 .nav-sec-toggle { width: 100%; justify-content: space-between; cursor: pointer; background: transparent; border: none; font: inherit; text-align: left; }
@@ -174,14 +177,18 @@ h2 { font-size: 15px; margin: 26px 0 12px; color: var(--text-dim); font-weight: 
 .panel-note { font-size: 12.5px; color: var(--muted); margin: -6px 0 14px; line-height: 1.6; }
 .panel[id] { scroll-margin-top: 86px; }
 
-/* 设置页分类跳转胶囊导航 */
+/* 设置页分类切换胶囊导航（标签页形式：同一时间只显示一个面板） */
 .subnav { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
-.subnav a {
+.subnav a, .subnav button {
   background: var(--surface); border: 1px solid var(--border); color: var(--text-dim);
   padding: 6px 14px; border-radius: 999px; font-size: 12.5px; font-weight: 500;
+  font-family: inherit; line-height: 1.4; cursor: pointer;
   transition: border-color .15s, color .15s, background .15s;
 }
-.subnav a:hover { border-color: var(--accent); color: var(--accent-text); background: var(--accent-soft); }
+.subnav a:hover, .subnav button:hover { border-color: var(--accent); color: var(--accent-text); background: var(--accent-soft); }
+.subnav .active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.subnav .active:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
+.settings-panel[hidden] { display: none; }
 
 /* 设置页与安全运营页视觉对齐：表单结果框与面板内子分区统一间距/分隔线，替代内联样式 */
 .form-result { display: none; margin-top: 14px; }
@@ -320,7 +327,7 @@ td.num-cell { font-variant-numeric: tabular-nums; }
 
 /* ---------- modal ---------- */
 .modal-mask { position: fixed; inset: 0; background: var(--modal-mask); z-index: 90; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(2px); }
-.modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; width: 380px; box-shadow: var(--shadow); }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; width: 380px; max-width: 92vw; box-shadow: var(--shadow); }
 .modal h3 { font-size: 16px; color: var(--text-strong); margin-bottom: 16px; }
 .modal .stack { gap: 12px; }
 .modal.lg { width: 640px; max-width: 92vw; }

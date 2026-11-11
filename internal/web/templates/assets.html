@@ -10,6 +10,11 @@
     <button class="btn primary" type="submit">查询</button>
     <a class="btn ghost" href="/assets">重置</a>
     <a class="btn" href="/assets/export?q={{urlquery .Query}}&tag={{urlquery .CurTag}}&filter={{.Filter}}">导出 CSV</a>
+    <label class="field">每页<select id="page-size" name="page_size" onchange="changePageSize(this.value)">
+      <option value="20" {{if eq .PageSize 20}}selected{{end}}>20 条</option>
+      <option value="50" {{if eq .PageSize 50}}selected{{end}}>50 条</option>
+      <option value="100" {{if eq .PageSize 100}}selected{{end}}>100 条</option>
+    </select></label>
   </form>
   <div class="row between" style="margin-top:14px;align-items:flex-start">
     <div class="btn-group">
@@ -52,20 +57,20 @@
 <table>
   <thead><tr>{{if ne .Role "viewer"}}<th style="width:36px"><input type="checkbox" onclick="toggleAllChecks(this,'asset-check');updateAssetBatch()" title="全选/取消"></th>{{end}}<th>目标</th><th>类型</th><th>标签</th><th>维护人员</th><th>安全设备</th><th>来源</th><th>导入时间</th>{{if ne .Role "viewer"}}<th>操作</th>{{end}}</tr></thead>
   <tbody>
-  {{range .Targets}}
+  {{range $i, $t := .Targets}}
   <tr>
-    {{if ne $.Role "viewer"}}<td><input type="checkbox" class="asset-check" value="{{.ID}}" onclick="updateAssetBatch()"></td>{{end}}
-    <td>{{if eq .Kind "ip"}}<a href="/exposure?q={{urlquery .IP}}">{{.IP}}</a>{{else}}{{.IP}}{{end}}</td>
-    <td>{{if eq .Kind "cidr"}}<span class="pill info">网段</span>{{else if eq .Kind "range"}}<span class="pill info">范围</span>{{else if eq .Kind "domain"}}<span class="pill info">域名</span>{{else}}<span class="pill mute">单 IP</span>{{end}}</td>
-    <td>{{range $t := splitTags .Tags}}<span class="tag">{{$t}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
-    <td>{{if .Owner}}{{.Owner}}{{else}}<span class="muted">—</span>{{end}}</td>
-    <td>{{if .SecurityDevice}}{{.SecurityDevice}}{{else}}<span class="muted">—</span>{{end}}</td>
-    <td>{{.Source}}</td><td>{{fmtTime .CreatedAt}}</td>
+    {{if ne $.Role "viewer"}}<td><input type="checkbox" class="asset-check" value="{{$t.ID}}" onclick="updateAssetBatch()"></td>{{end}}
+    <td>{{if eq $t.Kind "ip"}}<a href="/exposure?q={{urlquery $t.IP}}">{{$t.IP}}</a>{{else if eq $t.Kind "domain"}}<a href="/assets/domain/{{urlquery $t.IP}}">{{$t.IP}}</a>{{with index $.Services $i}}{{range $j, $s := .}} <span class="tag">{{$s}}</span>{{end}}{{end}}{{if $t.SecurityDevice}} <span class="pill ok" title="安全设备">{{$t.SecurityDevice}}</span>{{end}}{{else}}{{$t.IP}}{{end}}</td>
+    <td>{{if eq $t.Kind "cidr"}}<span class="pill info">CIDR</span>{{else if eq $t.Kind "range"}}<span class="pill run">Range</span>{{else if eq $t.Kind "domain"}}<span class="pill err">Domain</span>{{else}}<span class="pill ok">IP</span>{{end}}</td>
+    <td>{{range $tg := splitTags $t.Tags}}<span class="tag">{{$tg}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{if $t.Owner}}{{$t.Owner}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{if $t.SecurityDevice}}{{$t.SecurityDevice}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{$t.Source}}</td><td>{{fmtTime $t.CreatedAt}}</td>
     {{if ne $.Role "viewer"}}
     <td>
       <div class="btn-group">
-        <button class="btn small ghost" data-id="{{.ID}}" data-spec="{{.IP}}" data-owner="{{.Owner}}" data-device="{{.SecurityDevice}}" data-tags="{{.Tags}}" onclick="editTargetFromBtn(this)">编辑</button>
-        <button class="btn small danger" data-id="{{.ID}}" data-ip="{{.IP}}" onclick="delTargetFromBtn(this)">删除</button>
+        <button class="btn small ghost" data-id="{{$t.ID}}" data-spec="{{$t.IP}}" data-owner="{{$t.Owner}}" data-device="{{$t.SecurityDevice}}" data-tags="{{$t.Tags}}" onclick="editTargetFromBtn(this)">编辑</button>
+        <button class="btn small danger" data-id="{{$t.ID}}" data-ip="{{$t.IP}}" onclick="delTargetFromBtn(this)">删除</button>
       </div>
     </td>
     {{end}}
@@ -76,6 +81,36 @@
   </tbody>
 </table>
 </div>
+
+<div class="row between" style="margin-top:14px">
+  <span class="muted">共 {{.Total}} 条 · 每页 {{.PageSize}} 条 · 第 {{.Page}}/{{.Pages}} 页</span>
+  <div class="btn-group">
+    <a class="btn small {{if le .Page 1}}ghost{{end}}" href="/assets?page={{.PrevPage}}&page_size={{.PageSize}}&q={{urlquery .Query}}&tag={{urlquery .CurTag}}&filter={{.Filter}}">上一页</a>
+    <a class="btn small {{if ge .Page .Pages}}ghost{{end}}" href="/assets?page={{.NextPage}}&page_size={{.PageSize}}&q={{urlquery .Query}}&tag={{urlquery .CurTag}}&filter={{.Filter}}">下一页</a>
+    <input type="number" id="jump-page" min="1" max="{{.Pages}}" value="{{.Page}}" style="width:70px" aria-label="跳转页码">
+    <button class="btn small" type="button" onclick="jumpPage()">跳转</button>
+  </div>
+</div>
+<script>
+function assetQuery() { return new URLSearchParams(location.search); }
+function changePageSize(v) {
+  try { localStorage.setItem('easm-assets-page-size', v); } catch (e) {}
+  const p = assetQuery(); p.set('page_size', v); p.set('page', '1');
+  location.href = '/assets?' + p.toString();
+}
+function jumpPage() {
+  const n = parseInt(document.getElementById('jump-page').value, 10) || 1;
+  const p = assetQuery(); p.set('page', String(n));
+  location.href = '/assets?' + p.toString();
+}
+(function () {
+  const p = assetQuery();
+  if (!p.has('page_size')) {
+    let s = null; try { s = localStorage.getItem('easm-assets-page-size'); } catch (e) {}
+    if (s && ['20', '50', '100'].indexOf(s) >= 0) { p.set('page_size', s); location.replace('/assets?' + p.toString()); return; }
+  }
+})();
+</script>
 
 {{if ne .Role "viewer"}}
 <!-- 手动添加单条资产 -->
@@ -179,7 +214,7 @@
         <a class="btn small" href="/api/sample/assets.csv">CSV 样例</a>
         <a class="btn small" href="/api/sample/assets.xlsx">XLSX 样例</a>
       </div>
-      <p class="hint" style="margin-top:12px">非法行会被跳过，并在导入结果中给出数量与示例，不会静默丢弃。「本批标签」会应用到本次新增的资产上。</p>
+      <p class="hint" style="margin-top:12px">重复的 IP/网段/域名会自动识别合并（等价 CIDR、大小写域名视为同一资产），非法行会被跳过，两者都会在导入结果中给出数量与示例，不会静默丢弃。「本批标签」会应用到本次新增的资产上。</p>
     </div>
     <div class="modal-foot"><button class="btn primary" type="button" onclick="closeModal('help-modal')">知道了</button></div>
   </div>
@@ -196,12 +231,13 @@ async function submitImport() {
   box.style.display = 'block';
   if (!res.ok) { box.textContent = res.json.error || '导入失败'; return; }
   let msg = `合法 ${res.json.parsed} 个，新增 ${res.json.added} 个`;
+  if (res.json.skipped) msg += `，跳过重复 ${res.json.skipped} 个（已存在的 IP/网段/域名自动合并，不重复入库）`;
   if (res.json.invalid) msg += `\n跳过非法内容 ${res.json.invalid} 项：${(res.json.invalid_sample || []).join('、')}`;
   const tag = (form.querySelector('[name=tag]').value || '').trim();
   msg += tag ? `\n本批标签「${tag}」已应用到新增资产` : '\n未设置本批标签（可稍后用「编辑」或「批量修改标签」补充）';
   box.textContent = msg;
   importChanged = true;
-  toast(res.json.invalid ? `导入完成，新增 ${res.json.added} 个，跳过 ${res.json.invalid} 项非法` : `导入成功，新增 ${res.json.added} 个`, res.json.invalid ? 'err' : 'ok');
+  toast(res.json.invalid ? `导入完成，新增 ${res.json.added} 个，跳过 ${res.json.invalid} 项非法` : `导入成功，新增 ${res.json.added} 个${res.json.skipped ? '，跳过重复 ' + res.json.skipped + ' 个' : ''}`, res.json.invalid ? 'err' : 'ok');
 }
 function closeImport() { closeModal('import-modal'); if (importChanged) location.reload(); }
 
@@ -253,7 +289,7 @@ async function submitBatchTags() {
 
 async function batchDeleteTargets() {
   const ids = checkedValues('asset-check');
-  if (ids.length > 0 && !confirm('确定删除选中的 ' + ids.length + ' 个资产？该操作不可恢复。')) return;
+  if (ids.length > 0 && !(await appConfirm('确定删除选中的 ' + ids.length + ' 个资产？该操作不可恢复。', {title: '批量删除资产', danger: true, okText: '删除'}))) return;
   const body = new FormData();
   ids.forEach(id => body.append('ids', id));
   const res = await postForm('/api/targets/batch-delete', body);
@@ -281,7 +317,7 @@ async function submitEdit() {
 }
 function delTargetFromBtn(btn) { delTarget(btn.dataset.id, btn.dataset.ip); }
 async function delTarget(id, ip) {
-  if (!confirm('从台账删除 ' + ip + ' ？')) return;
+  if (!(await appConfirm('从台账删除 ' + ip + ' ？', {title: '删除资产', danger: true, okText: '删除'}))) return;
   const res = await postEmpty('/api/targets/' + id, 'DELETE');
   if (res.ok) { toast('已删除', 'ok'); setTimeout(() => location.reload(), 500); } else toast(res.json.error || '失败', 'err');
 }

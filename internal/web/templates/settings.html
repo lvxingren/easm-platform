@@ -1,18 +1,18 @@
 {{define "settings.html"}}{{template "head" .}}{{template "nav" .}}
 <p class="hint">系统级配置，仅管理员可访问。各分类<b>独立保存、互不覆盖</b>：naabu / 通知 / 告警 / AI 类参数保存后立即生效；<b>网络监听与 HTTP/HTTPS 开关保存后需重启服务生效</b>，证书上传为热生效。非法值不会部分写入。</p>
 
-<div class="subnav">
-  <a href="#set-network">网络监听</a>
-  <a href="#set-cert">TLS 证书</a>
-  <a href="#set-notify">通知与告警</a>
-  <a href="#set-naabu">naabu 参数</a>
-  <a href="#set-fscan">fscan / 域名</a>
-  <a href="#set-ai">AI 分析</a>
-  <a href="#set-help">异常排查</a>
+<div class="subnav" role="tablist" aria-label="系统设置分类">
+  <button type="button" class="active" role="tab" data-settings-tab="set-network" aria-selected="true" aria-controls="set-network">网络监听</button>
+  <button type="button" role="tab" data-settings-tab="set-cert" aria-selected="false" aria-controls="set-cert">TLS 证书</button>
+  <button type="button" role="tab" data-settings-tab="set-notify" aria-selected="false" aria-controls="set-notify">通知与告警</button>
+  <button type="button" role="tab" data-settings-tab="set-naabu" aria-selected="false" aria-controls="set-naabu">naabu 参数</button>
+  <button type="button" role="tab" data-settings-tab="set-fscan" aria-selected="false" aria-controls="set-fscan">fscan / 域名</button>
+  <button type="button" role="tab" data-settings-tab="set-ai" aria-selected="false" aria-controls="set-ai">AI / 流量分析</button>
+  <button type="button" role="tab" data-settings-tab="set-help" aria-selected="false" aria-controls="set-help">异常排查</button>
 </div>
 
 <!-- ① 网络监听 -->
-<div class="panel" id="set-network">
+<div class="panel settings-panel" id="set-network" role="tabpanel">
   <div class="panel-title">网络监听（HTTP / HTTPS）</div>
   <p class="panel-note">配置文件：<code>{{.ConfigPath}}</code>。监听端口在进程启动时绑定，修改开关或地址后需重启：<code>sudo systemctl restart easm</code>。</p>
   <form id="network-form" class="grid">
@@ -30,7 +30,7 @@
 </div>
 
 <!-- ② TLS 证书 -->
-<div class="panel" id="set-cert">
+<div class="panel settings-panel" id="set-cert" role="tabpanel" hidden>
   <div class="panel-title">TLS 证书</div>
   {{if .CertInfo}}
   <div class="grid">
@@ -58,14 +58,15 @@
 </div>
 
 <!-- ③ 通知与告警 -->
-<div class="panel" id="set-notify">
+<div class="panel settings-panel" id="set-notify" role="tabpanel" hidden>
   <div class="panel-title">通知与告警</div>
   <p class="panel-note">飞书机器人 Webhook 与加签密钥；任务结束推送一条汇总。保存后可点「发送飞书测试」验证通道。</p>
   <form id="notify-form" class="grid">
     <label class="field full">飞书 Webhook<input name="feishu_webhook" value="{{.FeishuWebhook}}" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxx"><span class="field-help">风险告警推送地址；留空表示不推送。仅允许飞书官方域名。</span></label>
-    <label class="field">飞书加签密钥<input name="feishu_secret" value="{{.FeishuSecret}}" placeholder="可选"><span class="field-help">机器人启用加签时填写。</span></label>
+    <label class="field">飞书加签密钥<input type="password" name="feishu_secret" autocomplete="new-password" placeholder="{{if .FeishuSecretSet}}已配置，留空则不修改{{else}}可选{{end}}"><span class="field-help">机器人启用加签时填写；存于服务器数据库，页面不回显明文。</span></label>
     <label class="field">重告警周期（天）<input type="number" name="realert_days" min="1" max="3650" value="{{.RealertDays}}"><span class="field-help">同一未解决告警再次提醒的最短间隔。</span></label>
     <label class="check full"><input type="checkbox" name="alert_out_of_scope" {{if .AlertOutOfScope}}checked{{end}}> 范围外发现也告警<span class="field-help">台账外 IP 探明开放端口时是否同样登记告警。</span></label>
+    <label class="check full"><input type="checkbox" name="unreachable_probe" {{if .UnreachableProbe}}checked{{end}}> 启用连通性探测（网络不可达告警）<span class="field-help">扫描收尾时对台账中零结果的单 IP 补做 TCP 80/443 连接测试（最多 500 个、总预算 90 秒）；DNS 解析失败始终自动记录，不受此开关影响。</span></label>
     <div class="row full">
       <button type="submit" class="btn primary">保存通知配置</button>
       <button type="button" class="btn" onclick="testFeishu()">发送飞书测试</button>
@@ -75,7 +76,7 @@
 </div>
 
 <!-- ④ naabu 参数（含资源监测） -->
-<div class="panel" id="set-naabu">
+<div class="panel settings-panel" id="set-naabu" role="tabpanel" hidden>
   <div class="panel-title">naabu 扫描参数</div>
   <p class="panel-note">扫描引擎路径与发包参数，保存后立即生效；点「检测 naabu」会实际执行 <code>naabu -version</code> 并校验全部参数。</p>
   <form id="naabu-form" class="grid">
@@ -93,6 +94,8 @@
     <label class="field">排除端口（可选）<input name="naabu_exclude_ports" value="{{.NaabuExcludePorts}}" placeholder="22,8000-9000"><span class="field-help">本次以后所有任务都跳过这些端口，支持逗号和范围。</span></label>
     <label class="field">指定网卡（可选）<input name="naabu_interface" value="{{.NaabuInterface}}" placeholder="eth0 或 en0"><span class="field-help">多网卡服务器使用；留空由 naabu 自动选择。</span></label>
     <label class="check full" style="align-self:end"><input type="checkbox" name="naabu_verify" {{if .NaabuVerify}}checked{{end}}> 使用 TCP 二次验证开放端口<span class="field-help">降低误报，但会增加连接数和扫描耗时。</span></label>
+    <label class="check full" style="align-self:end"><input type="checkbox" name="scan_udp" {{if .ScanUDP}}checked{{end}}> 同时扫描 UDP 常用端口<span class="field-help">UDP 需 SYN/root（CAP_NET_RAW）；启用后自动用 SYN 并在 TCP 之外扫描下方 UDP 端口。权限不足时自动降级仅 TCP 并提示。</span></label>
+    <label class="field full">UDP 端口（逗号分隔，支持范围）<input name="udp_ports" value="{{.UDPPorts}}" placeholder="53,67,68,123,161,162,500,514,1900,5353"><span class="field-help">默认覆盖 DNS/DHCP/NTP/NetBIOS/SNMP/IPsec/syslog/SSDP/mDNS/memcached 等常用 UDP 服务。</span></label>
 
     <div class="panel-sub">资源监测（naabu 进程）</div>
     <label class="check full"><input type="checkbox" name="resource_monitor" {{if .ResourceMonitor}}checked{{end}}> 监测当前 naabu 进程资源占用<span class="field-help">每 5 秒采样 CPU 和 RSS；仅告警，不自动暂停或终止。</span></label>
@@ -114,7 +117,7 @@
 </div>
 
 <!-- ④-b fscan 与域名扫描 -->
-<div class="panel" id="set-fscan">
+<div class="panel settings-panel" id="set-fscan" role="tabpanel" hidden>
   <div class="panel-title">fscan 多工具引擎 / 域名扫描</div>
   <p class="panel-note">fscan 与 naabu 并列可选（新建任务时选择扫描引擎）；域名扫描通过 DNS 解析/子域枚举把域名衍生 IP 纳入扫描。未安装对应工具时不影响 naabu 现有任务。</p>
   <form id="fscan-form" class="grid">
@@ -129,7 +132,7 @@
       <span class="field-help">纯端口不启用 PoC；漏洞/混合覆盖 SmbGhost/Struts2/Log4j/Shiro/WebLogic。任务表单可单独覆盖。</span>
     </label>
     <label class="field full">Subfinder 路径（可选）<input name="subfinder_path" value="{{.SubfinderPath}}" placeholder="留空则仅用种子文件枚举子域"><span class="field-help">配置后对主域名做子域爆破；子域种子文件为 data/subdomains.txt。</span></label>
-    <label class="check full"><input type="checkbox" name="domain_resolve_enabled" {{if .DomainResolve}}checked{{end}}> 启用域名衍生 IP 扫描<span class="field-help">开启后把台账域名经 DNS/子域枚举解析出的 IP 自动纳入扫描（来源 domain_resolver）；默认关闭，不影响现有任务。</span></label>
+    <label class="check full"><input type="checkbox" name="domain_resolve_enabled" {{if .DomainResolve}}checked{{end}}> 启用域名衍生 IP 扫描<span class="field-help">开启后把台账域名经 DNS/子域枚举解析出的 IP 自动纳入扫描（来源 domain_resolver）；默认关闭，不影响现有任务。手工/台账中的域名目标本身不受此开关影响：naabu 原生解析域名，fscan 由平台先解析为 IPv4 再扫描。</span></label>
     <div class="row full">
       <button type="submit" class="btn primary">保存 fscan / 域名配置</button>
     </div>
@@ -138,7 +141,7 @@
 </div>
 
 <!-- ⑤ AI 分析 -->
-<div class="panel" id="set-ai">
+<div class="panel settings-panel" id="set-ai" role="tabpanel" hidden>
   <div class="panel-title">AI 分析（网络流量 / 安全设备日志溯源）</div>
   <p class="panel-note">OpenAI 兼容接口配置；留空端点则用内置规则降级分析（离线可用）。Token 存于服务器数据库、仅用于调用 AI，不写日志。</p>
   <form id="ai-form" class="grid">
@@ -147,6 +150,7 @@
     <label class="field">模型名称<input name="ai_model" value="{{.AiModel}}" placeholder="gpt-4o-mini / deepseek-chat / qwen-plus"><span class="field-help">端点提供的模型标识。</span></label>
     <label class="field">超时（秒）<input type="number" name="ai_timeout_sec" min="5" max="600" value="{{.AiTimeout}}" required><span class="field-help">单次 AI 调用超时，默认 60。</span></label>
     <label class="field">温度（0-2）<input type="number" name="ai_temperature" min="0" max="2" step="0.1" value="{{.AiTemperature}}" required><span class="field-help">越低越确定，分析类任务建议 0-0.3。</span></label>
+    <label class="check full"><input type="checkbox" name="analysis_enabled" {{if .AnalysisEnabled}}checked{{end}}> 启用【流量分析】模块<span class="field-help">默认关闭。开启后侧边栏才出现「流量分析」入口，才能上传日志/流量样本做安全溯源分析；关闭后入口隐藏且直接访问页面/接口返回 404。</span></label>
     <div class="row full">
       <button type="submit" class="btn primary">保存 AI 配置</button>
       <button type="button" class="btn" onclick="testAI()">测试 AI 连接</button>
@@ -156,12 +160,49 @@
 </div>
 
 <!-- ⑥ 异常排查说明 -->
-<div class="panel" id="set-help">
+<div class="panel settings-panel" id="set-help" role="tabpanel" hidden>
   <div class="panel-title">异常排查说明</div>
   <p class="hint">检测会实际执行 <code>naabu -version</code>，同时校验全部参数。路径不存在、无执行权限、架构不匹配、版本命令超时及参数错误会在对应面板的结果框显示完整原因。扫描中的进程异常、标准输出、错误输出和总超时会记录在「执行记录 → 查看详情」。</p>
+  <div class="panel-sub">日志级别（stderr 输出，热生效）</div>
+  <form id="log-form" class="grid">
+    <label class="field">最低输出级别<select name="log_level">
+      <option value="info" {{if eq .LogLevel "info"}}selected{{end}}>info（全量）</option>
+      <option value="warn" {{if eq .LogLevel "warn"}}selected{{end}}>warn（默认）</option>
+      <option value="error" {{if eq .LogLevel "error"}}selected{{end}}>error（仅报错）</option>
+    </select><span class="field-help">仅控制 stderr/控制台输出；「运行日志」页环形缓冲始终全量记录，分级检索不受影响。config.json 的 log_level 为初始默认值。</span></label>
+    <div class="row full"><button type="submit" class="btn primary">保存日志级别</button></div>
+  </form>
+  <div id="log-result" class="codeblock command-text form-result"></div>
 </div>
 
 <script>
+// 顶部分类胶囊按标签页切换：默认只显示「网络监听」，点其他分类再显示对应面板；
+// 支持 /settings#set-naabu 直达，保存结果仍留在各自面板内。
+const settingsTabs = Array.from(document.querySelectorAll('[data-settings-tab]'));
+function showSettingsPanel(id, updateHash) {
+  const panels = Array.from(document.querySelectorAll('.settings-panel'));
+  const target = panels.find(p => p.id === id) || panels[0];
+  if (!target) return;
+  panels.forEach(p => { p.hidden = p !== target; });
+  settingsTabs.forEach(tab => {
+    const on = tab.dataset.settingsTab === target.id;
+    tab.classList.toggle('active', on);
+    tab.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  if (updateHash !== false) {
+    try { history.replaceState(null, '', '#' + target.id); } catch (e) {}
+  }
+}
+settingsTabs.forEach(tab => tab.addEventListener('click', () => {
+  showSettingsPanel(tab.dataset.settingsTab);
+  window.scrollTo(0, 0);
+}));
+(function initSettingsTab() {
+  const fromHash = (location.hash || '').replace('#', '');
+  const exists = settingsTabs.some(tab => tab.dataset.settingsTab === fromHash);
+  showSettingsPanel(exists ? fromHash : 'set-network', false);
+})();
+
 function showResult(boxId, message, isError) {
   const box = document.getElementById(boxId);
   if (!box) return;
@@ -183,6 +224,7 @@ function bindSettingsForm(formId, boxId, okMsg) {
 bindSettingsForm('notify-form', 'notify-result', '通知与告警配置已保存并生效。');
 bindSettingsForm('naabu-form', 'naabu-result', 'naabu 参数已保存并生效。');
 bindSettingsForm('fscan-form', 'fscan-result', 'fscan / 域名配置已保存并生效。');
+bindSettingsForm('log-form', 'log-result', '日志级别已保存并热生效。');
 bindSettingsForm('ai-form', 'ai-result', 'AI 分析配置已保存并生效。');
 
 document.getElementById('network-form').addEventListener('submit', async (e) => {

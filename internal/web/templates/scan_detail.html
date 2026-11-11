@@ -7,6 +7,9 @@
     <button id="resume-btn" class="btn primary" type="button" onclick="controlScan('resume')" {{if ne .Scan.Status "paused"}}style="display:none"{{end}}>恢复扫描</button>
     <button id="stop-btn" class="btn danger" type="button" onclick="controlScan('stop')">终止扫描</button>
     {{end}}
+    {{if and (ne .Role "viewer") .CanResume}}
+    <button id="resume-unfinished-btn" class="btn primary" type="button" onclick="resumeUnfinished()" title="对本次执行未完成的目标发起增量续扫（保留已完成结果）">继续扫描{{if gt .UnfinishedCount 0}}（{{.UnfinishedCount}}）{{end}}</button>
+    {{end}}
     {{if and (ne .Role "viewer") (not .Running) (or (eq .Scan.Status "running") (eq .Scan.Status "paused"))}}
     <button class="btn" type="button" onclick="resyncScan()" title="服务重启或进程异常退出后，手动把悬空的运行中/暂停状态修正为已终止">重新同步状态</button>
     {{end}}
@@ -24,8 +27,9 @@
     <div><div class="muted">结束时间</div><strong id="finished-at">{{if .Scan.FinishedAt}}{{fmtTime .Scan.FinishedAt}}{{else}}尚未结束{{end}}</strong></div>
     <div><div class="muted">已保存开放端口</div><strong id="open-ports">{{.Scan.OpenPorts}}</strong></div>
     <div><div class="muted">实时连接</div><strong id="live-state" class="muted">{{if .Running}}每 2 秒更新{{else}}执行已结束{{end}}</strong></div>
+    {{if .Scan.UDPEnabled}}<div><div class="muted">UDP</div><strong><span class="pill ok">已启用 UDP 端口扫描</span></strong></div>{{end}}
   </div>
-  <div id="scan-error" class="error-banner" style="margin-top:16px;{{if not .Scan.Err}}display:none{{end}}"><strong>执行说明 / 异常详情</strong><br><span id="scan-error-text">{{.Scan.Err}}</span></div>
+  <div id="scan-error" class="error-banner" style="margin-top:16px;{{if not .Scan.Err}}display:none{{end}}"><strong>执行说明 / 异常详情</strong><br><span id="scan-error-text" style="white-space:pre-wrap">{{.Scan.Err}}</span></div>
   {{if .CapacityRejected}}
   <div id="capacity-banner" class="error-banner" style="margin-top:16px">
     <strong>容量预检拒绝，本次执行未启动（原始错误完整保留如下，未被吞并）</strong>
@@ -80,7 +84,7 @@
 </div>
 <script>
 async function resumeUnfinished() {
-  if (!confirm('将对本次执行中未完成的目标发起增量续扫（保留已完成结果），是否继续？')) return;
+  if (!(await appConfirm('将对本次执行中未完成的目标发起增量续扫（保留已完成结果），是否继续？', {title: '增量续扫', okText: '开始续扫'}))) return;
   const res = await postEmpty('/api/scans/{{.Scan.ID}}/resume');
   if (res.ok) { toast('已发起续扫，跳转到新执行', 'ok'); setTimeout(() => location.href = '/scans/' + res.json.scan_id, 600); }
   else toast(res.json.error || '续扫发起失败', 'err');
@@ -332,7 +336,7 @@ async function refreshLive() {
   }
 }
 async function controlScan(action) {
-  if (action === 'stop' && !confirm('确定终止当前扫描？naabu 进程会被停止，已发现的结果保留，但不会生成端口风险告警。')) return;
+  if (action === 'stop' && !(await appConfirm('确定终止当前扫描？naabu 进程会被停止，已发现的结果保留，但不会生成端口风险告警。', {title: '终止扫描', danger: true, okText: '终止'}))) return;
   const buttons = ['pause-btn','resume-btn','stop-btn'].map(id => document.getElementById(id)).filter(Boolean);
   buttons.forEach(button => button.disabled = true);
   const res = await postEmpty(`/api/scans/${scanID}/${action}`);
@@ -342,7 +346,7 @@ async function controlScan(action) {
 }
 // resyncScan 手动修正悬空状态：服务重启或进程异常退出后，执行可能仍显示运行中/暂停。
 async function resyncScan() {
-  if (!confirm('该执行的扫描进程可能已随服务重启或异常退出而消失。确认将状态手动同步为「已终止」？已入库结果会保留。')) return;
+  if (!(await appConfirm('该执行的扫描进程可能已随服务重启或异常退出而消失。确认将状态手动同步为「已终止」？已入库结果会保留。', {title: '重新同步状态', okText: '同步为已终止'}))) return;
   const res = await postEmpty(`/api/scans/${scanID}/resync`);
   toast(res.ok ? '状态已同步' : (res.json.error || '同步失败'), res.ok ? 'ok' : 'err');
   if (res.ok) setTimeout(() => location.reload(), 600);

@@ -64,6 +64,8 @@ type Scan struct {
 	SplitCompleted int  `json:"split_completed"` // 已完成子任务数
 	// ResumeOf 指向被续扫的父执行 ID（0 表示非续扫）。
 	ResumeOf int64 `json:"resume_of"`
+	// UDPEnabled 记录本次执行是否启用 UDP 端口扫描（任务级快照，可追溯）。
+	UDPEnabled bool `json:"udp_enabled"`
 }
 
 // ScanResultRow 是带执行来源的端口结果，供跨任务查询和按扫描模式区分。
@@ -143,6 +145,7 @@ type ScanTask struct {
 	Name         string
 	Mode         string
 	Engine       string // naabu | fscan | mixed；空值归一为 naabu（向后兼容）
+	Protocol     string // 扫描协议：tcp | udp | both；空值归一为 tcp（覆盖全局 scan_udp 默认值）
 	CustomPorts  string // mode==custom 时的端口规格，如 22,80,443,8000-9000
 	TargetType   string // all | tag | manual
 	TargetTag    string
@@ -155,6 +158,24 @@ type ScanTask struct {
 	Weekday      int // weekly 时生效，0=周日
 	CreatedAt    string
 	LastRun      string
+}
+
+// WantsTCP 报告任务是否扫描 TCP（protocol 为 tcp/both 时为真；udp 为假）。
+func (t ScanTask) WantsTCP() bool { return t.Protocol != "udp" }
+
+// WantsUDP 报告任务是否扫描 UDP（protocol 为 udp/both 时为真）。
+func (t ScanTask) WantsUDP() bool { return t.Protocol == "udp" || t.Protocol == "both" }
+
+// NormalizeProtocol 把任意输入归一为 tcp/udp/both（非法或空值归为 tcp），供 web 层解析表单复用。
+func NormalizeProtocol(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "udp":
+		return "udp"
+	case "both", "tcp+udp", "all":
+		return "both"
+	default:
+		return "tcp"
+	}
 }
 
 // User 后台账号（密码以 PBKDF2-SHA256 加盐哈希存储）
@@ -190,6 +211,8 @@ type WLEntry struct {
 	Owner     string
 	Remark    string
 	Business  string
+	Reason    string // 加白原因（暴露面加白时必填），与备注分开存储
+	Source    string // 来源：manual / auto_match / baseline 等，供审计
 	CreatedAt string
 }
 
@@ -208,6 +231,8 @@ type Alert struct {
 	Handler     string
 	HandleNote  string
 	HandledAt   string
+	Kind        string // port（端口暴露）| unreachable（网络不可达）；旧库默认 port
+	Reason      string // 不可达原因（DNS 解析失败/连接超时等），端口告警为空
 }
 
 type Schedule struct {
@@ -260,10 +285,10 @@ func Open(path string) (*Store, error) {
 CREATE TABLE IF NOT EXISTS targets (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL UNIQUE, kind TEXT DEFAULT 'ip', tags TEXT DEFAULT '', source TEXT DEFAULT '', created_at TEXT, domain TEXT DEFAULT '', owner TEXT DEFAULT '', security_device TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER DEFAULT 0, name TEXT DEFAULT '', mode TEXT, status TEXT, started_at TEXT, finished_at TEXT, open_ports INTEGER DEFAULT 0, error TEXT DEFAULT '', target_count INTEGER DEFAULT 0, command TEXT DEFAULT '', result_count INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS scan_results (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', status INTEGER DEFAULT 1, UNIQUE(scan_id, ip, port, proto));
-CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, ip_spec TEXT, port_spec TEXT, proto TEXT DEFAULT '*', service TEXT DEFAULT '', owner TEXT DEFAULT '', remark TEXT DEFAULT '', business TEXT DEFAULT '', created_at TEXT);
-CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', in_scope INTEGER DEFAULT 1, status TEXT DEFAULT 'new', first_seen_at TEXT, last_seen_at TEXT, sent_feishu INTEGER DEFAULT 0, created_at TEXT, handler TEXT DEFAULT '', handle_note TEXT DEFAULT '', handled_at TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, ip_spec TEXT, port_spec TEXT, proto TEXT DEFAULT '*', service TEXT DEFAULT '', owner TEXT DEFAULT '', remark TEXT DEFAULT '', business TEXT DEFAULT '', reason TEXT DEFAULT '', created_at TEXT);
+CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', in_scope INTEGER DEFAULT 1, status TEXT DEFAULT 'new', first_seen_at TEXT, last_seen_at TEXT, sent_feishu INTEGER DEFAULT 0, created_at TEXT, handler TEXT DEFAULT '', handle_note TEXT DEFAULT '', handled_at TEXT DEFAULT '', kind TEXT DEFAULT 'port', reason TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, mode TEXT, sched_type TEXT, hour INTEGER, minute INTEGER, weekday INTEGER DEFAULT -1, enabled INTEGER DEFAULT 1, last_run TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', mode TEXT DEFAULT 'top', engine TEXT DEFAULT 'naabu', custom_ports TEXT DEFAULT '', target_type TEXT DEFAULT 'all', target_tag TEXT DEFAULT '', ips TEXT DEFAULT '', add_to_ledger INTEGER DEFAULT 0, sched_enabled INTEGER DEFAULT 0, sched_type TEXT DEFAULT 'daily', hour INTEGER DEFAULT 2, minute INTEGER DEFAULT 0, weekday INTEGER DEFAULT -1, created_at TEXT DEFAULT '', last_run TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS scan_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', mode TEXT DEFAULT 'top', engine TEXT DEFAULT 'naabu', protocol TEXT DEFAULT 'tcp', custom_ports TEXT DEFAULT '', target_type TEXT DEFAULT 'all', target_tag TEXT DEFAULT '', ips TEXT DEFAULT '', add_to_ledger INTEGER DEFAULT 0, sched_enabled INTEGER DEFAULT 0, sched_type TEXT DEFAULT 'daily', hour INTEGER DEFAULT 2, minute INTEGER DEFAULT 0, weekday INTEGER DEFAULT -1, created_at TEXT DEFAULT '', last_run TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, pass_hash TEXT NOT NULL, role TEXT DEFAULT 'operator', display_name TEXT DEFAULT '', enabled INTEGER DEFAULT 1, created_at TEXT DEFAULT '', last_login TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT DEFAULT '', username TEXT DEFAULT '', role TEXT DEFAULT '', action TEXT DEFAULT '', target TEXT DEFAULT '', detail TEXT DEFAULT '', ip TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT DEFAULT '');
@@ -275,11 +300,14 @@ CREATE TABLE IF NOT EXISTS scan_sub_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS scan_target_status (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL, spec_raw TEXT NOT NULL, spec_kind TEXT DEFAULT 'ip', batch_index INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', updated_at TEXT DEFAULT '', UNIQUE(scan_id, spec_raw));
 CREATE TABLE IF NOT EXISTS scan_vulns (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL, ip TEXT, port INTEGER, proto TEXT DEFAULT 'tcp', service TEXT DEFAULT '', vuln TEXT, severity TEXT DEFAULT 'mid', UNIQUE(scan_id, ip, port, proto, vuln));
 CREATE TABLE IF NOT EXISTS domain_map (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT, ip TEXT, source TEXT DEFAULT 'domain_resolver', created_at TEXT, UNIQUE(domain, ip));
+CREATE TABLE IF NOT EXISTS scan_unreachable (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL, target TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT, UNIQUE(scan_id, target));
 CREATE INDEX IF NOT EXISTS idx_results_scan ON scan_results(scan_id);
 CREATE INDEX IF NOT EXISTS idx_results_scan_id ON scan_results(scan_id, id);
 CREATE INDEX IF NOT EXISTS idx_scan_events_scan ON scan_events(scan_id, id);
 CREATE INDEX IF NOT EXISTS idx_results_exposure ON scan_results(ip, port, proto, status);
 CREATE INDEX IF NOT EXISTS idx_alerts_key ON alerts(ip, port, proto);
+CREATE INDEX IF NOT EXISTS idx_alerts_kind ON alerts(kind, status);
+CREATE INDEX IF NOT EXISTS idx_unreachable_scan ON scan_unreachable(scan_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_files ON analysis_files(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_edges ON analysis_edges(analysis_id);
 `
@@ -320,10 +348,36 @@ CREATE INDEX IF NOT EXISTS idx_analysis_edges ON analysis_edges(analysis_id);
 		`ALTER TABLE scan_sub_tasks ADD COLUMN sub_scan_id INTEGER DEFAULT 0`,
 		`ALTER TABLE scan_tasks ADD COLUMN engine TEXT DEFAULT 'naabu'`,
 		`ALTER TABLE scans ADD COLUMN resume_of INTEGER DEFAULT 0`,
+		`ALTER TABLE scan_tasks ADD COLUMN udp INTEGER DEFAULT 0`,
+		`ALTER TABLE scans ADD COLUMN udp_enabled INTEGER DEFAULT 0`,
+		`ALTER TABLE whitelist ADD COLUMN source TEXT DEFAULT ''`,
+		`ALTER TABLE alerts ADD COLUMN kind TEXT DEFAULT 'port'`,
+		`ALTER TABLE alerts ADD COLUMN reason TEXT DEFAULT ''`,
+		`ALTER TABLE scan_tasks ADD COLUMN protocol TEXT DEFAULT 'tcp'`,
+		`ALTER TABLE whitelist ADD COLUMN reason TEXT DEFAULT ''`,
 	} {
 		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			log.Printf("schema 迁移忽略: %v", err)
 		}
+	}
+	// protocol 列回填：旧库新增列后存量行默认为 'tcp'，需把遗留 udp=1 的任务升级为 'both'
+	// （旧语义：勾选 UDP = TCP+UDP 同扫）。幂等：protocol='udp' 的行不被误改（WHERE 限定 'tcp'）。
+	if _, err := db.Exec(`UPDATE scan_tasks SET protocol='both' WHERE COALESCE(udp,0)=1 AND COALESCE(protocol,'tcp')='tcp'`); err != nil {
+		log.Printf("scan_tasks.protocol 迁移忽略: %v", err)
+	}
+	// 存量台账归一化合并：把历史非规范形态（未掩码 CIDR/大写域名等）合并到唯一键，
+	// 与新增导入的去重语义保持一致；失败只记日志不阻断启动。
+	if merged, err := normalizeExistingTargets(db); err != nil {
+		log.Printf("台账归一化迁移失败（不影响启动）: %v", err)
+	} else if merged > 0 {
+		log.Printf("台账归一化迁移：合并/改写 %d 条重复或非规范资产", merged)
+	}
+	// 白名单规则归一化去重并建立唯一索引：使历史重复规则合并、并为并发/重复写入提供
+	// 数据库层幂等保证（与 AddWhitelist 的 INSERT OR IGNORE 语义一致）；失败只记日志不阻断启动。
+	if changed, err := normalizeAndDedupeWhitelist(db); err != nil {
+		log.Printf("白名单去重索引迁移失败（不影响启动）: %v", err)
+	} else if changed > 0 {
+		log.Printf("白名单去重迁移：归一化/删除 %d 条重复或非规范规则", changed)
 	}
 	return &Store{db: db}, nil
 }
@@ -340,38 +394,63 @@ func b2i(b bool) int {
 // ---------- targets ----------
 // ImportAssets 导入一批资产；batchTag 非空时作为本批标签（已存在的资产会并入该标签）。
 // 域名资产（Kind==domain）同时写入独立的 domain 列；owner/security_device 仅在新增时写入，
-// 重复导入不覆盖已有维护信息。返回真正新增的数量（INSERT OR IGNORE 忽略的重复项不计）。
+// 重复导入不覆盖已有维护信息。返回真正新增的数量（重复项不计）。
 func (s *Store) ImportAssets(rows []ImportAsset, batchTag, source string) (int, error) {
+	added, _, err := s.ImportAssetsDetailed(rows, batchTag, source)
+	return added, err
+}
+
+// ImportAssetsDetailed 在 ImportAssets 基础上额外返回跳过数量（批内重复 + 库内已存在），
+// 供导入回显「新增/跳过/非法」透明化展示。所有规格先经 NormalizeTargetSpec 归一化：
+// 等价 CIDR（10.0.0.5/24 与 10.0.0.0/24）、大小写/尾点域名、IPv4 映射 IPv6 均视为同一资产；
+// 数据库层 targets.ip 的 UNIQUE 约束保证并发写入也不会产生重复行。
+func (s *Store) ImportAssetsDetailed(rows []ImportAsset, batchTag, source string) (int, int, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer tx.Rollback()
 	batchTag = strings.TrimSpace(batchTag)
-	n := 0
+	added, skipped := 0, 0
+	seen := map[string]bool{}
 	for _, row := range rows {
+		raw := row.Raw
+		if norm, _ := NormalizeTargetSpec(raw); norm != "" {
+			raw = norm
+		}
+		if seen[raw] {
+			skipped++
+			continue
+		}
+		seen[raw] = true
 		domain := ""
 		if row.Kind == "domain" {
-			domain = row.Raw
+			domain = raw
 		}
 		res, err := tx.Exec(`INSERT OR IGNORE INTO targets(ip, kind, tags, source, created_at, domain, owner, security_device) VALUES(?,?,?,?,?,?,?,?)`,
-			row.Raw, row.Kind, batchTag, source, now(), domain, strings.TrimSpace(row.Owner), strings.TrimSpace(row.SecurityDevice))
+			raw, row.Kind, batchTag, source, now(), domain, strings.TrimSpace(row.Owner), strings.TrimSpace(row.SecurityDevice))
 		if err != nil {
-			return 0, err
+			return added, skipped, err
 		}
 		if aff, _ := res.RowsAffected(); aff > 0 {
-			n++
-		} else if batchTag != "" {
-			var existing string
-			_ = tx.QueryRow(`SELECT COALESCE(tags,'') FROM targets WHERE ip=?`, row.Raw).Scan(&existing)
-			if merged := mergeTags(existing, batchTag); merged != existing {
-				if _, err := tx.Exec(`UPDATE targets SET tags=? WHERE ip=?`, merged, row.Raw); err != nil {
-					return 0, err
+			added++
+		} else {
+			skipped++
+			if batchTag != "" {
+				var existing string
+				_ = tx.QueryRow(`SELECT COALESCE(tags,'') FROM targets WHERE ip=?`, raw).Scan(&existing)
+				if merged := mergeTags(existing, batchTag); merged != existing {
+					if _, err := tx.Exec(`UPDATE targets SET tags=? WHERE ip=?`, merged, raw); err != nil {
+						return added, skipped, err
+					}
 				}
 			}
 		}
 	}
-	return n, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return added, skipped, err
+	}
+	return added, skipped, nil
 }
 
 // ImportTargets 兼容旧调用（如扫描任务手工目标入台账）：仅目标规格，无维护信息。
@@ -761,6 +840,8 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 	args := make([]interface{}, 0)
 	if status == "active" {
 		where = append(where, "status IN ('running','paused')")
+	} else if status == "resumable" {
+		where = append(where, "status IN ('stopped','partial')")
 	} else if status != "" {
 		where = append(where, "status=?")
 		args = append(args, status)
@@ -782,7 +863,7 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
 		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0),
-		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0), COALESCE(resume_of,0)
+		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0), COALESCE(resume_of,0), COALESCE(udp_enabled,0)
 		FROM scans WHERE ` + strings.Join(where, " AND ") + ` ORDER BY id DESC`
 	if limit > 0 {
 		sqlText += " LIMIT ?"
@@ -799,7 +880,7 @@ func (s *Store) ScansFiltered(status, query, mode string, taskID int64, limit in
 		if err := rows.Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
 			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount,
-			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted, &sc.ResumeOf); err != nil {
+			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted, &sc.ResumeOf, &sc.UDPEnabled); err != nil {
 			return nil, err
 		}
 		out = append(out, sc)
@@ -814,11 +895,11 @@ func (s *Store) Scan(id int64) (*Scan, error) {
 		COALESCE(finished_at,''), COALESCE(open_ports,0), COALESCE(error,''), COALESCE(target_count,0),
 		COALESCE(processed_targets,0), COALESCE(failed_targets,0), COALESCE(current_batch,0), COALESCE(total_batches,0), COALESCE(command,''),
 		COALESCE(cpu_percent,0), COALESCE(memory_rss,0), COALESCE(max_cpu_percent,0), COALESCE(max_memory_rss,0), COALESCE(result_count,0),
-		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0), COALESCE(resume_of,0) FROM scans WHERE id=?`, id).
+		COALESCE(is_split_task,0), COALESCE(split_total,0), COALESCE(split_completed,0), COALESCE(resume_of,0), COALESCE(udp_enabled,0) FROM scans WHERE id=?`, id).
 		Scan(&sc.ID, &sc.TaskID, &sc.Name, &sc.Mode, &sc.Status, &sc.StartedAt, &sc.FinishedAt, &sc.OpenPorts, &sc.Err,
 			&sc.TargetCount, &sc.ProcessedTargets, &sc.FailedTargets, &sc.CurrentBatch, &sc.TotalBatches, &sc.Command,
 			&sc.CPUPercent, &sc.MemoryRSS, &sc.MaxCPUPercent, &sc.MaxMemoryRSS, &sc.ResultCount,
-			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted, &sc.ResumeOf)
+			&sc.IsSplitTask, &sc.SplitTotal, &sc.SplitCompleted, &sc.ResumeOf, &sc.UDPEnabled)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -840,6 +921,25 @@ func (s *Store) LatestDoneScan() (int64, error) {
 	var id int64
 	err := s.db.QueryRow(`SELECT id FROM scans WHERE status='done' ORDER BY id DESC LIMIT 1`).Scan(&id)
 	return id, err
+}
+
+// LatestResumableScan 返回最近一次「可续扫」的执行（状态为 stopped/partial 且仍有未完成目标规格）。
+// 供任务页「继续扫描」入口使用；无此类执行时返回 nil。running/paused 属活跃执行，由实时面板处理，不在此列。
+// 重启自愈的 stopped 执行无 scan_target_status 记录、无法续扫，故此处以未完成目标数>0 为门控，避免入口指向无法续扫的详情页。
+func (s *Store) LatestResumableScan() (*Scan, error) {
+	scans, err := s.ScansFiltered("resumable", "", "", 0, 1)
+	if err != nil || len(scans) == 0 {
+		return nil, err
+	}
+	sc := scans[0]
+	_, pending, running, failed, cerr := s.TargetStatusCounts(sc.ID)
+	if cerr != nil {
+		return nil, cerr
+	}
+	if pending+running+failed == 0 {
+		return nil, nil // 无未完成目标（如重启自愈），不提供续扫入口
+	}
+	return &sc, nil
 }
 
 func (s *Store) CountScans() (int, error) {
@@ -974,17 +1074,52 @@ func (s *Store) CountExposures() (int, error) {
 }
 
 // ---------- whitelist ----------
+
+// AddWhitelist 写入一条白名单规则。入库前对匹配键三字段（IP/端口/协议）按
+// normalizeWhitelistRule 归一化（去空白+小写），使写入形态与 UNIQUE(ip_spec,port_spec,proto)
+// 索引及导入去重键完全一致；命中相同规则时由 INSERT OR IGNORE 幂等忽略（不报错、不新增）。
+// 返回新增行 id；若为重复规则被忽略则返回 0（并发/重试下调用方可据此判断实际是否新增）。
 func (s *Store) AddWhitelist(e WLEntry) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO whitelist(ip_spec, port_spec, proto, service, owner, remark, business, created_at) VALUES(?,?,?,?,?,?,?,?)`,
-		e.IPSpec, e.PortSpec, e.Proto, e.Service, e.Owner, e.Remark, e.Business, now())
+	ipSpec, portSpec, proto := normalizeWhitelistRule(e.IPSpec, e.PortSpec, e.Proto)
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO whitelist(ip_spec, port_spec, proto, service, owner, remark, business, reason, source, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		ipSpec, portSpec, proto, e.Service, e.Owner, e.Remark, e.Business, e.Reason, e.Source, now())
 	if err != nil {
 		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return 0, nil // 相同规则已存在，幂等忽略
 	}
 	return res.LastInsertId()
 }
 
+// UpdateWhitelistRemark 仅更新白名单条目的备注（不改动 IP/端口/协议匹配规则），
+// 供列表行内编辑；条目不存在时返回错误。
+func (s *Store) UpdateWhitelistRemark(id int64, remark string) error {
+	res, err := s.db.Exec(`UPDATE whitelist SET remark=? WHERE id=?`, strings.TrimSpace(remark), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("白名单条目不存在")
+	}
+	return nil
+}
+
+// UpdateWhitelistNote 同时更新白名单条目的「原因」与「备注」（不改动 IP/端口/协议匹配规则），
+// 供列表行内编辑；条目不存在时返回错误。
+func (s *Store) UpdateWhitelistNote(id int64, reason, remark string) error {
+	res, err := s.db.Exec(`UPDATE whitelist SET reason=?, remark=? WHERE id=?`, strings.TrimSpace(reason), strings.TrimSpace(remark), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("白名单条目不存在")
+	}
+	return nil
+}
+
 func (s *Store) Whitelist() ([]WLEntry, error) {
-	rows, err := s.db.Query(`SELECT id, ip_spec, port_spec, proto, service, owner, remark, COALESCE(business,''), created_at FROM whitelist ORDER BY id DESC`)
+	rows, err := s.db.Query(`SELECT id, ip_spec, port_spec, proto, service, owner, remark, COALESCE(business,''), COALESCE(reason,''), COALESCE(source,''), created_at FROM whitelist ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -992,7 +1127,7 @@ func (s *Store) Whitelist() ([]WLEntry, error) {
 	var out []WLEntry
 	for rows.Next() {
 		var e WLEntry
-		if err := rows.Scan(&e.ID, &e.IPSpec, &e.PortSpec, &e.Proto, &e.Service, &e.Owner, &e.Remark, &e.Business, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.IPSpec, &e.PortSpec, &e.Proto, &e.Service, &e.Owner, &e.Remark, &e.Business, &e.Reason, &e.Source, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -1003,6 +1138,30 @@ func (s *Store) Whitelist() ([]WLEntry, error) {
 func (s *Store) DeleteWhitelist(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM whitelist WHERE id=?`, id)
 	return err
+}
+
+// WhitelistRuleKey 白名单匹配规则的唯一键（IP/网段 + 端口 + 协议，去空白与小写）。
+// 仅用于导入去重判定：只有完全相同的规则才算重复，不做 CIDR 语义覆盖判断。
+func WhitelistRuleKey(ipSpec, portSpec, proto string) string {
+	return strings.ToLower(strings.TrimSpace(ipSpec)) + "|" + strings.ToLower(strings.TrimSpace(portSpec)) + "|" + strings.ToLower(strings.TrimSpace(proto))
+}
+
+// WhitelistRuleSet 返回库中现有白名单规则键集合，供批量导入跳过已存在的相同规则。
+func (s *Store) WhitelistRuleSet() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT ip_spec, port_spec, proto FROM whitelist`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var ipSpec, portSpec, proto string
+		if err := rows.Scan(&ipSpec, &portSpec, &proto); err != nil {
+			return nil, err
+		}
+		out[WhitelistRuleKey(ipSpec, portSpec, proto)] = true
+	}
+	return out, rows.Err()
 }
 
 // ---------- alerts ----------
@@ -1019,8 +1178,8 @@ func (s *Store) alertBy(condition string, args ...interface{}) (*Alert, error) {
 	var inScope, sent int
 	err := s.db.QueryRow(`SELECT id, ip, port, proto, COALESCE(service,''), in_scope, COALESCE(status,'new'),
 		COALESCE(first_seen_at,''), COALESCE(last_seen_at,''), sent_feishu, COALESCE(created_at,''),
-		COALESCE(handler,''), COALESCE(handle_note,''), COALESCE(handled_at,'') FROM alerts WHERE `+condition, args...).
-		Scan(&a.ID, &a.IP, &a.Port, &a.Proto, &a.Service, &inScope, &a.Status, &a.FirstSeenAt, &a.LastSeenAt, &sent, &a.CreatedAt, &a.Handler, &a.HandleNote, &a.HandledAt)
+		COALESCE(handler,''), COALESCE(handle_note,''), COALESCE(handled_at,''), COALESCE(kind,'port'), COALESCE(reason,'') FROM alerts WHERE `+condition, args...).
+		Scan(&a.ID, &a.IP, &a.Port, &a.Proto, &a.Service, &inScope, &a.Status, &a.FirstSeenAt, &a.LastSeenAt, &sent, &a.CreatedAt, &a.Handler, &a.HandleNote, &a.HandledAt, &a.Kind, &a.Reason)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1056,19 +1215,30 @@ func (s *Store) Alerts(limit int) ([]Alert, error) {
 }
 
 func (s *Store) AlertsFiltered(status, query string, limit int) ([]Alert, error) {
+	return s.AlertsFilteredKind(status, query, "", limit)
+}
+
+// AlertsFilteredKind 在状态/关键词筛选基础上增加告警类型维度：
+// kind=port 仅端口暴露告警，kind=unreachable 仅网络不可达告警，空为全部。
+func (s *Store) AlertsFilteredKind(status, query, kind string, limit int) ([]Alert, error) {
 	where := []string{"1=1"}
 	args := make([]interface{}, 0)
 	if status != "" {
 		where = append(where, "status=?")
 		args = append(args, status)
 	}
+	if kind == "port" {
+		where = append(where, "COALESCE(kind,'port')='port'")
+	} else if kind == "unreachable" {
+		where = append(where, "kind='unreachable'")
+	}
 	if query = strings.TrimSpace(query); query != "" {
-		where = append(where, "(ip LIKE ? OR service LIKE ? OR CAST(port AS TEXT) LIKE ? OR handle_note LIKE ? OR handler LIKE ?)")
+		where = append(where, "(ip LIKE ? OR service LIKE ? OR CAST(port AS TEXT) LIKE ? OR handle_note LIKE ? OR handler LIKE ? OR reason LIKE ?)")
 		like := "%" + query + "%"
-		args = append(args, like, like, like, like, like)
+		args = append(args, like, like, like, like, like, like)
 	}
 	sqlText := `SELECT id, ip, port, proto, service, in_scope, status, first_seen_at, last_seen_at, sent_feishu, created_at,
-		COALESCE(handler,''), COALESCE(handle_note,''), COALESCE(handled_at,'') FROM alerts
+		COALESCE(handler,''), COALESCE(handle_note,''), COALESCE(handled_at,''), COALESCE(kind,'port'), COALESCE(reason,'') FROM alerts
 		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY id DESC`
 	if limit > 0 {
 		sqlText += " LIMIT ?"
@@ -1083,7 +1253,7 @@ func (s *Store) AlertsFiltered(status, query string, limit int) ([]Alert, error)
 	for rows.Next() {
 		var a Alert
 		var inScope, sent int
-		if err := rows.Scan(&a.ID, &a.IP, &a.Port, &a.Proto, &a.Service, &inScope, &a.Status, &a.FirstSeenAt, &a.LastSeenAt, &sent, &a.CreatedAt, &a.Handler, &a.HandleNote, &a.HandledAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.IP, &a.Port, &a.Proto, &a.Service, &inScope, &a.Status, &a.FirstSeenAt, &a.LastSeenAt, &sent, &a.CreatedAt, &a.Handler, &a.HandleNote, &a.HandledAt, &a.Kind, &a.Reason); err != nil {
 			return nil, err
 		}
 		a.InScope = inScope == 1
@@ -1192,6 +1362,7 @@ func (s *Store) MarkScheduleRun(id int64) error {
 func normalizeScanTask(t ScanTask) ScanTask {
 	t.TargetTag = strings.TrimSpace(t.TargetTag)
 	t.CustomPorts = strings.TrimSpace(t.CustomPorts)
+	t.Protocol = NormalizeProtocol(t.Protocol)
 	if t.Engine != "fscan" && t.Engine != "fscan-vuln" && t.Engine != "fscan-mixed" && t.Engine != "mixed" {
 		t.Engine = "naabu"
 	}
@@ -1219,8 +1390,9 @@ func normalizeScanTask(t ScanTask) ScanTask {
 
 func (s *Store) CreateScanTask(t ScanTask) (int64, error) {
 	t = normalizeScanTask(t)
-	res, err := s.db.Exec(`INSERT INTO scan_tasks(name, mode, engine, custom_ports, target_type, target_tag, ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		t.Name, t.Mode, t.Engine, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, now())
+	// udp 列与 protocol 保持同步写入（udp = protocol 含 UDP），既供旧迁移读取，也避免两列发散。
+	res, err := s.db.Exec(`INSERT INTO scan_tasks(name, mode, engine, udp, protocol, custom_ports, target_type, target_tag, ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		t.Name, t.Mode, t.Engine, b2i(t.WantsUDP()), t.Protocol, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, now())
 	if err != nil {
 		return 0, err
 	}
@@ -1229,13 +1401,13 @@ func (s *Store) CreateScanTask(t ScanTask) (int64, error) {
 
 func (s *Store) UpdateScanTask(t ScanTask) error {
 	t = normalizeScanTask(t)
-	_, err := s.db.Exec(`UPDATE scan_tasks SET name=?, mode=?, engine=?, custom_ports=?, target_type=?, target_tag=?, ips=?, add_to_ledger=?, sched_enabled=?, sched_type=?, hour=?, minute=?, weekday=? WHERE id=?`,
-		t.Name, t.Mode, t.Engine, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, t.ID)
+	_, err := s.db.Exec(`UPDATE scan_tasks SET name=?, mode=?, engine=?, udp=?, protocol=?, custom_ports=?, target_type=?, target_tag=?, ips=?, add_to_ledger=?, sched_enabled=?, sched_type=?, hour=?, minute=?, weekday=? WHERE id=?`,
+		t.Name, t.Mode, t.Engine, b2i(t.WantsUDP()), t.Protocol, t.CustomPorts, t.TargetType, t.TargetTag, t.IPs, b2i(t.AddToLedger), b2i(t.SchedEnabled), t.SchedType, t.Hour, t.Minute, t.Weekday, t.ID)
 	return err
 }
 
 func (s *Store) ScanTasks() ([]ScanTask, error) {
-	rows, err := s.db.Query(`SELECT id, name, mode, COALESCE(engine,'naabu'), COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks ORDER BY id DESC`)
+	rows, err := s.db.Query(`SELECT id, name, mode, COALESCE(engine,'naabu'), COALESCE(udp,0), COALESCE(protocol,''), COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1243,12 +1415,18 @@ func (s *Store) ScanTasks() ([]ScanTask, error) {
 	var out []ScanTask
 	for rows.Next() {
 		var t ScanTask
-		var atl, se int
-		if err := rows.Scan(&t.ID, &t.Name, &t.Mode, &t.Engine, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun); err != nil {
+		var atl, se, udp int
+		if err := rows.Scan(&t.ID, &t.Name, &t.Mode, &t.Engine, &udp, &t.Protocol, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun); err != nil {
 			return nil, err
 		}
 		t.AddToLedger = atl == 1
 		t.SchedEnabled = se == 1
+		if strings.TrimSpace(t.Protocol) == "" {
+			// 旧库尚未回填 protocol 列：按遗留 udp 快照推导（udp=1 为 TCP+UDP）。
+			if udp == 1 {
+				t.Protocol = "both"
+			}
+		}
 		out = append(out, normalizeScanTask(t))
 	}
 	return out, rows.Err()
@@ -1256,9 +1434,9 @@ func (s *Store) ScanTasks() ([]ScanTask, error) {
 
 func (s *Store) ScanTask(id int64) (*ScanTask, error) {
 	var t ScanTask
-	var atl, se int
-	err := s.db.QueryRow(`SELECT id, name, mode, COALESCE(engine,'naabu'), COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks WHERE id=?`, id).
-		Scan(&t.ID, &t.Name, &t.Mode, &t.Engine, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun)
+	var atl, se, udp int
+	err := s.db.QueryRow(`SELECT id, name, mode, COALESCE(engine,'naabu'), COALESCE(udp,0), COALESCE(protocol,''), COALESCE(custom_ports,''), COALESCE(target_type,''), COALESCE(target_tag,''), ips, add_to_ledger, sched_enabled, sched_type, hour, minute, weekday, COALESCE(created_at,''), COALESCE(last_run,'') FROM scan_tasks WHERE id=?`, id).
+		Scan(&t.ID, &t.Name, &t.Mode, &t.Engine, &udp, &t.Protocol, &t.CustomPorts, &t.TargetType, &t.TargetTag, &t.IPs, &atl, &se, &t.SchedType, &t.Hour, &t.Minute, &t.Weekday, &t.CreatedAt, &t.LastRun)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1267,6 +1445,9 @@ func (s *Store) ScanTask(id int64) (*ScanTask, error) {
 	}
 	t.AddToLedger = atl == 1
 	t.SchedEnabled = se == 1
+	if strings.TrimSpace(t.Protocol) == "" && udp == 1 {
+		t.Protocol = "both"
+	}
 	t = normalizeScanTask(t)
 	return &t, nil
 }
@@ -1471,8 +1652,31 @@ func (s *Store) AuditLogs(limit int) ([]AuditLog, error) {
 
 // AuditLogsFiltered 按关键词（操作/对象/详情/来源IP）与用户名筛选审计流水；limit<=0 时默认 5000 条。
 func (s *Store) AuditLogsFiltered(query, username string, limit int) ([]AuditLog, error) {
+	return s.AuditLogsAdvanced(query, username, "", "", "", limit)
+}
+
+// auditTypePatterns 对象类型枚举→操作关键词映射，供审计筛选。
+var auditTypePatterns = map[string][]string{
+	"登录":   {"登录"},
+	"导入资产": {"导入资产", "新增资产"},
+	"删除资产": {"删除资产", "删除台账", "清空资产"},
+	"创建任务": {"创建任务", "新建任务", "修改任务"},
+	"启动扫描": {"启动扫描", "运行任务", "续扫"},
+	"暂停":   {"暂停"},
+	"恢复":   {"恢复"},
+	"终止":   {"终止"},
+	"加白":   {"加白", "白名单"},
+	"批量处置": {"批量处置", "批量"},
+	"改密":   {"密码"},
+	"账号管理": {"账号"},
+	"系统设置": {"设置", "配置"},
+}
+
+// AuditLogsAdvanced 在关键词/用户名基础上增加对象类型与时间范围组合查询。
+// actionType 为空不限；"其他" 表示不匹配任何已知类型；from/to 为日期或 RFC3339。
+func (s *Store) AuditLogsAdvanced(query, username, actionType, from, to string, limit int) ([]AuditLog, error) {
 	where := []string{"1=1"}
-	args := make([]interface{}, 0, 5)
+	args := make([]interface{}, 0, 8)
 	if query = strings.TrimSpace(query); query != "" {
 		where = append(where, "(action LIKE ? OR target LIKE ? OR detail LIKE ? OR ip LIKE ?)")
 		like := "%" + query + "%"
@@ -1481,6 +1685,29 @@ func (s *Store) AuditLogsFiltered(query, username string, limit int) ([]AuditLog
 	if username = strings.TrimSpace(username); username != "" {
 		where = append(where, "username LIKE ?")
 		args = append(args, "%"+username+"%")
+	}
+	if pats, ok := auditTypePatterns[actionType]; ok && len(pats) > 0 {
+		ors := make([]string, 0, len(pats))
+		for _, p := range pats {
+			ors = append(ors, "action LIKE ?")
+			args = append(args, "%"+p+"%")
+		}
+		where = append(where, "("+strings.Join(ors, " OR ")+")")
+	} else if actionType == "其他" {
+		for _, pats := range auditTypePatterns {
+			for _, p := range pats {
+				where = append(where, "action NOT LIKE ?")
+				args = append(args, "%"+p+"%")
+			}
+		}
+	}
+	if from = normalizeAuditTime(from, false); from != "" {
+		where = append(where, "ts >= ?")
+		args = append(args, from)
+	}
+	if to = normalizeAuditTime(to, true); to != "" {
+		where = append(where, "ts <= ?")
+		args = append(args, to)
 	}
 	if limit <= 0 {
 		limit = 5000
@@ -1500,6 +1727,38 @@ func (s *Store) AuditLogsFiltered(query, username string, limit int) ([]AuditLog
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// normalizeAuditTime 把日期（YYYY-MM-DD）或 RFC3339 输入按本地时区解析，
+// 输出与 ts 列同一格式（now() = 本地偏移 RFC3339）的当天起点/终点。
+// 不能直接补 'Z'：不同 timezone offset 的 RFC3339 字符串无法按字典序比较，
+// 会把筛选结果比较错位；无法解析的输入返回空串，按“忽略该筛选条件”处理。
+func normalizeAuditTime(v string, endOfDay bool) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if len(v) == 10 {
+		day, err := time.ParseInLocation("2006-01-02", v, time.Local)
+		if err != nil {
+			return ""
+		}
+		if endOfDay {
+			// 次日零点减一秒 = 当天 23:59:59（按本地时区，与 ts 写入口径一致）。
+			day = day.AddDate(0, 0, 1).Add(-time.Second)
+		}
+		return day.Format(time.RFC3339)
+	}
+	t, err := time.ParseInLocation(time.RFC3339, v, time.Local)
+	if err != nil {
+		// 兼容 datetime-local 精度（无秒/无偏移，2006-01-02T15:04）；仍解不出则忽略筛选。
+		if t2, err2 := time.ParseInLocation("2006-01-02T15:04", v, time.Local); err2 == nil {
+			t = t2
+		} else {
+			return ""
+		}
+	}
+	return t.Format(time.RFC3339)
 }
 
 // ---------- settings ----------

@@ -45,32 +45,34 @@ type Engine struct {
 	addWL func(store.WLEntry) (int64, error)
 
 	digestMu sync.Mutex
-	// lastDigest 最近一次后处理的聚合统计：只保留一份，不随扫描次数增长。
-	// AfterScan 与 NotifyScanSummary 在同一扫描流程内串行调用，用于把
-	// 「有界明细 + 完整总数」传递给通知层。
-	lastDigest *postScanDigest
+	// digests 按 scanID 暂存后处理聚合统计，取代原单槽 lastDigest：并发/交错执行时，
+	// 某扫描的端口摘要不会被另一扫描的不可达合并覆盖。由 takeDigest 取出即删，
+	// 每扫描收尾都会 take，故规模有界。
+	digests map[int64]*postScanDigest
 }
 
 func New(st *store.Store, cfg *config.Config) *Engine {
-	return &Engine{st: st, cfg: cfg, pager: st}
+	return &Engine{st: st, cfg: cfg, pager: st, digests: map[int64]*postScanDigest{}}
 }
 
 // postScanDigest 是一次后处理的聚合结果：全量计数 + 有界告警样本。
 // 结果行与告警都只累加计数，不驻留明细，因此内存占用与结果规模无关。
 type postScanDigest struct {
-	ScanID       int64
-	TotalResults int           // 实际读取到的结果行数
-	Whitelisted  int           // 命中白名单的行数
-	Violations   int           // 未命中白名单的行数
-	OutOfScope   int           // 范围外且未开启范围外告警而跳过的行数
-	Suppressed   int           // 命中忽略状态或重复提醒间隔而跳过的行数
-	Touched      int           // 成功刷新 last_seen_at 的已有告警数
-	Created      int           // 新建告警数
-	Reopened     int           // 重开告警数
-	Failed       int           // 单条告警操作失败次数
-	AlertTotal   int           // 需要通知的告警总数（新建 + 重开）
-	MaxChunk     int           // 单批处理过的最大违规行数（用于证明分块硬上限）
-	Alerts       []store.Alert // 有界样本，最多 postScanAlertSampleLimit 条
+	ScanID        int64
+	TotalResults  int           // 实际读取到的结果行数
+	Whitelisted   int           // 命中白名单的行数
+	Violations    int           // 未命中白名单的行数
+	OutOfScope    int           // 范围外且未开启范围外告警而跳过的行数
+	Suppressed    int           // 命中忽略状态或重复提醒间隔而跳过的行数
+	Touched       int           // 成功刷新 last_seen_at 的已有告警数
+	Created       int           // 新建告警数
+	Reopened      int           // 重开告警数
+	Failed        int           // 单条告警操作失败次数
+	AlertTotal    int           // 需要通知的端口告警总数（新建 + 重开）
+	MaxChunk      int           // 单批处理过的最大违规行数（用于证明分块硬上限）
+	Alerts        []store.Alert // 有界样本，最多 postScanAlertSampleLimit 条
+	Unreachable   int           // 需要通知的网络不可达告警总数（新建 + 重开，独立于端口告警）
+	UnreachAlerts []store.Alert // 不可达告警有界样本，最多 unreachSampleLimit 条
 }
 
 // addAlert 记录一条待通知告警：总数始终累加，明细到上限即停止追加。
@@ -88,19 +90,19 @@ func (d *postScanDigest) addAlert(a store.Alert) {
 
 func (e *Engine) rememberDigest(d *postScanDigest) {
 	e.digestMu.Lock()
-	e.lastDigest = d
+	if e.digests == nil {
+		e.digests = map[int64]*postScanDigest{}
+	}
+	e.digests[d.ScanID] = d
 	e.digestMu.Unlock()
 }
 
-// takeDigest 取出并清空摘要；scanID 不匹配（迟到的旧摘要）时返回 nil。
+// takeDigest 取出并删除指定扫描的摘要；不存在（未记录或已被取走）时返回 nil。
 func (e *Engine) takeDigest(scanID int64) *postScanDigest {
 	e.digestMu.Lock()
-	d := e.lastDigest
-	e.lastDigest = nil
+	d := e.digests[scanID]
+	delete(e.digests, scanID)
 	e.digestMu.Unlock()
-	if d == nil || d.ScanID != scanID {
-		return nil
-	}
 	return d
 }
 
@@ -577,7 +579,7 @@ func (e *Engine) NotifyScanSummary(scanID int64, status string, newAlerts []stor
 	if digest != nil && digest.AlertTotal > alertTotal {
 		alertTotal = digest.AlertTotal
 	}
-	if err := nf.Send(e.appendFscanSections(e.buildSummaryText(scan, status, newAlerts, alertTotal, resourceAlerts), scanID)); err != nil {
+	if err := nf.Send(e.appendUnreachableSection(e.appendFscanSections(e.buildSummaryText(scan, status, newAlerts, alertTotal, resourceAlerts), scanID), digest)); err != nil {
 		log.Printf("飞书发送失败: %v", err)
 		return
 	}
@@ -588,6 +590,13 @@ func (e *Engine) NotifyScanSummary(scanID int64, status string, newAlerts []stor
 			log.Printf("标记告警已发送失败: %v", err)
 		}
 	}
+	if digest != nil {
+		for _, a := range digest.UnreachAlerts {
+			if err := e.st.MarkAlertSent(a.ID); err != nil {
+				log.Printf("标记不可达告警已发送失败: %v", err)
+			}
+		}
+	}
 	if alertTotal > len(newAlerts) {
 		log.Printf("扫描 %d: 告警 %d 条，汇总逐条标记已推送 %d 条，其余 %d 条仅计入总数",
 			scanID, alertTotal, len(newAlerts), alertTotal-len(newAlerts))
@@ -595,6 +604,32 @@ func (e *Engine) NotifyScanSummary(scanID int64, status string, newAlerts []stor
 }
 
 // NotifyScanResource 已废弃：资源告警不再实时推送飞书，改为统一并入任务结束汇总。
+
+// appendUnreachableSection 在汇总末尾追加「网络不可达」独立段落（与端口告警分开呈现）。
+// 无不可达告警时原样返回，保证旧任务汇总不受影响。
+func (e *Engine) appendUnreachableSection(text string, digest *postScanDigest) string {
+	if digest == nil || digest.Unreachable == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.WriteString(text)
+	fmt.Fprintf(&b, "\n网络不可达：%d 条（DNS 解析失败/连通性异常，独立于端口告警）\n", digest.Unreachable)
+	listed := len(digest.UnreachAlerts)
+	if listed > 10 {
+		listed = 10
+	}
+	for _, a := range digest.UnreachAlerts[:listed] {
+		reason := a.Reason
+		if reason == "" {
+			reason = "未知原因"
+		}
+		fmt.Fprintf(&b, " - %s：%s\n", a.IP, reason)
+	}
+	if digest.Unreachable > listed {
+		fmt.Fprintf(&b, " …其余 %d 条见平台（含排查建议）\n", digest.Unreachable-listed)
+	}
+	return b.String()
+}
 
 // appendFscanSections 对 fscan 任务在汇总末尾追加「端口发现清单」与「漏洞发现」。
 // 非 fscan 任务（无 engine=fscan 事件）原样返回，保证 naabu 汇总不受影响。
@@ -692,7 +727,7 @@ func (e *Engine) buildSummaryText(scan *store.Scan, status string, newAlerts []s
 	case "stopped":
 		b.WriteString("说明：已基于已入库结果完成白名单比对与风险告警，结果可能因提前终止而不完整。\n")
 	case "partial", "failed":
-		b.WriteString("说明：结果不完整，未执行白名单比对与端口风险告警，详见执行详情异常。\n")
+		b.WriteString("说明：结果不完整，未执行白名单比对与端口风险告警；网络不可达检测仍照常执行，详见执行详情异常。\n")
 	}
 	if alertTotal < len(newAlerts) {
 		alertTotal = len(newAlerts)

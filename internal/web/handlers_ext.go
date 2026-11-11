@@ -41,7 +41,7 @@ func (s *Server) apiDeleteTarget(w http.ResponseWriter, r *http.Request) {
 // apiBatchTargetTags 批量设置/追加资产标签：支持按资产 ID（资产台账页）或按 IP（告警页改关联资产）。
 // mode=set 覆盖（tags 为空即清除），mode=append 追加合并。仅 operator/admin。
 func (s *Server) apiBatchTargetTags(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
+	if err := parseAnyForm(r); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "表单解析失败"})
 		return
 	}
@@ -113,7 +113,7 @@ func (s *Server) apiBatchTargetTags(w http.ResponseWriter, r *http.Request) {
 
 // apiBatchDeleteTargets 批量删除勾选的资产（IP/CIDR/范围/域名均可）。仅 operator/admin。
 func (s *Server) apiBatchDeleteTargets(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
+	if err := parseAnyForm(r); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "表单解析失败"})
 		return
 	}
@@ -147,8 +147,10 @@ func (s *Server) apiBatchDeleteTargets(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiExposureWhitelist 把暴露面勾选项（ip[]/port[]/proto[]/service[] 对齐数组）批量加入白名单。仅 operator/admin。
+// reason 必填：支持单值（应用到全部）或与 ip[] 对齐的 reason 数组（逐行）；
+// 若某行原因为空则拒绝整批并回报具体行号，不部分写入。remark 为可选备注。
 func (s *Server) apiExposureWhitelist(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
+	if err := parseAnyForm(r); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "表单解析失败"})
 		return
 	}
@@ -160,30 +162,54 @@ func (s *Server) apiExposureWhitelist(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "未选择任何暴露面条目"})
 		return
 	}
+	reasons := r.Form["reason"]
+	// getReason 兼容两种提交：单值 reason（len==1，应用到全部）或与 ip[] 对齐的逐行数组。
+	getReason := func(i int) string {
+		if i < len(reasons) {
+			return strings.TrimSpace(reasons[i])
+		}
+		if len(reasons) == 1 {
+			return strings.TrimSpace(reasons[0])
+		}
+		return ""
+	}
+	remark := strings.TrimSpace(r.FormValue("remark"))
 	operator := currentUser(r).username
-	added, skipped := 0, 0
+
+	rows := make([]store.WLEntry, 0, len(ips))
+	emptyRows := 0
+	// 先逐行校验（含必填原因），任一行不合格则拒绝整批，不部分写入。
 	for i, ip := range ips {
 		ip = strings.TrimSpace(ip)
 		port := ""
 		if i < len(ports) {
 			port = strings.TrimSpace(ports[i])
 		}
+		if ip == "" || port == "" {
+			emptyRows++ // 缺 ip/port 的行计入跳过（与旧行为一致）
+			continue
+		}
+		reason := getReason(i)
+		if reason == "" {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("第 %d 行缺少加白原因（必填）：%s:%s", i+1, ip, port)})
+			return
+		}
 		proto := "tcp"
 		if i < len(protos) && strings.TrimSpace(protos[i]) != "" {
 			proto = strings.TrimSpace(protos[i])
 		}
-		if ip == "" || port == "" {
-			skipped++
-			continue
-		}
-		entry := store.WLEntry{IPSpec: ip, PortSpec: port, Proto: proto, Owner: operator, Remark: "暴露面批量加白"}
+		entry := store.WLEntry{IPSpec: ip, PortSpec: port, Proto: proto, Owner: operator, Reason: reason, Remark: remark, Source: "exposure"}
 		if i < len(services) {
 			entry.Service = strings.TrimSpace(services[i])
 		}
 		if err := engine.ValidateEntry(entry); err != nil {
-			skipped++
-			continue
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("第 %d 行条目非法: %v", i+1, err)})
+			return
 		}
+		rows = append(rows, entry)
+	}
+	added, skipped := 0, emptyRows
+	for _, entry := range rows {
 		if _, err := s.st.AddWhitelist(entry); err != nil {
 			skipped++
 			continue
@@ -252,6 +278,10 @@ func (s *Server) apiCreateTarget(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "请填写 IP / 网段 / 范围 / 域名"})
 		return
 	}
+	// 归一化后再校验与入库：等价形态（未掩码 CIDR/大写或尾点域名）命中已有资产时提示不重复添加。
+	if norm, _ := store.NormalizeTargetSpec(spec); norm != "" {
+		spec = norm
+	}
 	kind, ok := engine.ClassifyTarget(spec)
 	if !ok {
 		writeJSON(w, 400, map[string]string{"error": "目标格式非法：" + spec + "（支持单 IP、CIDR 网段、IP 范围、域名）"})
@@ -310,6 +340,19 @@ func (s *Server) exportAssets(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 导入样例文件下载 ----------
 
+// whitelistTemplateHeaders / whitelistTemplateRows 白名单 Excel/CSV 模板的表头与示例行。
+// 列序与无表头文件的回落列序一致：IP/网段、端口、服务、备注（原因列靠表头名识别；协议/负责人/业务 同理可自行加列）。
+var (
+	whitelistTemplateHeaders = []string{"IP/网段", "端口", "服务", "备注", "原因"}
+	whitelistTemplateRows    = [][5]string{
+		{"1.2.3.4", "22,80,443", "SSH,HTTP,HTTPS", "运维跳板机，工单 #1024", "运维官方服务"},
+		{"10.0.0.5", "3306", "MySQL", "仅内网访问", "业务数据库"},
+		{"10.0.0.0/24", "1000-2000", "业务端口段", "整段放行", "已确认合规"},
+		{"*", "443", "HTTPS", "全局通用端口", "通用 HTTPS"},
+		{"10.0.0.9", "", "", "端口留空 + 勾选「自动匹配已识别端口」，自动放行该 IP 已识别端口", "自动匹配放行"},
+	}
+)
+
 func (s *Server) apiSample(w http.ResponseWriter, r *http.Request) {
 	switch r.PathValue("kind") {
 	case "assets.csv":
@@ -337,6 +380,34 @@ func (s *Server) apiSample(w http.ResponseWriter, r *http.Request) {
 			"10.0.0.5 3306\n" +
 			"10.0.0.0/24 1000-2000 udp\n"
 		download(w, "whitelist-sample.txt", "text/plain; charset=utf-8", []byte(body))
+	case "whitelist.xlsx":
+		f := excelize.NewFile()
+		sheet := f.GetSheetName(0)
+		cols := []string{"A", "B", "C", "D", "E"}
+		for i, h := range whitelistTemplateHeaders {
+			_ = f.SetCellValue(sheet, cols[i]+"1", h)
+		}
+		for i, row := range whitelistTemplateRows {
+			for j, v := range row {
+				_ = f.SetCellValue(sheet, fmt.Sprintf("%s%d", cols[j], i+2), v)
+			}
+		}
+		_ = f.SetColWidth(sheet, "A", "E", 26)
+		var buf bytes.Buffer
+		_ = f.Write(&buf)
+		_ = f.Close()
+		download(w, "whitelist-template.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", buf.Bytes())
+	case "whitelist.csv":
+		var b bytes.Buffer
+		b.WriteString("\ufeff")
+		// 端口列常含逗号（如 22,80,443），必须走 CSV 引号转义，否则会被拆成多列
+		cw := csv.NewWriter(&b)
+		_ = cw.Write(whitelistTemplateHeaders)
+		for _, row := range whitelistTemplateRows {
+			_ = cw.Write(row[:])
+		}
+		cw.Flush()
+		download(w, "whitelist-template.csv", "text/csv; charset=utf-8", b.Bytes())
 	default:
 		http.Error(w, "未知样例类型", http.StatusNotFound)
 	}
@@ -376,6 +447,12 @@ func (s *Server) pageTaskForm(w http.ResponseWriter, r *http.Request) {
 		bd.Title = "新建任务"
 		task.TargetType = "all"
 		task.Hour = 2
+		// 新建任务协议默认取全局 scan_udp：开启→TCP+UDP，关闭→纯 TCP；用户可在任务表单单独覆盖。
+		if s.st.Setting("scan_udp") == "1" {
+			task.Protocol = "both"
+		} else {
+			task.Protocol = "tcp"
+		}
 	}
 	tags, _ := s.st.AllTags()
 	s.render(w, "task_form.html", struct {
@@ -384,6 +461,78 @@ func (s *Server) pageTaskForm(w http.ResponseWriter, r *http.Request) {
 		Editing bool
 		Tags    []string
 	}{bd, task, editing, tags})
+}
+
+// pageDomainDetail 域名资产详情：关联端口（domain_map 衍生 IP 的开放端口）+ 服务指纹 + 安全设备。
+func (s *Server) pageDomainDetail(w http.ResponseWriter, r *http.Request) {
+	domain := strings.ToLower(strings.TrimSpace(r.PathValue("domain")))
+	if domain == "" {
+		http.Error(w, "域名不能为空", http.StatusBadRequest)
+		return
+	}
+	bd, _ := s.baseData(r, "域名资产 · "+domain, "assets")
+	ips, _ := s.st.IPsForDomain(domain)
+	ports, _ := s.st.OpenPortsByIPs(ips)
+	services, _ := s.st.DomainServices(domain)
+	device := ""
+	targets, _ := s.st.Targets()
+	for _, t := range targets {
+		if t.Kind == "domain" && strings.EqualFold(t.IP, domain) {
+			device = t.SecurityDevice
+			break
+		}
+	}
+	s.render(w, "domain_detail.html", struct {
+		pageData
+		Domain   string
+		IPs      []string
+		Ports    []store.Result
+		Services []string
+		Device   string
+	}{bd, domain, ips, ports, services, device})
+}
+
+// apiDomainWhitelist 一键将域名下所有衍生 IP 的开放端口加入白名单。
+// 查询错误显式返回 500（区分“确实无端口”与“查询失败”）；靠 AddWhitelist 的
+// INSERT OR IGNORE 幂等保证重复点击不产生重复规则（id==0 计为已存在）；并对衍生规模设上限。
+func (s *Server) apiDomainWhitelist(w http.ResponseWriter, r *http.Request) {
+	domain := strings.ToLower(strings.TrimSpace(r.FormValue("domain")))
+	if domain == "" {
+		writeJSON(w, 400, map[string]string{"error": "域名不能为空"})
+		return
+	}
+	ips, err := s.st.IPsForDomain(domain)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "查询域名衍生 IP 失败: " + err.Error()})
+		return
+	}
+	open, err := s.st.OpenPortsByIPs(ips)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "查询已识别端口失败: " + err.Error()})
+		return
+	}
+	if len(open) > wlImportMaxRows {
+		writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("该域名衍生端口 %d 条，超过单次加白上限 %d，请按需精确添加", len(open), wlImportMaxRows)})
+		return
+	}
+	operator := currentUser(r).username
+	added, existed := 0, 0
+	for _, p := range open {
+		e := store.WLEntry{IPSpec: p.IP, PortSpec: strconv.Itoa(p.Port), Proto: p.Proto, Service: p.Service, Owner: operator, Source: "domain", Remark: "域名衍生 IP 一键加白: " + domain}
+		id, err := s.st.AddWhitelist(e)
+		if err != nil {
+			s.audit(r, "域名一键加白", domain, fmt.Sprintf("写入失败（已加白 %d 条）: %v", added, err))
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if id > 0 {
+			added++
+		} else {
+			existed++ // 相同规则已在白名单，幂等跳过
+		}
+	}
+	s.audit(r, "域名一键加白", domain, fmt.Sprintf("新增 %d 条，已存在 %d 条", added, existed))
+	writeJSON(w, 200, map[string]interface{}{"added": added, "existed": existed})
 }
 
 // ---------- 聚合暴露面 ----------
@@ -542,9 +691,9 @@ func (s *Server) exportWhitelist(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "导出失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	records := [][]string{{"IP/网段", "端口", "协议", "服务", "负责人", "业务", "备注", "创建时间"}}
+	records := [][]string{{"IP/网段", "端口", "协议", "服务", "负责人", "业务", "原因", "备注", "创建时间"}}
 	for _, e := range entries {
-		records = append(records, []string{e.IPSpec, e.PortSpec, e.Proto, e.Service, e.Owner, e.Business, e.Remark, e.CreatedAt})
+		records = append(records, []string{e.IPSpec, e.PortSpec, e.Proto, e.Service, e.Owner, e.Business, e.Reason, e.Remark, e.CreatedAt})
 	}
 	s.audit(r, "导出白名单", "", fmt.Sprintf("%d 条", len(entries)))
 	writeCSVDownload(w, "whitelist.csv", records)
@@ -600,7 +749,7 @@ func (s *Server) apiBaselinePreview(w http.ResponseWriter, r *http.Request) {
 // apiBaselineApply 把预览中勾选的条目（ip[]/port[]/proto[]/service[] 对齐数组）批量加入白名单，
 // owner=baseline，可带统一业务归属。仅 operator/admin。
 func (s *Server) apiBaselineApply(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
+	if err := parseAnyForm(r); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "表单解析失败"})
 		return
 	}
@@ -649,7 +798,8 @@ func (s *Server) apiBaselineApply(w http.ResponseWriter, r *http.Request) {
 
 // exportAudit 导出当前筛选下的操作审计 CSV。仅 admin。
 func (s *Server) exportAudit(w http.ResponseWriter, r *http.Request) {
-	logs, err := s.st.AuditLogsFiltered(strings.TrimSpace(r.URL.Query().Get("q")), strings.TrimSpace(r.URL.Query().Get("user")), 20000)
+	logs, err := s.st.AuditLogsAdvanced(strings.TrimSpace(r.URL.Query().Get("q")), strings.TrimSpace(r.URL.Query().Get("user")),
+		strings.TrimSpace(r.URL.Query().Get("type")), strings.TrimSpace(r.URL.Query().Get("from")), strings.TrimSpace(r.URL.Query().Get("to")), 20000)
 	if err != nil {
 		http.Error(w, "导出失败: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -801,6 +951,10 @@ func (s *Server) submitAlertWhitelist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	returnTo := safeAlertReturn(r.FormValue("return"))
+	if alert.Kind == "unreachable" {
+		http.Error(w, "网络不可达告警不适用端口加白，请按排查建议处置连通性问题", http.StatusBadRequest)
+		return
+	}
 	note := strings.TrimSpace(r.FormValue("note"))
 	status := alert.Status
 	if status == "new" {
@@ -859,6 +1013,10 @@ func (s *Server) apiAlertWhitelist(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "告警不存在"})
 		return
 	}
+	if alert.Kind == "unreachable" {
+		writeJSON(w, 400, map[string]string{"error": "网络不可达告警不适用端口加白，请按排查建议处置连通性问题"})
+		return
+	}
 	proto := alert.Proto
 	if proto == "" {
 		proto = "tcp"
@@ -883,7 +1041,7 @@ func (s *Server) apiAlertWhitelist(w http.ResponseWriter, r *http.Request) {
 
 // apiBatchAlerts 批量处置告警：按状态批量变更，或批量加白并忽略。仅 operator/admin。
 func (s *Server) apiBatchAlerts(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
+	if err := parseAnyForm(r); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "表单解析失败"})
 		return
 	}
@@ -925,6 +1083,10 @@ func (s *Server) apiBatchAlerts(w http.ResponseWriter, r *http.Request) {
 		for _, id := range ids {
 			alert, err := s.st.AlertByID(id)
 			if err != nil || alert == nil {
+				continue
+			}
+			// 网络不可达告警没有端口维度，加白无意义，跳过并保留原状态供单独处置。
+			if alert.Kind == "unreachable" {
 				continue
 			}
 			proto := alert.Proto
@@ -974,19 +1136,27 @@ func (s *Server) exportAlerts(w http.ResponseWriter, r *http.Request) {
 	if !validAlertStatus(status) {
 		status = ""
 	}
-	alerts, err := s.st.AlertsFiltered(status, strings.TrimSpace(r.URL.Query().Get("q")), 0)
+	kind := r.URL.Query().Get("kind")
+	if kind != "port" && kind != "unreachable" {
+		kind = ""
+	}
+	alerts, err := s.st.AlertsFilteredKind(status, strings.TrimSpace(r.URL.Query().Get("q")), kind, 0)
 	if err != nil {
 		http.Error(w, "导出失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	records := [][]string{{"ID", "IP", "端口", "协议", "服务", "范围", "状态", "首次发现", "最近发现", "处理人", "处理说明", "处理时间"}}
+	records := [][]string{{"ID", "类型", "IP", "端口", "协议", "服务", "范围", "状态", "失败原因", "排查建议", "首次发现", "最近发现", "处理人", "处理说明", "处理时间"}}
 	for _, a := range alerts {
 		scope := "范围外"
 		if a.InScope {
 			scope = "范围内"
 		}
-		records = append(records, []string{strconv.FormatInt(a.ID, 10), a.IP, strconv.Itoa(a.Port), a.Proto, a.Service, scope,
-			alertStatusName(a.Status), a.FirstSeenAt, a.LastSeenAt, a.Handler, a.HandleNote, a.HandledAt})
+		kindName, reason, suggestion := "端口风险", "", ""
+		if a.Kind == "unreachable" {
+			kindName, reason, suggestion = "网络不可达", a.Reason, store.UnreachableSuggestion(a.Reason)
+		}
+		records = append(records, []string{strconv.FormatInt(a.ID, 10), kindName, a.IP, strconv.Itoa(a.Port), a.Proto, a.Service, scope,
+			alertStatusName(a.Status), reason, suggestion, a.FirstSeenAt, a.LastSeenAt, a.Handler, a.HandleNote, a.HandledAt})
 	}
 	writeCSVDownload(w, "alerts.csv", records)
 }

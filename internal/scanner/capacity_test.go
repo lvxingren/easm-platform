@@ -394,12 +394,13 @@ func withCapacityEnv(t *testing.T, fdSoft, fdInUse uint64, diskFree int64) {
 // 自定义端口与排除端口都先构造去重集合，再求差集。
 func TestModePortCount(t *testing.T) {
 	cases := []struct {
-		name    string
-		mode    string
-		custom  string
-		exclude string
-		want    int
-		wantErr bool
+		name        string
+		mode        string
+		custom      string
+		exclude     string
+		topExplicit bool
+		want        int
+		wantErr     bool
 	}{
 		{name: "全端口", mode: "full", want: 65535},
 		{name: "常用端口", mode: "top", want: 1000},
@@ -415,10 +416,15 @@ func TestModePortCount(t *testing.T) {
 		{name: "自定义端口非法", mode: "custom", custom: "abc", wantErr: true},
 		{name: "排除端口非法", mode: "full", exclude: "70-60", wantErr: true},
 		{name: "常用端口排除量达 1000", mode: "top", exclude: "1-1000", wantErr: true},
+		// top+UDP 组合实际下发显式 -p top1000TCP：预检按真实列表求精确差集。
+		// 注意：列表去重后实为 1002 个端口（nmap top-1000 含范围项溢出），事件记录实际下发数而非名义 1000。
+		{name: "top 显式列表基础量", mode: "top", topExplicit: true, want: 1002},
+		{name: "top 显式列表扣除在列表内的端口", mode: "top", exclude: "22", topExplicit: true, want: 1001},
+		{name: "top 显式列表扣除不在列表内的端口不影响实际量", mode: "top", exclude: "60001", topExplicit: true, want: 1002},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := modePortCount(c.mode, c.custom, c.exclude)
+			got, err := modePortCount(c.mode, c.custom, c.exclude, c.topExplicit)
 			if c.wantErr {
 				if err == nil {
 					t.Fatalf("期望错误，实际 ports=%d", got)

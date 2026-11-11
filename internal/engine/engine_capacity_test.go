@@ -82,10 +82,16 @@ func lastDigest(t *testing.T, e *Engine) *postScanDigest {
 	t.Helper()
 	e.digestMu.Lock()
 	defer e.digestMu.Unlock()
-	if e.lastDigest == nil {
+	if len(e.digests) == 0 {
 		t.Fatal("AfterScan 未记录后处理摘要")
 	}
-	return e.lastDigest
+	if len(e.digests) > 1 {
+		t.Fatalf("测试假设单一摘要，实际存在 %d 个", len(e.digests))
+	}
+	for _, d := range e.digests {
+		return d
+	}
+	return nil
 }
 
 // TestAfterScanHalfMillionResultsBounded 用 50 万条等价 fake 结果证明：

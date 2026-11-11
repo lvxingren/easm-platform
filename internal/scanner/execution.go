@@ -53,6 +53,10 @@ const (
 	progressMessageLimit = 40
 	// resolutionSampleLimit 是单批次解析失败目标样例上限。
 	resolutionSampleLimit = 5
+	// unreachableKeepRecent 是 scan_unreachable 明细的保留窗口（最近 N 次执行）：
+	// 告警只消费收尾即时读取的明细，历史明细仅供详情页回看，超限部分在扫描启动时裁剪，
+	// 避免定时扫描环境下明细表无界增长（与扫描产物保留策略同款思路）。
+	unreachableKeepRecent = 50
 )
 
 type batchOutcome struct {
@@ -139,6 +143,10 @@ type scanProgress struct {
 	suppressed int
 	// connectFallback 表示本次执行已确认 SYN 权限不足，后续批次与重试统一降级为 CONNECT。
 	connectFallback bool
+	// udpEnabled 记录本次执行是否启用 UDP，供 SYN 降级时提示 UDP 被跳过。
+	udpEnabled bool
+	// udpOnly 记录本次执行是否仅扫 UDP（无 TCP）；SYN 降级 CONNECT 后无任何可扫协议，需明确报错而非静默扫 TCP。
+	udpOnly bool
 }
 
 func newScanProgress() *scanProgress {
@@ -261,12 +269,16 @@ func (r *Runner) run(scanID int64, mode string, customPorts string, specs []stor
 			_ = r.st.ForceStopScanIfActive(scanID, fmt.Sprintf("扫描进程异常（panic）：%v；已保留入库结果，不生成告警。", rec))
 		}
 	}()
-	r.executeScan(scanID, mode, customPorts, specs, settings, plan)
+	r.executeScan(scanID, mode, customPorts, specs, settings, plan, false)
 }
 
 // executeScan 是核心执行逻辑，由 run 和 runSubTask 共享。
 // 与 run 的区别：不修改 Runner 的 running 状态，适合子任务复用。
-func (r *Runner) executeScan(scanID int64, mode string, customPorts string, specs []store.TargetSpec, settings NaabuSettings, plan capacityPlan) {
+// subScan=true 表示本次是拆分子任务（runSubTask 调用）：其网络不可达探测与告警生成
+// 交由父任务 runSplitTask 聚合子扫描明细后统一执行，避免每个子扫描各自发起 TCP 探测、
+// 以子扫描 ID 重复生成不可达告警并污染后处理摘要。端口告警与飞书汇总仍按现状逐子任务执行，
+// 以保证拆分 partial（部分子任务失败）时已成功子批次的端口告警不丢失。
+func (r *Runner) executeScan(scanID int64, mode string, customPorts string, specs []store.TargetSpec, settings NaabuSettings, plan capacityPlan, subScan bool) {
 	start := time.Now()
 	totalBatches := (len(specs) + scanBatchSize - 1) / scanBatchSize
 	if err := r.st.StartScanExecution(scanID, len(specs), totalBatches); err != nil {
@@ -301,6 +313,12 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 	// 启动前按容量/保留策略清理旧的扫描产物：只删除平台生成的 batch_* 文件，
 	// 绝不触碰 data/easm.db、证书、日志等用户业务数据。
 	pruneScanArtifacts("data", scanID)
+	// 同步裁剪超出保留窗口的不可达明细（含已删扫描的孤儿行）：失败只记日志，不影响本次扫描。
+	if removed, err := r.st.PruneUnreachableDetails(unreachableKeepRecent); err != nil {
+		log.Printf("裁剪历史不可达明细失败（不影响本次扫描）: %v", err)
+	} else if removed > 0 {
+		log.Printf("已裁剪 %d 条超出保留窗口（最近 %d 次执行）的不可达明细", removed, unreachableKeepRecent)
+	}
 
 	dataDir := filepath.Join("data", fmt.Sprintf("scan_%d", scanID))
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
@@ -309,6 +327,8 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 	}
 
 	prog := newScanProgress()
+	prog.udpEnabled = settings.UDP
+	prog.udpOnly = settings.UDPOnly
 	concurrency := plan.Concurrency
 	if concurrency > totalBatches {
 		concurrency = totalBatches
@@ -363,8 +383,16 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 		if message != "" {
 			message += "\n\n"
 		}
-		message += "本次执行存在无法可靠识别的输出（域名解析失败或结构化输出损坏），已保留可识别结果；为避免虚报完成，终态标记为不完整，不执行白名单比对和告警。"
+		message += "本次执行存在无法可靠识别的输出（域名解析失败或结构化输出损坏），已保留可识别结果；为避免虚报完成，终态标记为不完整，不执行白名单比对和端口告警（网络不可达检测仍照常执行）。"
 		status = "partial"
+	}
+	if prog.udpOnly && prog.connectOnly() {
+		// 「仅 UDP」在无原始套接字权限时零结果：不能把 0 结果报告为 done，
+		// 否则运营会误以为端口已关闭。下方面向非空 message 的分支会将终态细化为 failed。
+		if message != "" {
+			message += "\n\n"
+		}
+		message += "本任务为「仅 UDP」协议，但当前没有原始套接字权限（root 或 setcap cap_net_raw+ep），naabu 已降级为 CONNECT 且没有可扫协议，本次未产生任何结果；请授予权限后重试，或将任务协议改为含 TCP。"
 	}
 	if r.isStopped(scanID) {
 		status = "stopped"
@@ -377,7 +405,7 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 		if snap.openPorts > 0 {
 			status = "partial"
 		}
-		message += "\n\n不完整结果不会执行白名单比对和告警。"
+		message += "\n\n不完整结果不会执行白名单比对和端口告警（网络不可达检测仍照常执行）。"
 	}
 	if err := r.st.FinishScanStatus(scanID, status, snap.openPorts, message); err != nil {
 		log.Printf("更新扫描状态失败: %v", err)
@@ -389,6 +417,12 @@ func (r *Runner) executeScan(scanID int64, mode string, customPorts string, spec
 	var newAlerts []store.Alert
 	if status == "done" || status == "stopped" {
 		newAlerts = r.eng.AfterScan(scanID)
+	}
+	// 网络不可达告警独立于端口告警，不受终态门禁：DNS 解析失败恰恰会把终态拉成 partial，
+	// 若只在 done/stopped 执行会丢失最主要的不可达信号。
+	// 拆分子任务跳过：明细已随 runBatch 落子扫描 ID，由父任务 CopySubScanUnreachables 聚合后统一探测与告警。
+	if !subScan {
+		r.eng.ProcessUnreachable(scanID)
 	}
 	r.eng.NotifyScanSummary(scanID, status, newAlerts)
 }
@@ -418,6 +452,9 @@ func (r *Runner) processBatch(scanID int64, settings NaabuSettings, mode, custom
 	}
 	args := settings.args(targetsFile, outFile, mode, customPorts)
 	commandText := strings.Join(append([]string{settings.Path}, args...), " ")
+	if args == nil {
+		commandText = settings.Path + "（当前设置无任何可安全下发的端口，已跳过；原因见降级事件）"
+	}
 	log.Printf("扫描 %d 批次 %d/%d 启动(%d 个目标): %s", scanID, batchNumber, totalBatches, len(batch), commandText)
 
 	outcome := r.runBatchWithRetry(scanID, settings, mode, customPorts, targetsFile, outFile, batchNumber, prog)
@@ -795,6 +832,33 @@ func (r *Runner) runBatch(scanID int64, settings NaabuSettings, args []string, o
 	pending := make([]store.Result, 0, dbFlushRows)
 	pendingKeys := make(map[string]struct{}, dbFlushRows)
 	pendingBytes := 0
+	// pendingUnreachable 是本批次 DNS 失败目标的缓冲去重集：解析热路径不再逐条同步写库
+	// （避免与 scan_results 批量写争锁、放大 busy_timeout 等待），批末一次事务写入；
+	// 跨批次/重试重复由 UNIQUE(scan_id, target) 兜底，写失败仅 log 留痕不影响终态。
+	// 容量天然有界：每个批次只包含 scanBatchSize 个目标，同批内重复已先在缓冲层去重。
+	unreachableSet := make(map[string]struct{})
+	var pendingUnreachable []string
+	queueUnreachable := func(target string) {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			return
+		}
+		if _, dup := unreachableSet[target]; dup {
+			return
+		}
+		unreachableSet[target] = struct{}{}
+		pendingUnreachable = append(pendingUnreachable, target)
+	}
+	flushUnreachable := func() {
+		if len(pendingUnreachable) == 0 {
+			return
+		}
+		if _, err := r.st.RecordUnreachableBatch(scanID, pendingUnreachable, store.ReasonDNSFailure); err != nil {
+			log.Printf("扫描 %d 批量写入 DNS 解析失败明细(%d 条): %v", scanID, len(pendingUnreachable), err)
+		}
+		pendingUnreachable = nil
+	}
+	defer flushUnreachable()
 	var stdoutTail strings.Builder
 	failStore := func(err error) {
 		if outcome.storeErr == nil {
@@ -898,6 +962,8 @@ func (r *Runner) runBatch(scanID int64, settings NaabuSettings, args []string, o
 					if len(outcome.resolutionSamples) < resolutionSampleLimit {
 						outcome.resolutionSamples = append(outcome.resolutionSamples, parsed.target)
 					}
+					// 不可达明细先进批次缓冲去重，批末一次事务落库（告警需要全量目标，同扫描幂等）。
+					queueUnreachable(parsed.target)
 					prog.markUnreliable()
 				case parseMalformed:
 					outcome.malformedLines++
@@ -983,6 +1049,7 @@ func (r *Runner) runBatch(scanID int64, settings NaabuSettings, args []string, o
 				if len(outcome.resolutionSamples) < resolutionSampleLimit {
 					outcome.resolutionSamples = append(outcome.resolutionSamples, target)
 				}
+				queueUnreachable(target)
 				prog.markUnreliable()
 			},
 			func(line string) {
@@ -1041,6 +1108,14 @@ func (r *Runner) runBatchWithRetry(scanID int64, settings NaabuSettings, mode, c
 			_ = os.Remove(outFile)
 		}
 		args := settings.args(targetsFile, outFile, mode, customPorts)
+		if args == nil {
+			// 「仅 UDP」降级为 CONNECT 后没有任何可扫协议：返回错误而不启动 naabu，
+			// 避免退回默认 TCP 端口扫描（那会扫出用户未授权的 TCP 结果）。
+			final.runErr = fmt.Errorf("当前没有原始套接字权限（需 root 或 setcap cap_net_raw+ep），「仅 UDP」任务无任何可扫协议，已跳过本批以免误扫 TCP")
+			final.attempts = attempt
+			final.stderr = lastStderr
+			return final
+		}
 		attemptOut := r.runBatch(scanID, settings, args, outFile, prog)
 		results += attemptOut.results
 		attemptOut.results = results
@@ -1051,6 +1126,13 @@ func (r *Runner) runBatchWithRetry(scanID int64, settings NaabuSettings, mode, c
 			attemptOut.stderr = lastStderr
 		}
 		final = attemptOut
+		// naabu 在非 root/未 setcap 时不会以非零退出报告 SYN 失败，而是自行降级为 CONNECT，
+		// 并在 stderr 自述 “Running CONNECT scan with non root privileges”；UDP 端口随之被静默丢弃。
+		// 成功路径也要识别该提示：标记仅 CONNECT（后续批次不再下发 u:）、纠正 UDP 快照并记录事件。
+		if settings.ScanType != "c" && naabuFellBackToConnect(final.stderr) {
+			settings.ScanType = "c"
+			r.noteSynFallback(scanID, batchNumber, final.stderr, prog)
+		}
 		if final.storeErr != nil || final.timedOut || r.isStopped(scanID) || !batchRetryable(final) {
 			return final
 		}
@@ -1149,13 +1231,38 @@ func synCapabilityFailure(stderr string) bool {
 	return false
 }
 
+// naabuFellBackToConnect 判断 naabu 是否自述“以非 root 权限降级为 CONNECT 扫描”。
+// naabu 未能创建原始套接字时不会报错退出，而是自动降级 CONNECT，并在 stderr 打印
+// "[INF] Running CONNECT scan with non root privileges"；此时 UDP 端口被静默丢弃。
+// 只匹配降级提示，不能用 synCapabilityFailure（它会把有权限时的
+// "Running SYN scan with root privileges" 一并匹配成失败）。
+func naabuFellBackToConnect(stderr string) bool {
+	text := strings.ToLower(stderr)
+	if !strings.Contains(text, "connect scan") {
+		return false
+	}
+	for _, marker := range []string{"non root", "without root", "not root", "non-root", "unprivileged"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // noteSynFallback 将本次执行标记为仅 CONNECT（后续批次也不再尝试 SYN），并记录一次事件。
 // 参数依据本机 naabu --help：-scan-type/-s 支持 SYN/CONNECT，现有实现用 c 表示 CONNECT。
 func (r *Runner) noteSynFallback(scanID int64, batchNumber int, stderr string, prog *scanProgress) {
 	if !prog.markConnectOnly() {
 		return
 	}
-	message := fmt.Sprintf("批次 %d 的 SYN 扫描因原始套接字/权限能力不足失败，本次执行后续尝试与批次自动降级为 CONNECT 扫描（naabu -scan-type c）；如需 SYN 扫描请为运行账号授予 CAP_NET_RAW 或 root 权限，平台不会自动提权或安装工具", batchNumber)
+	message := fmt.Sprintf("批次 %d：naabu 无法使用原始套接字（运行账号非 root 且 naabu 未授予 CAP_NET_RAW），已自动降级为 CONNECT 扫描（-scan-type c）；如需 SYN 扫描请为 naabu 执行 setcap cap_net_raw+ep 或以 root 运行，平台不会自动提权或安装工具", batchNumber)
+	if prog.udpOnly {
+		message += "；本任务为「仅 UDP」协议，而 UDP 必须依赖 SYN/root，降级后没有任何可扫协议，本次不会产生结果；后续批次已跳过以避免误扫 TCP，请授予 root/CAP_NET_RAW 后重试，或将任务协议改为含 TCP"
+	} else if prog.udpEnabled {
+		// 快照纠正：UDP 实际未执行，避免执行详情继续显示「已启用 UDP 端口扫描」。
+		_ = r.st.SetScanUDPEnabled(scanID, false)
+		message += "；已启用的 UDP 扫描因权限不足被跳过（UDP 依赖 SYN/root），本次仅扫描 TCP"
+	}
 	log.Printf("扫描 %d %s；naabu 错误输出：%s", scanID, message, limitedOutput(stderr))
 	_ = r.st.AddScanEvent(scanID, "warn", "degrade", message+"\n错误输出："+limitedOutput(stderr))
 }
@@ -1354,6 +1461,19 @@ func (r *Runner) runSplitTask(scanID int64, batches [][]store.TargetSpec, mode, 
 			}
 		}
 	}
+	// 不可达明细聚合覆盖全部子扫描（含失败子任务）：失败批次记录的 DNS 解析失败
+	// 恰恰是最需要呈现的不可达信号，不能随结果聚合的 done/running 过滤被丢弃。
+	var allSubScanIDs []int64
+	for _, sub := range subTasks {
+		if sub.SubScanID > 0 {
+			allSubScanIDs = append(allSubScanIDs, sub.SubScanID)
+		}
+	}
+	if nu, err := r.st.CopySubScanUnreachables(scanID, allSubScanIDs); err != nil {
+		log.Printf("扫描 %d 聚合子扫描不可达明细失败: %v", scanID, err)
+	} else if nu > 0 {
+		_ = r.st.AddScanEvent(scanID, "info", "split_aggregate", fmt.Sprintf("已聚合 %d 条网络不可达明细到主扫描", nu))
+	}
 
 	// 更新主扫描记录状态
 	if err := r.st.FinishScanStatus(scanID, status, totalOpenPorts, message); err != nil {
@@ -1368,6 +1488,7 @@ func (r *Runner) runSplitTask(scanID int64, batches [][]store.TargetSpec, mode, 
 	if status == "done" || status == "stopped" {
 		newAlerts = r.eng.AfterScan(scanID)
 	}
+	r.eng.ProcessUnreachable(scanID)
 	r.eng.NotifyScanSummary(scanID, status, newAlerts)
 }
 
@@ -1410,8 +1531,8 @@ func (r *Runner) runSubTask(parentScanID, subTaskID int64, parentName string, pa
 	subSettings := settings
 	subSettings.Rate = strconv.Itoa(plan.PerRate)
 
-	// 执行扫描（复用核心执行逻辑，但不修改 running 状态）
-	r.executeScan(subScanID, mode, customPorts, specs, subSettings, plan)
+	// 执行扫描（复用核心执行逻辑，但不修改 running 状态；子任务标记使不可达探测/告警上移到父任务统一执行）
+	r.executeScan(subScanID, mode, customPorts, specs, subSettings, plan, true)
 
 	subScan, err := r.st.Scan(subScanID)
 	if err != nil {

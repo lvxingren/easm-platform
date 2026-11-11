@@ -1,15 +1,20 @@
 {{define "alert_form.html"}}{{template "head" .}}{{template "nav" .}}
 <div class="row between" style="margin-bottom:16px">
   <a class="btn ghost small" href="{{.Return}}">返回告警列表</a>
-  <a class="btn ghost small" href="/exposure?q={{urlquery .Alert.IP}}&port={{.Alert.Port}}">查看关联暴露面</a>
+  {{if ne .Alert.Kind "unreachable"}}<a class="btn ghost small" href="/exposure?q={{urlquery .Alert.IP}}&port={{.Alert.Port}}">查看关联暴露面</a>{{end}}
 </div>
 {{if .Error}}<div class="error-banner">{{.Error}}</div>{{end}}
 
 <div class="panel">
-  <div class="panel-title">告警 #{{.Alert.ID}} · {{.Alert.IP}}:{{.Alert.Port}}</div>
+  <div class="panel-title">告警 #{{.Alert.ID}} · {{.Alert.IP}}{{if ne .Alert.Kind "unreachable"}}:{{.Alert.Port}}{{end}}{{if eq .Alert.Kind "unreachable"}} <span class="pill err">网络不可达</span>{{end}}</div>
   <div class="grid">
     <div><div class="muted">当前状态</div><strong>{{alertStatusName .Alert.Status}}</strong></div>
+    {{if eq .Alert.Kind "unreachable"}}
+    <div><div class="muted">失败原因</div><strong>{{if .Alert.Reason}}{{.Alert.Reason}}{{else}}未知{{end}}</strong></div>
+    <div class="full"><div class="muted">建议排查步骤</div><strong>{{unreachSuggestion .Alert.Reason}}</strong></div>
+    {{else}}
     <div><div class="muted">协议 / 服务</div><strong>{{.Alert.Proto}}{{if .Alert.Service}} / {{.Alert.Service}}{{end}}</strong></div>
+    {{end}}
     <div><div class="muted">资产范围</div><strong>{{if .Alert.InScope}}范围内{{else}}范围外{{end}}</strong></div>
     <div><div class="muted">飞书通知</div><strong>{{if .Alert.SentFeishu}}已推送{{else}}未推送{{end}}</strong></div>
     <div><div class="muted">首次发现</div><strong>{{fmtTime .Alert.FirstSeenAt}}</strong></div>
@@ -37,10 +42,11 @@
     <p class="hint full">解决或忽略必须填写说明。保存后会记录当前账号、处理时间和审计流水。</p>
     <div class="row full">
       <button class="btn primary" type="submit">保存处置</button>
-      <button class="btn" type="submit" formaction="/alerts/{{.Alert.ID}}/whitelist">加入白名单并忽略</button>
+      {{if ne .Alert.Kind "unreachable"}}<button class="btn" type="submit" formaction="/alerts/{{.Alert.ID}}/whitelist">加入白名单并忽略</button>{{end}}
       <a class="btn ghost" href="{{.Return}}">取消</a>
     </div>
-    <p class="hint full">仅在确认该端口属于业务放行时选择加白：系统将新增该 IP、端口和协议的精确白名单，并把告警标记为已忽略。</p>
+    {{if eq .Alert.Kind "unreachable"}}<p class="hint full">网络不可达告警反映资产连通性异常，不适用端口加白；请按建议排查后选择「已解决」（恢复后再次失败会自动重开）或「已忽略」（确认放行不再提醒）。</p>
+    {{else}}<p class="hint full">仅在确认该端口属于业务放行时选择加白：系统将新增该 IP、端口和协议的精确白名单，并把告警标记为已忽略。</p>{{end}}
   </form>
 </div>
 {{template "foot" .}}{{end}}

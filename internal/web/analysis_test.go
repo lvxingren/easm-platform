@@ -55,6 +55,10 @@ func waitAnalysisDone(t *testing.T, server *Server, id int64) map[string]interfa
 func TestAnalysisPipelineRuleBasedAndRBAC(t *testing.T) {
 	t.Chdir(t.TempDir())
 	server, st := newScanLiveTestServer(t)
+	// 流量分析模块默认关闭，打开后才能访问页面/接口（本测试验证完整业务链路）。
+	if err := st.SetSetting("analysis_enabled", "1"); err != nil {
+		t.Fatal(err)
+	}
 
 	// viewer 不能创建分析
 	vrec := httptest.NewRecorder()
@@ -139,5 +143,37 @@ func TestAnalysisPipelineRuleBasedAndRBAC(t *testing.T) {
 	}
 	if a2, _ := st.Analysis(id); a2 != nil {
 		t.Fatal("删除后分析记录仍存在")
+	}
+}
+
+// TestAnalysisModuleGate 验证「流量分析」模块总开关：默认关闭时侧边栏不渲染入口、
+// 页面/API 直接访问返回 404；显式开启后入口出现且页面可正常访问。
+func TestAnalysisModuleGate(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server, st := newScanLiveTestServer(t)
+
+	// 默认关闭：列表页 404，首页侧边栏不含「流量分析」
+	if rec := scanLiveRequest(server, http.MethodGet, "/analysis", "operator"); rec.Code != http.StatusNotFound {
+		t.Fatalf("未启用时 /analysis 应 404，实际 %d", rec.Code)
+	}
+	if rec := scanLiveRequest(server, http.MethodGet, "/", "operator"); rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "/analysis\" class=\"nav-item") {
+		t.Fatalf("未启用时首页不应显示流量分析入口，状态=%d", rec.Code)
+	}
+	// 未启用时创建分析接口应 404（而非进入业务逻辑）
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, analysisUploadReq("operator", "x", "a.csv", sampleCFWCSV))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("未启用时 POST /api/analysis 应 404，实际 %d 响应=%s", rr.Code, rr.Body.String())
+	}
+
+	// 开启：入口显示且页面 200
+	if err := st.SetSetting("analysis_enabled", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := scanLiveRequest(server, http.MethodGet, "/", "operator"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), ">流量分析</a>") {
+		t.Fatalf("启用后首页应显示流量分析入口，状态=%d", rec.Code)
+	}
+	if rec := scanLiveRequest(server, http.MethodGet, "/analysis", "operator"); rec.Code != http.StatusOK {
+		t.Fatalf("启用后 /analysis 应 200，实际 %d", rec.Code)
 	}
 }

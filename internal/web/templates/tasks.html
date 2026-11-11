@@ -12,8 +12,9 @@
 
 <div class="section-head">
   <h2>任务列表（{{len .Tasks}} 个）</h2>
-  <div class="row"><a class="btn ghost" href="/scans">全部执行记录</a>{{if ne .Role "viewer"}}<a class="btn primary" href="/tasks/new">+ 新建任务</a>{{end}}</div>
+  <div class="row">{{if and .ResumableScan (ne .Role "viewer")}}<a class="btn primary" href="/scans/{{.ResumableScan.ID}}" title="跳转到执行详情页续扫未完成目标">▶ 继续扫描 #{{.ResumableScan.ID}}</a>{{end}}<a class="btn ghost" href="/scans">全部执行记录</a>{{if ne .Role "viewer"}}<a class="btn primary" href="/tasks/new">+ 新建任务</a>{{end}}</div>
 </div>
+{{if .ResumableScan}}<div class="run-banner" style="margin-bottom:12px">存在已终止但未完成的执行 <strong>#{{.ResumableScan.ID}}{{if .ResumableScan.Name}} · {{.ResumableScan.Name}}{{end}}</strong>（{{scanStatusName .ResumableScan.Status}}），可进入详情页对未完成目标发起增量续扫。{{if ne .Role "viewer"}}<a class="btn small primary" href="/scans/{{.ResumableScan.ID}}">继续扫描</a>{{end}}</div>{{end}}
 <div class="table-wrap">
 <table>
   <thead><tr><th>ID</th><th>名称</th><th>模式</th><th>目标</th><th>入台账</th><th>定时</th><th>上次运行</th><th>执行进度</th>{{if ne .Role "viewer"}}<th>操作</th>{{end}}</tr></thead>
@@ -87,13 +88,13 @@ async function runTask(id) {
     (error, advice, scanID) => { startingTask = false; showRunError(error, advice, scanID); });
 }
 async function controlRunning(scanID, action) {
-  if (action === 'stop' && !confirm('确定终止当前扫描？已发现结果会保留。')) return;
+  if (action === 'stop' && !(await appConfirm('确定终止当前扫描？已发现结果会保留。', {title: '终止扫描', danger: true, okText: '终止'}))) return;
   const res = await postEmpty(`/api/scans/${scanID}/${action}`);
   toast(res.ok ? '操作已提交' : (res.json.error || '操作失败'), res.ok ? 'ok' : 'err');
   setTimeout(()=>location.reload(), 400);
 }
 async function delTask(id) {
-  if (!confirm('删除该扫描任务？（历史扫描记录保留）')) return;
+  if (!(await appConfirm('删除该扫描任务？（历史扫描记录保留）', {title: '删除扫描任务', danger: true, okText: '删除'}))) return;
   const res = await postEmpty('/api/tasks/' + id, 'DELETE');
   if (res.ok) { toast('已删除', 'ok'); setTimeout(()=>location.reload(), 600); } else toast(res.json.error || '失败', 'err');
 }

@@ -1,17 +1,22 @@
 {{define "alerts.html"}}{{template "head" .}}{{template "nav" .}}
-<p class="hint">非白名单开放端口会形成风险告警。请按实际处置选择「跟进中 / 已解决 / 已忽略」并填写说明；已解决端口再次被发现会自动重开，已忽略不再提醒。确认业务放行时可直接加入白名单。勾选多条可批量处置。</p>
+<p class="hint">非白名单开放端口会形成端口风险告警；DNS 解析失败/连通性异常会形成独立的「网络不可达」告警（可按类型筛选）。请按实际处置选择「跟进中 / 已解决 / 已忽略」并填写说明；已解决再次发现会自动重开，已忽略不再提醒。确认业务放行时可直接加入白名单（仅限端口告警）。勾选多条可批量处置。</p>
 
 <div class="panel">
   <div class="panel-title">筛选与检索</div>
   <form method="get" action="/alerts" class="filter-bar">
     <label class="field grow">检索告警<input name="q" value="{{.Query}}" placeholder="IP、端口、服务、处理人或说明"></label>
+    <label class="field">类型<select name="kind">
+      <option value="">全部</option>
+      <option value="port" {{if eq .Kind "port"}}selected{{end}}>端口风险</option>
+      <option value="unreachable" {{if eq .Kind "unreachable"}}selected{{end}}>网络不可达</option>
+    </select></label>
     <label class="field">状态<select name="status">
       <option value="">全部</option><option value="new" {{if eq .Status "new"}}selected{{end}}>待处理</option>
       <option value="acked" {{if eq .Status "acked"}}selected{{end}}>跟进中</option><option value="resolved" {{if eq .Status "resolved"}}selected{{end}}>已解决</option>
       <option value="ignored" {{if eq .Status "ignored"}}selected{{end}}>已忽略</option>
     </select></label>
     <button class="btn primary" type="submit">查询</button><a class="btn ghost" href="/alerts">重置</a>
-    <a class="btn" href="/alerts/export?q={{urlquery .Query}}&status={{.Status}}">导出 CSV</a>
+    <a class="btn" href="/alerts/export?q={{urlquery .Query}}&status={{.Status}}&kind={{.Kind}}">导出 CSV</a>
   </form>
 </div>
 
@@ -31,7 +36,7 @@
     <button class="btn batch-btn" type="button" onclick="openAlertBatchTags()" disabled>批量改资产标签</button>
     <span class="muted" id="batch-count">未选择</span>
   </div>
-  <p class="hint" style="margin:10px 0 0">批量操作会记录当前账号与审计流水；「批量加白并忽略」为每条告警新增 IP+端口+协议的精确白名单并标记为已忽略。</p>
+  <p class="hint" style="margin:10px 0 0">批量操作会记录当前账号与审计流水；「批量加白并忽略」为每条端口告警新增 IP+端口+协议的精确白名单并标记为已忽略（网络不可达告警不适用加白，会被自动跳过）。</p>
 </div>
 {{end}}
 
@@ -43,14 +48,14 @@
   {{range .Alerts}}
   <tr>
     {{if ne $.Role "viewer"}}<td><input type="checkbox" class="alert-check" value="{{.ID}}" data-ip="{{.IP}}" onclick="updateBatchCount()"></td>{{end}}
-    <td><a href="/exposure?q={{urlquery .IP}}&port={{.Port}}"><strong>{{.IP}}:{{.Port}}</strong></a><div class="muted">{{.Proto}}</div></td>
+    <td>{{if eq .Kind "unreachable"}}<strong>{{.IP}}</strong><div><span class="pill err">网络不可达</span></div><div class="muted wrap-note" title="{{unreachSuggestion .Reason}}">{{if .Reason}}{{.Reason}}{{else}}连通性异常{{end}}（悬停查看排查建议）</div>{{else}}<a href="/exposure?q={{urlquery .IP}}&port={{.Port}}"><strong>{{.IP}}:{{.Port}}</strong></a><div class="muted">{{.Proto}}</div>{{end}}</td>
     <td>{{if .Service}}{{.Service}}{{else}}<span class="muted">—</span>{{end}}</td>
     <td>{{if .InScope}}<span class="pill info">范围内</span>{{else}}<span class="pill mute">范围外</span>{{end}}</td>
     <td>{{if eq .Status "new"}}<span class="pill err">待处理</span>{{else if eq .Status "acked"}}<span class="pill run">跟进中</span>{{else}}<span class="pill mute">{{alertStatusName .Status}}</span>{{end}}</td>
     <td>{{fmtTime .LastSeenAt}}<div class="muted">首次 {{fmtTime .FirstSeenAt}}</div></td>
     <td>{{if .Handler}}{{.Handler}}{{else}}<span class="muted">—</span>{{end}}<div class="muted wrap-note" title="{{.HandleNote}}">{{if .HandleNote}}{{.HandleNote}}{{else}}—{{end}}</div></td>
     <td>{{if .SentFeishu}}<span class="pill ok">已推送</span>{{else}}<span class="muted">未推送</span>{{end}}</td>
-    {{if ne $.Role "viewer"}}<td><div class="btn-group"><a class="btn small" href="/alerts/{{.ID}}?status={{urlquery $.Status}}&q={{urlquery $.Query}}">处置</a><button class="btn small ghost" type="button" data-id="{{.ID}}" data-ip="{{.IP}}" data-port="{{.Port}}" data-proto="{{.Proto}}" onclick="alertWhitelist(this)">加白</button></div></td>{{end}}
+    {{if ne $.Role "viewer"}}<td><div class="btn-group"><a class="btn small" href="/alerts/{{.ID}}?status={{urlquery $.Status}}&q={{urlquery $.Query}}&kind={{urlquery $.Kind}}">处置</a>{{if ne .Kind "unreachable"}}<button class="btn small ghost" type="button" data-id="{{.ID}}" data-ip="{{.IP}}" data-port="{{.Port}}" data-proto="{{.Proto}}" onclick="alertWhitelist(this)">加白</button>{{end}}</div></td>{{end}}
   </tr>
   {{else}}
   <tr><td colspan="9"><div class="empty"><div class="big">没有匹配的告警</div>可调整筛选条件；新扫描发现的非白名单端口会在此登记</div></td></tr>
@@ -97,8 +102,16 @@ function updateBatchCount() {
 }
 async function alertWhitelist(btn) {
   const ip = btn.dataset.ip, port = btn.dataset.port, proto = btn.dataset.proto || 'tcp';
-  if (!confirm(`将 ${ip}:${port}/${proto} 加入白名单并标记已忽略？`)) return;
-  const res = await postForm('/api/alerts/' + btn.dataset.id + '/whitelist', new FormData());
+  const input = await appFormDialog({
+    title: '加入白名单',
+    message: `将 ${ip}:${port}/${proto} 加入白名单并标记已忽略。`,
+    okText: '确认加白',
+    fields: [{ name: 'note', label: '处理说明（可选）', placeholder: '如：业务官方服务 / 工单 #1024' }]
+  });
+  if (!input) return;
+  const body = new FormData();
+  if (input.note) body.append('note', input.note);
+  const res = await postForm('/api/alerts/' + btn.dataset.id + '/whitelist', body);
   if (res.ok) { toast('已加白并忽略', 'ok'); setTimeout(() => location.reload(), 500); }
   else toast(res.json.error || '加白失败', 'err');
 }
@@ -107,7 +120,7 @@ async function batchAction(action) {
   if (!ids.length) { toast('请先勾选要处置的告警', 'err'); return; }
   const note = document.getElementById('batch-note').value.trim();
   if ((action === 'resolved' || action === 'ignored') && !note) { toast('解决或忽略需要填写统一说明', 'err'); return; }
-  if (action === 'whitelist' && !confirm(`将选中的 ${ids.length} 条告警对应端口加入白名单并忽略？`)) return;
+  if (action === 'whitelist' && !(await appConfirm(`将选中的 ${ids.length} 条告警对应端口加入白名单并忽略？`, {title: '批量加入白名单', okText: '确认加白'}))) return;
   const body = new FormData();
   body.append('action', action);
   body.append('note', note);

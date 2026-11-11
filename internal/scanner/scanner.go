@@ -102,6 +102,10 @@ func (r *Runner) StartTask(taskID int64) (int64, error) {
 	r.scanID = scanID
 	r.active = newExecutionControl()
 	r.mu.Unlock()
+	// 任务级协议快照：仅 naabu 引擎支持 UDP，fscan 不扫 UDP（退化为纯 TCP）。
+	udpEnabled := task.WantsUDP() && !engineIsFscan(task.Engine)
+	udpOnly := task.Protocol == "udp" && !engineIsFscan(task.Engine)
+	_ = r.st.SetScanUDPEnabled(scanID, udpEnabled)
 	failStart := func(err error) (int64, error) {
 		r.fail(scanID, err)
 		r.setRunning(false)
@@ -115,6 +119,13 @@ func (r *Runner) StartTask(taskID int64) (int64, error) {
 	// 设置快照只读取一次：自检、容量预检与实际执行必须使用同一份设置，
 	// 否则执行阶段重新读取可能拿到用户刚改过的值，导致 argv 与容量结论不一致。
 	settings := r.naabuSettings()
+	// 任务级协议覆盖全局默认：tcp→纯 TCP；both→强制 SYN+TCP&UDP；udp→强制 SYN+仅 UDP。
+	settings.UDP = udpEnabled
+	settings.UDPOnly = udpOnly
+	settings.ScanType = strings.ToLower(r.setting("naabu_scan_type", "c"))
+	if settings.UDP {
+		settings.ScanType = "s"
+	}
 	// 仅 naabu 引擎需要 naabu 自检；fscan/混合引擎走独立自检，避免未装 naabu 时误拒。
 	if task.Engine == "naabu" {
 		if _, _, err := r.checkNaabu(settings); err != nil {
@@ -132,6 +143,12 @@ func (r *Runner) StartTask(taskID int64) (int64, error) {
 			return failStart(fmt.Errorf("目标为空：标签 %q 下没有资产，请调整标签或导入资产后重新执行", task.TargetTag))
 		}
 		return failStart(fmt.Errorf("目标为空：请先导入资产，或在任务中填写手工目标"))
+	}
+
+	// 域名映射补记：naabu 原生解析域名但结果只存 IP，提前记录映射供页面关联；
+	// fscan 在 execFscan 内解析并记录，避免重复 DNS 查询。
+	if !engineIsFscan(task.Engine) {
+		r.prefetchDomainMappings(specs)
 	}
 
 	if task.AddToLedger && task.TargetType == "manual" && strings.TrimSpace(task.IPs) != "" {
@@ -266,9 +283,14 @@ type NaabuSettings struct {
 	// TotalRate 是平台级总发包速率预算（所有并行 naabu 进程之和），空值取平台默认。
 	// ProcessBudget 是平台级 naabu 进程并发预算上限，空值取平台默认。
 	// 两者只用于容量预检收敛，不会改写用户配置的目标端口范围。
-	TotalRate        string
-	ProcessBudget    string
-	Verify           bool
+	TotalRate     string
+	ProcessBudget string
+	Verify        bool
+	// UDP 启用后在 TCP 之外同时扫描 UDP 常用端口（naabu -p u:端口，需 SYN/root）。
+	// UDPOnly 为真时只下发 UDP 端口、不扫任何 TCP（零值 false = 兼容旧行为）。
+	UDP              bool
+	UDPOnly          bool
+	UDPPorts         string
 	ResourceMonitor  bool
 	ResourceCPU      string
 	ResourceMemory   string
@@ -283,7 +305,7 @@ func (r *Runner) setting(key, fallback string) string {
 }
 
 func (r *Runner) naabuSettings() NaabuSettings {
-	return NaabuSettings{
+	s := NaabuSettings{
 		Path:             r.naabuPath(),
 		Rate:             r.setting("naabu_rate", r.cfg.NaabuRate),
 		Retries:          r.setting("naabu_retries", "2"),
@@ -297,11 +319,18 @@ func (r *Runner) naabuSettings() NaabuSettings {
 		TotalRate:        r.setting("naabu_total_rate", strconv.Itoa(defaultTotalRate)),
 		ProcessBudget:    r.setting("scan_process_budget", strconv.Itoa(defaultProcessBudget)),
 		Verify:           r.st.Setting("naabu_verify") == "1",
+		UDP:              r.setting("scan_udp", "0") == "1",
+		UDPPorts:         r.setting("udp_ports", defaultUDPPorts),
 		ResourceMonitor:  r.setting("resource_monitor", "1") == "1",
 		ResourceCPU:      r.setting("resource_cpu_percent", "90"),
 		ResourceMemory:   r.setting("resource_memory_mb", "1024"),
 		ResourceDuration: r.setting("resource_duration_sec", "30"),
 	}
+	// UDP 依赖原始套接字，必须 SYN；启用 UDP 时强制扫描类型为 s。
+	if s.UDP {
+		s.ScanType = "s"
+	}
+	return s
 }
 
 // shouldAutoSplit 返回是否启用自动拆分功能（从 settings 表读取配置）。
@@ -381,6 +410,14 @@ func (s NaabuSettings) Validate() error {
 			return err
 		}
 	}
+	if s.UDPOnly && !s.UDP {
+		return fmt.Errorf("仅 UDP 模式必须同时启用 UDP 扫描")
+	}
+	if s.UDP {
+		if err := ValidatePortList(s.UDPPorts, "UDP 端口"); err != nil {
+			return err
+		}
+	}
 	if s.ResourceCPU != "" {
 		if err := validateInteger("资源告警 CPU 阈值（%）", s.ResourceCPU, 1, 100); err != nil {
 			return err
@@ -450,14 +487,51 @@ func (s NaabuSettings) args(targetsFile, outFile, mode, customPorts string) []st
 	// 域名策略保持 naabu 默认：每个域名取解析结果中的首个 IPv4 与首个 IPv6，
 	// 因此这里刻意不加 -scan-all-ips（不扩大扫描范围）。
 	args := []string{"-list", targetsFile, "-rate", s.Rate, "-retries", s.Retries,
-		"-c", s.Workers, "-timeout", s.ResponseTimeout, "-scan-type", s.ScanType, "-silent", "-json", "-o", outFile}
-	switch mode {
-	case "full":
-		args = append(args, "-p", "-")
-	case "custom":
-		args = append(args, "-p", customPorts)
-	default:
-		args = append(args, "-top-ports", "1000")
+		"-c", s.Workers, "-timeout", s.ResponseTimeout, "-scan-type", s.ScanType, "-json", "-o", outFile}
+	// -silent 会一并吞掉 naabu 的模式自述（如 "[INF] Running CONNECT scan with non root privileges"）。
+	// SYN 模式下缺少 root/CAP_NET_RAW 时 naabu 不报错退出，而是静默降级 CONNECT（UDP 随之失效），
+	// 只有保留 stderr 日志执行层才能识别降级并提示；naabu 日志走 stderr，stdout 仍只有 JSON，不影响解析。
+	if s.ScanType != "s" {
+		args = append(args, "-silent")
+	}
+	// UDP 端口必须以 u:端口 显式指定，且仅 SYN 可用；SYN 降级 CONNECT 后自动丢弃 UDP。
+	udpSpec := ""
+	if s.UDP && s.ScanType == "s" {
+		udpSpec = udpPortSpec(s.UDPPorts)
+		if udpSpec == "" {
+			udpSpec = udpPortSpec(defaultUDPPorts)
+		}
+	}
+	if s.UDPOnly {
+		if udpSpec == "" {
+			// 仅 UDP 且已降级 CONNECT：没有任何可扫协议。
+			// 绝不退回 TCP top 扫描（那会扫出用户未授权的 TCP 结果），返回 nil 由执行层跳过本批。
+			return nil
+		}
+		// 仅 UDP：只下发 u: 端口，不附加任何 TCP 端口（也不受 mode/top-ports 影响）。
+		args = append(args, "-p", udpSpec)
+	} else {
+		switch mode {
+		case "full":
+			p := "-"
+			if udpSpec != "" {
+				p = "1-65535," + udpSpec
+			}
+			args = append(args, "-p", p)
+		case "custom":
+			p := customPorts
+			if udpSpec != "" {
+				p += "," + udpSpec
+			}
+			args = append(args, "-p", p)
+		default:
+			if udpSpec != "" {
+				// -top-ports 与 -p 互斥，top+UDP 改用显式 top1000TCP + u:UDP。
+				args = append(args, "-p", top1000TCP+","+udpSpec)
+			} else {
+				args = append(args, "-top-ports", "1000")
+			}
+		}
 	}
 	if s.ExcludePorts != "" {
 		args = append(args, "-exclude-ports", s.ExcludePorts)

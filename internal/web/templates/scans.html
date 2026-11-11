@@ -50,7 +50,7 @@
 
 <script>
 async function baseline() {
-  if (!confirm('把最近一次正常完成扫描的全部开放端口加入白名单基线？')) return;
+  if (!(await appConfirm('把最近一次正常完成扫描的全部开放端口加入白名单基线？', {title: '生成白名单基线', okText: '生成基线'}))) return;
   const res = await postEmpty('/api/baseline');
   if (res.ok) { toast('已加入白名单 ' + res.json.added + ' 条', 'ok'); setTimeout(()=>location.reload(), 700); } else toast(res.json.error || '失败', 'err');
 }

@@ -20,6 +20,14 @@
       </select>
       <span class="field-help">fscan 三模式需在系统设置配置 fscan 路径；纯端口默认轻量高效，未配置时不影响 naabu 任务。</span>
     </label>
+    <label class="field">扫描协议
+      <select name="protocol" id="scan-protocol">
+        <option value="tcp" {{if eq .Task.Protocol "tcp"}}selected{{end}}>仅 TCP（默认）</option>
+        <option value="udp" {{if eq .Task.Protocol "udp"}}selected{{end}}>仅 UDP</option>
+        <option value="both" {{if eq .Task.Protocol "both"}}selected{{end}}>TCP + UDP（两者）</option>
+      </select>
+      <span class="field-help" id="protocol-help">仅 naabu 引擎生效。选 UDP（含“仅 UDP”与“TCP+UDP”）时本任务强制 SYN 并扫描 UDP 常用端口（需 root/CAP_NET_RAW）；系统设置仅作默认值，本任务可单独覆盖。</span>
+    </label>
     <label class="field full" id="custom-ports-wrap" style="display:none">自定义端口
       <input name="custom_ports" id="custom-ports" value="{{.Task.CustomPorts}}" placeholder="22,80,443 或 8000-9000 或 22,80,443,8000-9000" oninput="validateCustomPorts()">
       <span class="field-help" id="custom-ports-help">逗号分隔单端口，连字符表示范围；每个端口须在 1-65535，结束端口不小于起始端口。</span>
@@ -28,7 +36,7 @@
       <select name="target_type" id="target-type" onchange="toggleTaskFields()">
         <option value="all" {{if eq .Task.TargetType "all"}}selected{{end}}>全部资产台账</option>
         <option value="tag" {{if eq .Task.TargetType "tag"}}selected{{end}}>按资产标签圈选（运行时动态读取）</option>
-        <option value="manual" {{if eq .Task.TargetType "manual"}}selected{{end}}>手工填写 IP / 网段 / 范围</option>
+        <option value="manual" {{if eq .Task.TargetType "manual"}}selected{{end}}>手工填写 IP / 网段 / 范围 / 域名</option>
       </select>
     </label>
     <label class="field full" id="target-tag" style="display:none">资产标签
@@ -39,8 +47,8 @@
       <span class="hint">标签在「资产台账」导入或编辑；每次运行会包含该标签下的最新资产。</span>
     </label>
     <label class="field full" id="target-manual" style="display:none">手工目标（每行或逗号分隔）
-      <textarea name="ips" rows="5" placeholder="1.2.3.4&#10;10.0.0.0/24&#10;1.2.3.1-1.2.3.50">{{.Task.IPs}}</textarea>
-      <span class="field-help">支持单 IP / CIDR 网段 / IP 范围。<button type="button" class="btn small ghost" onclick="openModal('task-help-modal')">格式帮助 / 模板</button></span>
+      <textarea name="ips" rows="5" placeholder="1.2.3.4&#10;10.0.0.0/24&#10;1.2.3.1-1.2.3.50&#10;example.com">{{.Task.IPs}}</textarea>
+      <span class="field-help">支持单 IP / CIDR 网段 / IP 范围 / 域名；域名会先解析为 IP 再扫描（naabu 可扫 IPv4/IPv6，fscan 仅扫 IPv4）。<button type="button" class="btn small ghost" onclick="openModal('task-help-modal')">格式帮助 / 模板</button></span>
     </label>
     <label class="check full" id="add-ledger-wrap" style="display:none"><input type="checkbox" name="add_to_ledger" {{if .Task.AddToLedger}}checked{{end}}> 同时把手工目标加入资产台账</label>
     <label class="check full"><input type="checkbox" name="sched_enabled" id="sched-enabled" onchange="toggleTaskFields()" {{if .Task.SchedEnabled}}checked{{end}}> 启用定时计划</label>
@@ -77,13 +85,14 @@
   <div class="modal lg">
     <div class="modal-head"><h3>手工目标格式与模板</h3><button class="modal-close" type="button" onclick="closeModal('task-help-modal')">×</button></div>
     <div class="modal-body">
-      <p class="hint">每行一个或逗号分隔，支持三种写法；非法行会在保存时报错并指出具体条目：</p>
+      <p class="hint">每行一个或逗号分隔，支持四种写法；非法行会在保存时报错并指出具体条目：</p>
       <div class="table-wrap"><table>
         <thead><tr><th>类型</th><th>写法</th><th>示例</th></tr></thead>
         <tbody>
           <tr><td>单 IP</td><td>点分十进制</td><td><code>1.2.3.4</code></td></tr>
           <tr><td>CIDR 网段</td><td>IP/掩码</td><td><code>10.0.0.0/24</code></td></tr>
           <tr><td>IP 范围</td><td>起-止</td><td><code>1.2.3.1-1.2.3.50</code></td></tr>
+          <tr><td>域名</td><td>主机名 / 子域</td><td><code>example.com</code>、<code>api.example.com</code></td></tr>
         </tbody>
       </table></div>
       <p class="hint" style="margin-top:12px">下载目标列表模板（可编辑后粘贴到上方输入框）：</p>

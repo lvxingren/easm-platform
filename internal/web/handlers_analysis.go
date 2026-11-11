@@ -37,6 +37,22 @@ func (s *Server) aiConfig() ai.Config {
 	}
 }
 
+// analysisGate 是「流量分析」模块总开关守卫：仅当系统设置 analysis_enabled=1 时才放行。
+// 关闭时模块入口在侧边栏隐藏，直接访问页面/API 一律返回 404，避免仅靠前端隐藏被绕过。
+func (s *Server) analysisGate(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.analysisModuleEnabled() {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "流量分析模块未启用"})
+				return
+			}
+			http.Error(w, "流量分析模块未启用", http.StatusNotFound)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (s *Server) pageAnalysis(w http.ResponseWriter, r *http.Request) {
 	bd, _ := s.baseData(r, "流量分析", "analysis")
 	items, _ := s.st.Analyses(200)

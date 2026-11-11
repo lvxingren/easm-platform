@@ -1,7 +1,7 @@
 {
   "app_name": "灵瞰 · 资产测绘管理平台",
   "listen": "127.0.0.1:8000",
-  "http_enabled": true,
+  "http_enabled": false,
   "https_enabled": true,
   "https_listen": "127.0.0.1:8443",
   "tls_cert": "data/certs/server.crt",

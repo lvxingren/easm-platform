@@ -7,10 +7,12 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -21,6 +23,7 @@ import (
 	"github.com/xuri/excelize/v2"
 
 	"easm-platform/internal/ai"
+	"easm-platform/internal/applog"
 	"easm-platform/internal/buildinfo"
 	"easm-platform/internal/cert"
 	"easm-platform/internal/config"
@@ -70,6 +73,8 @@ type pageData struct {
 	ScanMode  string
 	StartedAt string
 	Error     string
+	// AnalysisEnabled 表示「流量分析」模块开关是否打开；仅当为 true 时侧边栏才显示该入口。
+	AnalysisEnabled bool
 }
 
 func New(st *store.Store, cfg *config.Config, sc *scanner.Runner, eng *engine.Engine) *Server {
@@ -105,10 +110,28 @@ func New(st *store.Store, cfg *config.Config, sc *scanner.Runner, eng *engine.En
 				return "全部台账"
 			}
 		},
-		"alertStatusName":     alertStatusName,
-		"scanStatusName":      scanStatusName,
-		"scanStatusClass":     scanStatusClass,
-		"targetStatusName":    store.TargetStatusName,
+		"alertStatusName":   alertStatusName,
+		"unreachSuggestion": store.UnreachableSuggestion,
+		"scanStatusName":    scanStatusName,
+		"scanStatusClass":   scanStatusClass,
+		"targetStatusName":  store.TargetStatusName,
+		"isIP":              func(s string) bool { return net.ParseIP(strings.TrimSpace(s)) != nil },
+		"scanIDFromTarget": func(s string) string {
+			s = strings.TrimSpace(s)
+			if !strings.HasPrefix(s, "#") {
+				return ""
+			}
+			id := strings.TrimPrefix(s, "#")
+			if id == "" {
+				return ""
+			}
+			for _, c := range id {
+				if c < '0' || c > '9' {
+					return ""
+				}
+			}
+			return id
+		},
 		"analysisStatusName":  analysisStatusName,
 		"analysisStatusClass": analysisStatusClass,
 		"weekdayName": func(day int) string {
@@ -149,6 +172,8 @@ func (s *Server) Handler() http.Handler {
 	// 页面（只读，登录即可）
 	mux.HandleFunc("GET /{$}", s.auth(s.pageIndex))
 	mux.HandleFunc("GET /assets", s.auth(s.pageAssets))
+	mux.HandleFunc("GET /assets/domain/{domain}", s.auth(s.pageDomainDetail))
+	mux.HandleFunc("GET /api/assets", s.auth(s.apiAssets))
 	mux.HandleFunc("GET /assets/export", s.auth(s.exportAssets))
 	mux.HandleFunc("GET /exposure", s.auth(s.pageExposure))
 	mux.HandleFunc("GET /exposure/export", s.auth(s.exportExposure))
@@ -170,14 +195,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /logs", s.requireAdmin(s.pageLogs))
 	mux.HandleFunc("GET /settings", s.requireAdmin(s.pageSettings))
 	mux.HandleFunc("GET /help/whitelist", s.auth(s.pageWhitelistHelp))
-	mux.HandleFunc("GET /analysis", s.auth(s.pageAnalysis))
-	mux.HandleFunc("GET /analysis/{id}", s.auth(s.pageAnalysisDetail))
+	mux.HandleFunc("GET /analysis", s.auth(s.analysisGate(s.pageAnalysis)))
+	mux.HandleFunc("GET /analysis/{id}", s.auth(s.analysisGate(s.pageAnalysisDetail)))
 
 	// 样例文件下载
 	mux.HandleFunc("GET /api/sample/{kind}", s.auth(s.apiSample))
 
 	// 写操作（operator/admin）
 	mux.HandleFunc("POST /api/assets/import", s.requireWrite(s.apiImportAssets))
+	mux.HandleFunc("POST /api/assets/domain/whitelist", s.requireWrite(s.apiDomainWhitelist))
 	mux.HandleFunc("POST /api/assets/clear", s.requireWrite(s.apiClearAssets))
 	mux.HandleFunc("POST /api/targets", s.requireWrite(s.apiCreateTarget))
 	mux.HandleFunc("POST /api/targets/{id}/tags", s.requireWrite(s.apiSetTargetTags))
@@ -197,6 +223,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/exposure/whitelist", s.requireWrite(s.apiExposureWhitelist))
 	mux.HandleFunc("POST /api/whitelist", s.requireWrite(s.apiAddWhitelist))
 	mux.HandleFunc("POST /api/whitelist/import", s.requireWrite(s.apiImportWhitelist))
+	mux.HandleFunc("POST /api/whitelist/import/preview", s.requireWrite(s.apiWhitelistImportPreview))
+	mux.HandleFunc("POST /api/whitelist/import/apply", s.requireWrite(s.apiWhitelistImportApply))
+	mux.HandleFunc("POST /api/whitelist/{id}/remark", s.requireWrite(s.apiUpdateWhitelistRemark))
 	mux.HandleFunc("DELETE /api/whitelist/{id}", s.requireWrite(s.apiDelWhitelist))
 	mux.HandleFunc("POST /alerts/{id}", s.requireWrite(s.submitAlertForm))
 	mux.HandleFunc("POST /alerts/{id}/whitelist", s.requireWrite(s.submitAlertWhitelist))
@@ -205,9 +234,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/alerts/{id}/whitelist", s.requireWrite(s.apiAlertWhitelist))
 	mux.HandleFunc("POST /api/alerts/batch", s.requireWrite(s.apiBatchAlerts))
 	mux.HandleFunc("POST /api/alerts/manual", s.requireWrite(s.apiCreateAlertManual))
-	mux.HandleFunc("POST /api/analysis", s.requireWrite(s.apiCreateAnalysis))
-	mux.HandleFunc("POST /api/analysis/{id}/retry", s.requireWrite(s.apiRetryAnalysis))
-	mux.HandleFunc("DELETE /api/analysis/{id}", s.requireWrite(s.apiDeleteAnalysis))
+	mux.HandleFunc("POST /api/analysis", s.requireWrite(s.analysisGate(s.apiCreateAnalysis)))
+	mux.HandleFunc("POST /api/analysis/{id}/retry", s.requireWrite(s.analysisGate(s.apiRetryAnalysis)))
+	mux.HandleFunc("DELETE /api/analysis/{id}", s.requireWrite(s.analysisGate(s.apiDeleteAnalysis)))
 	mux.HandleFunc("POST /api/account/password", s.auth(s.apiChangeOwnPassword))
 
 	// 系统管理（仅 admin）
@@ -224,7 +253,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/scans/{id}/live", s.auth(s.apiScanLive))
 	mux.HandleFunc("GET /api/scans/{id}/subtasks", s.auth(s.apiScanSubTasks))
-	mux.HandleFunc("GET /api/analysis/{id}", s.auth(s.apiAnalysisStatus))
+	mux.HandleFunc("GET /api/analysis/{id}", s.auth(s.analysisGate(s.apiAnalysisStatus)))
 	mux.HandleFunc("GET /api/logs", s.requireAdmin(s.apiLogs))
 	mux.HandleFunc("POST /api/scans/{id}/{action}", s.requireWrite(s.apiScanControl))
 	mux.HandleFunc("POST /api/scans/{id}/resume", s.requireWrite(s.apiScanResume))
@@ -385,13 +414,18 @@ func sectionOf(active string) string {
 	}
 }
 
+// analysisModuleEnabled 报告「流量分析」模块开关是否打开（默认关闭，需在系统设置显式开启后才显示/可用）。
+func (s *Server) analysisModuleEnabled() bool {
+	return s.st.Setting("analysis_enabled") == "1"
+}
+
 func (s *Server) baseData(r *http.Request, title, active string) (pageData, error) {
 	n, err := s.st.NewAlertCount()
 	if err != nil {
 		return pageData{}, err
 	}
 	sess := currentUser(r)
-	return pageData{Title: title, Section: sectionOf(active), Active: active, AppName: s.cfg.AppName, Version: buildinfo.Version, User: sess.username, Role: sess.role, IsAdmin: sess.role == "admin", NewAlerts: n}, nil
+	return pageData{Title: title, Section: sectionOf(active), Active: active, AppName: s.cfg.AppName, Version: buildinfo.Version, User: sess.username, Role: sess.role, IsAdmin: sess.role == "admin", NewAlerts: n, AnalysisEnabled: s.analysisModuleEnabled()}, nil
 }
 
 func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {
@@ -443,17 +477,95 @@ func (s *Server) pageAssets(w http.ResponseWriter, r *http.Request) {
 	if filter != "tagged" && filter != "untagged" {
 		filter = ""
 	}
-	total := len(targets)
-	targets = filterTargets(targets, query, curTag, filter)
+	filtered := filterTargets(targets, query, curTag, filter)
+	items, total, page, pageSize, pages := paginateTargets(filtered, r.URL.Query().Get("page"), r.URL.Query().Get("page_size"))
+	// 域名资产关联历史服务指纹（仅当页域名行查询，避免全表 N+1）。
+	services := make([][]string, len(items))
+	for i, t := range items {
+		if t.Kind == "domain" {
+			services[i], _ = s.st.DomainServices(t.IP)
+		}
+	}
 	s.render(w, "assets.html", struct {
 		pageData
-		Targets []store.Target
-		AllTags []string
-		CurTag  string
-		Query   string
-		Filter  string
-		Total   int
-	}{bd, targets, allTags, curTag, query, filter, total})
+		Targets  []store.Target
+		AllTags  []string
+		CurTag   string
+		Query    string
+		Filter   string
+		Total    int
+		Page     int
+		PageSize int
+		Pages    int
+		PrevPage int
+		NextPage int
+		Services [][]string
+	}{bd, items, allTags, curTag, query, filter, total, page, pageSize, pages, maxInt(1, page-1), minInt(pages, page+1), services})
+}
+
+// clampPageSize 归一每页条数：默认 20，上限 100。
+func clampPageSize(v string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 20
+	}
+	if n > 100 {
+		return 100
+	}
+	return n
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// paginateTargets 对已筛选资产做内存分页，返回当页记录/总数/页码/每页/总页数。
+func paginateTargets(filtered []store.Target, pageStr, sizeStr string) (items []store.Target, total, page, pageSize, pages int) {
+	pageSize = clampPageSize(sizeStr)
+	total = len(filtered)
+	pages = (total + pageSize - 1) / pageSize
+	if pages < 1 {
+		pages = 1
+	}
+	page, _ = strconv.Atoi(strings.TrimSpace(pageStr))
+	if page < 1 {
+		page = 1
+	}
+	if page > pages {
+		page = pages
+	}
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if start > total {
+		start = total
+	}
+	if end > total {
+		end = total
+	}
+	return filtered[start:end], total, page, pageSize, pages
+}
+
+// apiAssets 返回分页资产 JSON（page_size 上限 100），供前端分页控件使用。
+func (s *Server) apiAssets(w http.ResponseWriter, r *http.Request) {
+	targets, _ := s.st.Targets()
+	curTag := r.URL.Query().Get("tag")
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	filter := r.URL.Query().Get("filter")
+	if filter != "tagged" && filter != "untagged" {
+		filter = ""
+	}
+	filtered := filterTargets(targets, query, curTag, filter)
+	items, total, page, pageSize, pages := paginateTargets(filtered, r.URL.Query().Get("page"), r.URL.Query().Get("page_size"))
+	writeJSON(w, 200, map[string]interface{}{"items": items, "total": total, "page": page, "page_size": pageSize, "pages": pages})
 }
 
 func (s *Server) pageTasks(w http.ResponseWriter, r *http.Request) {
@@ -468,11 +580,14 @@ func (s *Server) pageTasks(w http.ResponseWriter, r *http.Request) {
 	if !bd.Running || runningScan == nil || runningScan.ID != s.sc.CurrentScanID() {
 		runningScan = nil
 	}
+	// 「继续扫描」入口：最近一次已终止但未完成（stopped/partial）的执行，跳转详情页统一续扫。
+	resumableScan, _ := s.st.LatestResumableScan()
 	s.render(w, "tasks.html", struct {
 		pageData
-		Tasks       []store.ScanTask
-		RunningScan *store.Scan
-	}{bd, tasks, runningScan})
+		Tasks         []store.ScanTask
+		RunningScan   *store.Scan
+		ResumableScan *store.Scan
+	}{bd, tasks, runningScan, resumableScan})
 }
 
 func (s *Server) pageScans(w http.ResponseWriter, r *http.Request) {
@@ -626,14 +741,19 @@ func (s *Server) pageAlerts(w http.ResponseWriter, r *http.Request) {
 	if !validAlertStatus(status) {
 		status = ""
 	}
+	kind := r.URL.Query().Get("kind")
+	if kind != "port" && kind != "unreachable" {
+		kind = ""
+	}
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	alerts, _ := s.st.AlertsFiltered(status, query, 500)
+	alerts, _ := s.st.AlertsFilteredKind(status, query, kind, 500)
 	s.render(w, "alerts.html", struct {
 		pageData
 		Alerts []store.Alert
 		Status string
 		Query  string
-	}{bd, alerts, status, query})
+		Kind   string
+	}{bd, alerts, status, query, kind})
 }
 
 func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
@@ -648,7 +768,7 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "settings.html", struct {
 		pageData
 		FeishuWebhook      string
-		FeishuSecret       string
+		FeishuSecretSet    bool
 		NaabuPath          string
 		NaabuRate          string
 		NaabuRetries       string
@@ -658,6 +778,8 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		NaabuExcludePorts  string
 		NaabuInterface     string
 		NaabuVerify        bool
+		ScanUDP            bool
+		UDPPorts           string
 		ScanTimeout        string
 		ScanConcurrency    string
 		RealertDays        string
@@ -688,10 +810,13 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		FscanMode          string
 		SubfinderPath      string
 		DomainResolve      bool
+		LogLevel           string
+		UnreachableProbe   bool
+		AnalysisEnabled    bool
 	}{
 		pageData:           bd,
 		FeishuWebhook:      get("feishu_webhook", ""),
-		FeishuSecret:       get("feishu_secret", ""),
+		FeishuSecretSet:    s.st.Setting("feishu_secret") != "",
 		NaabuPath:          get("naabu_path", s.cfg.NaabuPath),
 		NaabuRate:          get("naabu_rate", s.cfg.NaabuRate),
 		NaabuRetries:       get("naabu_retries", "2"),
@@ -701,6 +826,8 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		NaabuExcludePorts:  get("naabu_exclude_ports", ""),
 		NaabuInterface:     get("naabu_interface", ""),
 		NaabuVerify:        get("naabu_verify", "0") == "1",
+		ScanUDP:            get("scan_udp", "0") == "1",
+		UDPPorts:           get("udp_ports", scanner.DefaultUDPPorts),
 		ScanTimeout:        get("scan_timeout_min", "0"),
 		ScanConcurrency:    get("scan_concurrency", "6"),
 		RealertDays:        get("realert_days", strconv.Itoa(s.cfg.RealertDays)),
@@ -731,6 +858,9 @@ func (s *Server) pageSettings(w http.ResponseWriter, r *http.Request) {
 		FscanMode:          get("fscan_mode", "port"),
 		SubfinderPath:      get("subfinder_path", ""),
 		DomainResolve:      get("domain_resolve_enabled", "0") == "1",
+		LogLevel:           get("log_level", s.cfg.LogLevel),
+		UnreachableProbe:   get("unreachable_probe", "0") == "1",
+		AnalysisEnabled:    get("analysis_enabled", "0") == "1",
 	})
 }
 
@@ -758,24 +888,36 @@ func matchImportCol(header string, candidates []string) bool {
 
 // parseImportAssets 解析导入来源：文本框为纯目标（每行或逗号/空格分隔）；上传的 CSV/TXT/XLSX
 // 支持结构化列（目标 + 维护人员 + 安全设备），按表头识别列，缺列或未提供则留空。支持域名。
-func parseImportAssets(r *http.Request) ([]store.ImportAsset, []string, error) {
+// 第三个返回值为批内重复（归一化后等价）被去掉的行数，供导入回显透明化展示。
+func parseImportAssets(r *http.Request) ([]store.ImportAsset, []string, int, error) {
 	var out []store.ImportAsset
 	var invalid []string
+	dupInFile := 0
 	seen := map[string]bool{}
 	add := func(raw, owner, device string) {
 		raw = strings.TrimSpace(strings.ReplaceAll(raw, "\ufeff", ""))
-		if raw == "" || strings.HasPrefix(raw, "#") || seen[raw] {
+		if raw == "" || strings.HasPrefix(raw, "#") {
 			return
 		}
-		kind, ok := engine.ClassifyTarget(raw)
+		// 先归一化再校验：尾点域名/未掩码 CIDR 等等价形态以规范键参与
+		// 校验与批内去重，与 store.ImportAssetsDetailed 的全局去重键保持一致。
+		spec := raw
+		if norm, _ := store.NormalizeTargetSpec(raw); norm != "" {
+			spec = norm
+		}
+		kind, ok := engine.ClassifyTarget(spec)
 		if !ok {
 			if !matchImportCol(raw, targetColCandidates) && !matchImportCol(raw, ownerColCandidates) && !matchImportCol(raw, deviceColCandidates) {
 				invalid = append(invalid, raw)
 			}
 			return
 		}
-		seen[raw] = true
-		out = append(out, store.ImportAsset{Raw: raw, Kind: kind, Owner: strings.TrimSpace(owner), SecurityDevice: strings.TrimSpace(device)})
+		if seen[spec] {
+			dupInFile++
+			return
+		}
+		seen[spec] = true
+		out = append(out, store.ImportAsset{Raw: spec, Kind: kind, Owner: strings.TrimSpace(owner), SecurityDevice: strings.TrimSpace(device)})
 	}
 	for _, l := range strings.Split(r.FormValue("ips"), "\n") {
 		for _, p := range strings.FieldsFunc(l, func(c rune) bool { return c == ',' || c == ' ' || c == '\t' || c == ';' }) {
@@ -794,7 +936,7 @@ func parseImportAssets(r *http.Request) ([]store.ImportAsset, []string, error) {
 				records, ferr = csvRows(file)
 			}
 			if ferr != nil {
-				return nil, nil, ferr
+				return nil, nil, 0, ferr
 			}
 			tc, oc, dc, hasHeader := identifyImportColumns(records)
 			start := 0
@@ -817,9 +959,9 @@ func parseImportAssets(r *http.Request) ([]store.ImportAsset, []string, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, invalid, fmt.Errorf("未解析到合法目标（支持单 IP、CIDR 网段如 10.0.0.0/24、范围如 1.2.3.1-1.2.3.50、域名如 example.com）")
+		return nil, invalid, dupInFile, fmt.Errorf("未解析到合法目标（支持单 IP、CIDR 网段如 10.0.0.0/24、范围如 1.2.3.1-1.2.3.50、域名如 example.com）")
 	}
-	return out, invalid, nil
+	return out, invalid, dupInFile, nil
 }
 
 // identifyImportColumns 按表头识别 目标/维护人员/安全设备 列；无表头时目标列取合法目标占比最高者。
@@ -907,12 +1049,12 @@ func xlsxRows(file multipart.File) ([][]string, error) {
 
 func (s *Server) apiImportAssets(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "导入资产", "", "tag="+strings.TrimSpace(r.FormValue("tag")))
-	rows, invalid, err := parseImportAssets(r)
+	rows, invalid, dupInFile, err := parseImportAssets(r)
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	added, err := s.st.ImportAssets(rows, strings.TrimSpace(r.FormValue("tag")), "手动导入")
+	added, skipped, err := s.st.ImportAssetsDetailed(rows, strings.TrimSpace(r.FormValue("tag")), "手动导入")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -921,7 +1063,7 @@ func (s *Server) apiImportAssets(w http.ResponseWriter, r *http.Request) {
 	if len(invalidSample) > 5 {
 		invalidSample = invalidSample[:5]
 	}
-	writeJSON(w, 200, map[string]interface{}{"parsed": len(rows), "added": added, "invalid": len(invalid), "invalid_sample": invalidSample})
+	writeJSON(w, 200, map[string]interface{}{"parsed": len(rows), "added": added, "skipped": skipped + dupInFile, "invalid": len(invalid), "invalid_sample": invalidSample})
 }
 
 func (s *Server) apiClearAssets(w http.ResponseWriter, r *http.Request) {
@@ -967,6 +1109,7 @@ func taskFromForm(r *http.Request) store.ScanTask {
 		Name:         strings.TrimSpace(r.FormValue("name")),
 		Mode:         mode,
 		Engine:       r.FormValue("engine"),
+		Protocol:     taskProtocolFromForm(r),
 		CustomPorts:  strings.TrimSpace(r.FormValue("custom_ports")),
 		TargetType:   targetType,
 		TargetTag:    strings.TrimSpace(r.FormValue("target_tag")),
@@ -977,6 +1120,18 @@ func taskFromForm(r *http.Request) store.ScanTask {
 		Minute:       minute,
 		Weekday:      weekday,
 	}
+}
+
+// taskProtocolFromForm 从任务表单解析扫描协议（tcp/udp/both）：
+// 优先读 protocol 选择器；兼容旧表单仅有 udp 复选框时（勾选=both、未勾=tcp）。
+func taskProtocolFromForm(r *http.Request) string {
+	if p := strings.TrimSpace(r.FormValue("protocol")); p != "" {
+		return store.NormalizeProtocol(p)
+	}
+	if r.FormValue("udp") == "on" {
+		return "both"
+	}
+	return "tcp"
 }
 
 // parseTaskIPs 清洗任务 IP 文本为换行分隔的合法规格；空表示扫描整个台账
@@ -1141,7 +1296,7 @@ func parseWhitelistLines(text string) ([]store.WLEntry, error) {
 			ports = append(ports, tk)
 		}
 		if len(ports) == 0 {
-			return nil, fmt.Errorf("未解析到端口（行: %s）", line)
+			return nil, fmt.Errorf("%w（行: %s）", ErrNoPortSpec, line)
 		}
 		e := store.WLEntry{IPSpec: ipSpec, PortSpec: strings.Join(ports, ","), Proto: proto, Owner: "import"}
 		if err := engine.ValidateEntry(e); err != nil {
@@ -1180,22 +1335,38 @@ func allDigits(s string) bool {
 	return true
 }
 
-func (s *Server) apiImportWhitelist(w http.ResponseWriter, r *http.Request) {
-	s.audit(r, "导入白名单", "", "")
-	entries, err := parseWhitelistLines(r.FormValue("entries"))
-	if err != nil {
-		writeJSON(w, 400, map[string]string{"error": err.Error()})
-		return
-	}
-	n := 0
-	for _, e := range entries {
-		if _, err := s.st.AddWhitelist(e); err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
+// 白名单批量导入相关接口（解析计划、预览、确认导入、一步式导入）见 whitelist_import.go。
+
+// parseWhitelistImport 拆分导入文本为「手动 IP+端口」与「待自动匹配的 IP」两类。
+// autoMatch 开启时，纯 IP 行（无端口）归入自动匹配；CIDR/范围/通配跳过并提示。
+func parseWhitelistImport(text string, autoMatch bool) (manual []store.WLEntry, autoIPs, skipped []string, err error) {
+	for i, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(strings.ReplaceAll(raw, "\ufeff", ""))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-		n++
+		entries, perr := parseWhitelistLines(line)
+		if perr == nil {
+			manual = append(manual, entries...)
+			continue
+		}
+		if autoMatch && errors.Is(perr, ErrNoPortSpec) {
+			ip := strings.Fields(line)[0]
+			if net.ParseIP(ip) != nil {
+				autoIPs = append(autoIPs, ip)
+			} else {
+				skipped = append(skipped, ip+"（仅单 IP 可自动匹配）")
+			}
+			continue
+		}
+		// 逐行容错：与表格导入、README 承诺一致——非法行只跳过并回显行号与原因，
+		// 不阻断整批入库（粘贴大段端口清单时不会因一行手误全丢）。
+		skipped = append(skipped, fmt.Sprintf("第 %d 行 %v", i+1, perr))
 	}
-	writeJSON(w, 200, map[string]interface{}{"parsed": len(entries), "added": n})
+	if len(manual) == 0 && len(autoIPs) == 0 {
+		return nil, nil, skipped, fmt.Errorf("未解析到有效白名单条目")
+	}
+	return manual, autoIPs, skipped, nil
 }
 
 func (s *Server) apiBaseline(w http.ResponseWriter, r *http.Request) {
@@ -1210,6 +1381,11 @@ func (s *Server) apiBaseline(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiAddWhitelist(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "新增白名单", strings.TrimSpace(r.FormValue("ip_spec"))+":"+strings.TrimSpace(r.FormValue("port_spec")), "")
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	if reason == "" {
+		writeJSON(w, 400, map[string]string{"error": "请填写加白原因（必填）"})
+		return
+	}
 	e := store.WLEntry{
 		IPSpec:   strings.TrimSpace(r.FormValue("ip_spec")),
 		PortSpec: strings.TrimSpace(r.FormValue("port_spec")),
@@ -1218,6 +1394,7 @@ func (s *Server) apiAddWhitelist(w http.ResponseWriter, r *http.Request) {
 		Owner:    strings.TrimSpace(r.FormValue("owner")),
 		Remark:   strings.TrimSpace(r.FormValue("remark")),
 		Business: strings.TrimSpace(r.FormValue("business")),
+		Reason:   reason,
 	}
 	if err := engine.ValidateEntry(e); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -1240,6 +1417,32 @@ func (s *Server) apiDelWhitelist(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
+// apiUpdateWhitelistRemark 行内编辑白名单「原因+备注」：只改这两项，不改动匹配规则；
+// 导入的条目与单条添加/基线/告警加白产生的条目均可编辑。reason 必填（与新增一致）。
+func (s *Server) apiUpdateWhitelistRemark(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if id <= 0 {
+		writeJSON(w, 400, map[string]string{"error": "白名单 ID 非法"})
+		return
+	}
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	remark := strings.TrimSpace(r.FormValue("remark"))
+	if reason == "" {
+		writeJSON(w, 400, map[string]string{"error": "请填写加白原因（必填）"})
+		return
+	}
+	if len(remark) > wlRemarkMaxBytes {
+		writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("备注过长，请控制在 %d 字节以内", wlRemarkMaxBytes)})
+		return
+	}
+	if err := s.st.UpdateWhitelistNote(id, reason, remark); err != nil {
+		writeJSON(w, 404, map[string]string{"error": err.Error()})
+		return
+	}
+	s.audit(r, "编辑白名单原因/备注", "#"+r.PathValue("id"), "reason="+reason+"；remark="+remark)
+	writeJSON(w, 200, map[string]string{"ok": "1"})
+}
+
 func (s *Server) apiAckAlert(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	s.audit(r, "处理告警", "#"+r.PathValue("id"), "")
@@ -1250,12 +1453,29 @@ func (s *Server) apiAckAlert(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
+// formMaxMemory 是文本类表单接口解析的内存上限（无大文件上传），仅用于防御超大畸形请求体。
+const formMaxMemory = 16 << 20
+
+// parseAnyForm 兼容 application/x-www-form-urlencoded 与 multipart/form-data 两种表单编码。
+// r.ParseForm() 只解析 urlencoded 请求体：浏览器 fetch(new FormData(...)) 默认发送 multipart，
+// 直接用它会让 r.Form / r.PostForm / r.FormValue 全为空（历史 bug：暴露面批量加白报
+// 「未选择任何暴露面条目」）。ParseMultipartForm 内部会先调 ParseForm，因此两种编码都能用；
+// 非 multipart 请求会返回 ErrNotMultipart，此时只要 PostForm 已填充就视为解析成功。
+func parseAnyForm(r *http.Request) error {
+	if err := r.ParseMultipartForm(formMaxMemory); err != nil && r.PostForm == nil {
+		return err
+	}
+	return nil
+}
+
 // apiSaveSettings 按类别部分更新系统设置：请求提交了哪一类字段，就只校验并保存哪一类，
 // 未提交的类别保持原值不变。前端「通知与告警 / naabu 参数 / 资源监测 / AI 分析」各自独立表单，
 // 均 POST 到本接口而互不覆盖；SaveSettings 只写入 pairs 中存在的键，天然支持部分保存。
 func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		writeJSON(w, 400, map[string]string{"error": "表单解析失败"})
+	// 必须兼容 multipart：浏览器 fetch(new FormData(form)) 发送的是 multipart/form-data，
+	// 只调 ParseForm 会导致下面 has() 读 PostForm 全为 false（“没有可保存的配置项”）。
+	if err := parseAnyForm(r); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "表单解析失败：" + err.Error()})
 		return
 	}
 	has := func(key string) bool { _, ok := r.PostForm[key]; return ok }
@@ -1269,10 +1489,14 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 	pairs := map[string]string{}
 
 	// 通知与告警
-	if has("feishu_webhook") || has("feishu_secret") || has("realert_days") || has("alert_out_of_scope") {
+	if has("feishu_webhook") || has("feishu_secret") || has("realert_days") || has("alert_out_of_scope") || has("unreachable_probe") {
 		pairs["feishu_webhook"] = val("feishu_webhook")
-		pairs["feishu_secret"] = val("feishu_secret")
+		// 加签密钥留空表示不修改（与 AI Token 一致，避免明文回填与误清空）
+		if sec := val("feishu_secret"); sec != "" {
+			pairs["feishu_secret"] = sec
+		}
 		pairs["alert_out_of_scope"] = onOff("alert_out_of_scope")
+		pairs["unreachable_probe"] = onOff("unreachable_probe")
 		if has("realert_days") {
 			if days, err := strconv.Atoi(val("realert_days")); err != nil || days < 1 || days > 3650 {
 				writeJSON(w, 400, map[string]string{"error": "配置未保存：重告警周期必须是 1-3650 的整数天数"})
@@ -1290,8 +1514,13 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 			Concurrency: val("scan_concurrency"),
 			ScanType:    strings.ToLower(val("naabu_scan_type")), ExcludePorts: val("naabu_exclude_ports"), Interface: val("naabu_interface"),
 			Verify:          r.PostFormValue("naabu_verify") == "on",
+			UDP:             r.PostFormValue("scan_udp") == "on",
+			UDPPorts:        val("udp_ports"),
 			ResourceMonitor: r.PostFormValue("resource_monitor") == "on", ResourceCPU: val("resource_cpu_percent"),
 			ResourceMemory: val("resource_memory_mb"), ResourceDuration: val("resource_duration_sec"),
+		}
+		if settings.UDP && strings.TrimSpace(settings.UDPPorts) == "" {
+			settings.UDPPorts = scanner.DefaultUDPPorts
 		}
 		if err := settings.Validate(); err != nil {
 			writeJSON(w, 400, map[string]string{"error": "配置未保存：" + err.Error()})
@@ -1308,6 +1537,8 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 		pairs["naabu_exclude_ports"] = settings.ExcludePorts
 		pairs["naabu_interface"] = settings.Interface
 		pairs["naabu_verify"] = onOff("naabu_verify")
+		pairs["scan_udp"] = onOff("scan_udp")
+		pairs["udp_ports"] = settings.UDPPorts
 		pairs["resource_monitor"] = onOff("resource_monitor")
 		pairs["resource_cpu_percent"] = settings.ResourceCPU
 		pairs["resource_memory_mb"] = settings.ResourceMemory
@@ -1315,7 +1546,7 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// AI 分析
-	if has("ai_endpoint") || has("ai_model") || has("ai_timeout_sec") || has("ai_temperature") || has("ai_key") {
+	if has("ai_endpoint") || has("ai_model") || has("ai_timeout_sec") || has("ai_temperature") || has("ai_key") || has("analysis_enabled") {
 		if ep := val("ai_endpoint"); ep != "" {
 			if err := ai.ValidateEndpoint(ep); err != nil {
 				writeJSON(w, 400, map[string]string{"error": "配置未保存：" + err.Error()})
@@ -1342,6 +1573,8 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 		if k := val("ai_key"); k != "" {
 			pairs["ai_key"] = k
 		}
+		// 流量分析模块开关（与 AI 同面板提交）：未勾选时 onOff 返回 "0"，即关闭后模块隐藏且不可访问。
+		pairs["analysis_enabled"] = onOff("analysis_enabled")
 	}
 
 	// 自动拆分降级
@@ -1374,8 +1607,27 @@ func (s *Server) apiSaveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 日志级别（热生效，仅控制 stderr；环形缓冲始终全量）
+	if has("log_level") {
+		lv := val("log_level")
+		if lv != "info" && lv != "warn" && lv != "error" {
+			writeJSON(w, 400, map[string]string{"error": "配置未保存：日志级别必须为 info/warn/error"})
+			return
+		}
+		pairs["log_level"] = lv
+		applog.SetMinLevel(lv)
+	}
+
 	if len(pairs) == 0 {
-		writeJSON(w, 400, map[string]string{"error": "没有可保存的配置项"})
+		// 把实际收到的字段名回显：典型场景是脚本/API 客户端发了空表单或 JSON body（本接口只收表单编码），
+		// 或旧版二进制不认识新版字段；列出收到键能直接区分这两类原因。
+		received := make([]string, 0, len(r.PostForm))
+		for key := range r.PostForm {
+			received = append(received, key)
+		}
+		sort.Strings(received)
+		errorf := "没有可保存的配置项：本次请求未包含任何已知配置字段（收到字段：%s）。本接口仅接受表单编码（application/x-www-form-urlencoded 或 multipart）提交；若你刚更新过版本，请确认服务端二进制已重新编译部署。"
+		writeJSON(w, 400, map[string]string{"error": fmt.Sprintf(errorf, strings.Join(received, ", "))})
 		return
 	}
 	if err := s.st.SaveSettings(pairs); err != nil {

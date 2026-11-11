@@ -45,6 +45,49 @@ type ring struct {
 
 var global = &ring{nextID: 1}
 
+// minLevel 控制 stderr 输出的最低级别（默认 warn）；环形缓冲始终全量记录，不受影响。
+var (
+	levelMu  sync.Mutex
+	minLevel = LevelWarn
+)
+
+// SetMinLevel 设置 stderr 最低输出级别（info|warn|error），热生效。
+func SetMinLevel(l string) {
+	levelMu.Lock()
+	defer levelMu.Unlock()
+	switch l {
+	case LevelInfo, LevelWarn, LevelError:
+		minLevel = l
+	default:
+		minLevel = LevelWarn
+	}
+}
+
+// MinLevel 返回当前 stderr 最低级别。
+func MinLevel() string {
+	levelMu.Lock()
+	defer levelMu.Unlock()
+	return minLevel
+}
+
+func levelRank(l string) int {
+	switch l {
+	case LevelInfo:
+		return 0
+	case LevelWarn:
+		return 1
+	case LevelError:
+		return 2
+	}
+	return 0
+}
+
+func stderrAllowed(l string) bool {
+	levelMu.Lock()
+	defer levelMu.Unlock()
+	return levelRank(l) >= levelRank(minLevel)
+}
+
 // Init 把标准 log 的输出接管为「stderr + 内存环形缓冲」，应在 main 最早调用。
 func Init() {
 	log.SetFlags(log.LstdFlags)
@@ -62,7 +105,16 @@ type teeWriter struct {
 }
 
 func (w *teeWriter) Write(p []byte) (int, error) {
-	global.appendLine(string(p))
+	line := strings.TrimRight(string(p), "\r\n")
+	if line != "" {
+		ts, rest := splitTimestamp(line)
+		level, msg := classify(rest)
+		// 环形缓冲始终全量记录，保证「运行日志」页分级检索不受 stderr 级别影响。
+		global.append(Entry{Ts: ts, Level: level, Msg: msg})
+		if !stderrAllowed(level) {
+			return len(p), nil
+		}
+	}
 	if w.stderr != nil {
 		return w.stderr.Write(p)
 	}

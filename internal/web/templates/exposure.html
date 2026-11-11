@@ -73,6 +73,24 @@
     </div>
   </div>
 </div>
+
+<!-- 加白：必须填写原因，备注可选 -->
+<div class="modal-mask" id="exposure-wl-modal" style="display:none" onclick="modalBackdrop(event,'exposure-wl-modal')">
+  <div class="modal">
+    <div class="modal-head"><h3>加入白名单</h3><button class="modal-close" type="button" onclick="closeModal('exposure-wl-modal')">×</button></div>
+    <div class="modal-body">
+      <div class="stack">
+        <p class="hint" id="exposure-wl-target" style="margin:0"></p>
+        <label class="field">加白原因（必填）<textarea id="exposure-wl-reason" rows="2" placeholder="如：业务官方服务 / 已确认合规 / 工单 #1024"></textarea></label>
+        <label class="field">备注（可选）<input id="exposure-wl-remark" placeholder="补充说明，可留空"></label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" type="button" onclick="closeModal('exposure-wl-modal')">取消</button>
+      <button class="btn primary" type="button" onclick="submitExposureWhitelist()">确认加白</button>
+    </div>
+  </div>
+</div>
 <script>
 function exposureSelected() {
   return Array.from(document.querySelectorAll('.exposure-check:checked'));
@@ -90,32 +108,47 @@ function clearExposureSelection() {
   if (master) master.checked = false;
   updateExposureBatch();
 }
-async function whitelistOne(ip, port, proto, service) {
-  if (!confirm(`将 ${ip}:${port}/${proto || 'tcp'} 加入白名单？`)) return;
-  const body = new FormData();
-  body.append('ip_spec', ip); body.append('port_spec', String(port)); body.append('proto', proto || 'tcp');
-  if (service) body.append('service', service);
-  body.append('remark', '暴露面确认放行');
-  const res = await postForm('/api/whitelist', body);
-  if (res.ok) { toast('已加入白名单', 'ok'); setTimeout(() => location.reload(), 600); }
-  else toast(res.json.error || '加白失败', 'err');
+// 待加白条目（由单条/批量入口填充），统一走模态框收集必填原因后提交。
+let exposureWlItems = [];
+function openExposureWhitelist(items) {
+  exposureWlItems = items;
+  document.getElementById('exposure-wl-reason').value = '';
+  document.getElementById('exposure-wl-remark').value = '';
+  const summary = items.length === 1
+    ? `将 ${items[0].ip}:${items[0].port}/${items[0].proto || 'tcp'} 加入白名单`
+    : `将选中的 ${items.length} 个 IP:端口 加入白名单`;
+  document.getElementById('exposure-wl-target').textContent = summary + '；加白原因为必填项。';
+  openModal('exposure-wl-modal');
 }
-async function batchWhitelist() {
+function whitelistOne(ip, port, proto, service) {
+  openExposureWhitelist([{ ip, port, proto, service }]);
+}
+function batchWhitelist() {
   const rows = exposureSelected();
   if (!rows.length) { toast('请先勾选暴露面条目', 'err'); return; }
-  if (!confirm(`将选中的 ${rows.length} 个 IP:端口 加入白名单？`)) return;
+  openExposureWhitelist(rows.map(c => ({ ip: c.dataset.ip, port: c.dataset.port, proto: c.dataset.proto || 'tcp', service: c.dataset.service || '' })));
+}
+async function submitExposureWhitelist() {
+  if (!exposureWlItems.length) { toast('没有待加白的条目', 'err'); return; }
+  const reason = document.getElementById('exposure-wl-reason').value.trim();
+  if (!reason) { toast('请填写加白原因（必填）', 'err'); return; }
+  const remark = document.getElementById('exposure-wl-remark').value.trim();
   const body = new FormData();
-  rows.forEach(c => {
-    body.append('ip', c.dataset.ip);
-    body.append('port', c.dataset.port);
-    body.append('proto', c.dataset.proto || 'tcp');
-    body.append('service', c.dataset.service || '');
+  body.append('remark', remark);
+  // reason 与 ip/port 逐行对齐提交（本弹窗一个原因应用到本批全部），后端按行校验非空。
+  exposureWlItems.forEach(it => {
+    body.append('ip', it.ip);
+    body.append('port', String(it.port));
+    body.append('proto', it.proto || 'tcp');
+    body.append('service', it.service || '');
+    body.append('reason', reason);
   });
   const res = await postForm('/api/exposure/whitelist', body);
   if (res.ok) {
     toast(`已加白 ${res.json.added} 条${res.json.skipped ? '，跳过 ' + res.json.skipped + ' 条' : ''}`, 'ok');
+    closeModal('exposure-wl-modal');
     setTimeout(() => location.reload(), 700);
-  } else toast(res.json.error || '批量加白失败', 'err');
+  } else toast(res.json.error || '加白失败', 'err');
 }
 function openExposureTags() {
   const ips = Array.from(new Set(exposureSelected().map(c => c.dataset.ip)));

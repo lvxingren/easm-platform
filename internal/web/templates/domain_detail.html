@@ -1,0 +1,38 @@
+{{define "domain_detail.html"}}{{template "head" .}}{{template "nav" .}}
+<div class="row between" style="margin-bottom:16px">
+  <a class="btn ghost small" href="/assets">返回资产台账</a>
+  {{if ne .Role "viewer"}}<button class="btn primary" type="button" onclick="whitelistDomain()">一键加白所有衍生 IP 端口</button>{{end}}
+</div>
+
+<div class="panel">
+  <div class="panel-title">域名 {{.Domain}}</div>
+  <div class="grid">
+    <div><div class="muted">衍生 IP 数</div><strong>{{len .IPs}}</strong></div>
+    <div><div class="muted">开放端口数</div><strong>{{len .Ports}}</strong></div>
+    <div><div class="muted">安全设备</div><strong>{{if .Device}}<span class="pill ok">{{.Device}}</span>{{else}}<span class="muted">—</span>{{end}}</strong></div>
+    <div><div class="muted">服务指纹</div><strong>{{range $i, $s := .Services}}{{if $i}}, {{end}}<span class="tag">{{$s}}</span>{{else}}<span class="muted">—</span>{{end}}</strong></div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">关联端口（DNS 衍生 IP 的开放端口）</div>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>IP</th><th>端口</th><th>协议</th><th>服务</th></tr></thead>
+    <tbody>
+    {{range .Ports}}<tr><td class="command-text">{{.IP}}</td><td class="num-cell">{{.Port}}</td><td>{{.Proto}}</td><td>{{if .Service}}{{.Service}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+    {{else}}<tr><td colspan="4"><div class="empty"><div class="big">暂无关联端口</div>该域名尚未解析出开放端口，先运行扫描任务</div></td></tr>{{end}}
+    </tbody>
+  </table>
+  </div>
+</div>
+<script>
+async function whitelistDomain() {
+  if (!(await appConfirm('将域名下所有衍生 IP 的开放端口加入白名单？', {title: '批量加入白名单', okText: '开始加白'}))) return;
+  const body = new FormData(); body.append('domain', {{.Domain}});
+  const res = await postForm('/api/assets/domain/whitelist', body);
+  if (res.ok) { toast(`已加白 ${res.json.added} 条`, 'ok'); setTimeout(() => location.reload(), 600); }
+  else toast(res.json.error || '加白失败', 'err');
+}
+</script>
+{{template "foot" .}}{{end}}

@@ -74,6 +74,12 @@ func TestExposureWhitelistBatchAndRBAC(t *testing.T) {
 	if rec := scanFormRequest(server, "/api/exposure/whitelist", "viewer", form); rec.Code != http.StatusForbidden {
 		t.Fatalf("viewer 暴露面加白状态=%d，期望 403", rec.Code)
 	}
+	// 缺少必填原因应 400
+	if rec := scanFormRequest(server, "/api/exposure/whitelist", "operator", form); rec.Code != http.StatusBadRequest {
+		t.Fatalf("未填原因应 400，实际 %d 响应=%s", rec.Code, rec.Body.String())
+	}
+	form.Set("reason", "业务官方服务")
+	form.Set("remark", "已核实")
 	rec := scanFormRequest(server, "/api/exposure/whitelist", "operator", form)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("operator 暴露面加白状态=%d，响应=%s", rec.Code, rec.Body.String())
@@ -92,6 +98,9 @@ func TestExposureWhitelistBatchAndRBAC(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].IPSpec != "192.0.2.1" || entries[0].PortSpec != "443" {
 		t.Fatalf("白名单落库异常: %+v", entries)
+	}
+	if entries[0].Reason != "业务官方服务" || entries[0].Remark != "已核实" {
+		t.Fatalf("加白原因/备注未落库: %+v", entries[0])
 	}
 	logs, _ := st.AuditLogs(20)
 	found := false
@@ -205,5 +214,52 @@ func TestAuditLogsFilteredStore(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Fatalf("无关关键词应无结果: %+v", none)
+	}
+}
+
+// TestWhitelistSingleAddRequiresReason 单条新增白名单：reason 必填，缺失 400，填写后与 remark 分开落库。
+func TestWhitelistSingleAddRequiresReason(t *testing.T) {
+	server, st := newScanLiveTestServer(t)
+	addTestAdmin(t, server, st)
+	form := url.Values{}
+	form.Set("ip_spec", "10.1.0.1")
+	form.Set("port_spec", "443")
+	form.Set("proto", "tcp")
+	if rec := scanFormRequest(server, "/api/whitelist", "admin", form); rec.Code != http.StatusBadRequest {
+		t.Fatalf("缺原因应 400，实际 %d 响应=%s", rec.Code, rec.Body.String())
+	}
+	form.Set("reason", "业务官方服务")
+	form.Set("remark", "备注x")
+	if rec := scanFormRequest(server, "/api/whitelist", "admin", form); rec.Code != http.StatusOK {
+		t.Fatalf("带原因应 200，实际 %d 响应=%s", rec.Code, rec.Body.String())
+	}
+	entries, _ := st.Whitelist()
+	if len(entries) != 1 || entries[0].Reason != "业务官方服务" || entries[0].Remark != "备注x" {
+		t.Fatalf("原因/备注未正确落库: %+v", entries)
+	}
+}
+
+// TestTasksPageResumeEntry 任务页在存在可续扫执行（stopped/partial 且有未完成目标）时显示「继续扫描」入口并链到详情页；无则隐藏。
+func TestTasksPageResumeEntry(t *testing.T) {
+	server, st := newScanLiveTestServer(t)
+	addTestAdmin(t, server, st)
+	if body := newAuthedGet(server, "/tasks", "operator").Body.String(); strings.Contains(body, "继续扫描") {
+		t.Fatal("无未完成执行时不应显示继续扫描入口")
+	}
+	sid, _ := st.CreateScan(0, "终止任务", "top")
+	_ = st.InitTargetStatus(sid, []store.TargetSpec{{Raw: "192.0.2.1", Kind: "ip"}, {Raw: "192.0.2.2", Kind: "ip"}}, 1)
+	_ = st.MarkBatchTargetStatus(sid, 0, store.TargetDone)
+	_ = st.FinishScanStatus(sid, "stopped", 1, "用户终止")
+	body := newAuthedGet(server, "/tasks", "operator").Body.String()
+	if !strings.Contains(body, "继续扫描") || !strings.Contains(body, "/scans/"+strconv.FormatInt(sid, 10)) {
+		t.Fatal("存在可续扫执行时应显示继续扫描入口并链接详情页")
+	}
+	// 已完成（done）的执行不应触发入口。
+	doneID, _ := st.CreateScan(0, "已完成", "top")
+	_ = st.InitTargetStatus(doneID, []store.TargetSpec{{Raw: "192.0.2.3", Kind: "ip"}}, 1)
+	_ = st.MarkBatchTargetStatus(doneID, 0, store.TargetDone)
+	_ = st.FinishScanStatus(doneID, "done", 1, "")
+	if sc, _ := st.LatestResumableScan(); sc == nil || sc.ID != sid {
+		t.Fatalf("LatestResumableScan 应返回最近的可续扫执行 #%d，实际 %+v", sid, sc)
 	}
 }

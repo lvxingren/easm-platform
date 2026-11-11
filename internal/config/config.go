@@ -17,6 +17,7 @@ type Config struct {
 	TLSHosts        []string `json:"tls_hosts"`
 	AppName         string   `json:"app_name"`
 	DBPath          string   `json:"db_path"`
+	LogLevel        string   `json:"log_level"`
 	NaabuPath       string   `json:"naabu_path"`
 	NaabuRate       string   `json:"naabu_rate"`
 	RealertDays     int      `json:"realert_days"`
@@ -51,6 +52,9 @@ func Load(path string) (*Config, error) {
 	}
 	if c.DBPath == "" {
 		c.DBPath = "data/easm.db"
+	}
+	if c.LogLevel == "" {
+		c.LogLevel = "warn"
 	}
 	if c.NaabuPath == "" {
 		c.NaabuPath = "naabu"

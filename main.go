@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -68,6 +69,13 @@ func main() {
 	}
 	// 存量库性能调优：仅把仍等于旧默认值的并发/线程/速率升级到 2C4G 推荐值，保留用户自定义。
 	st.UpgradePerformanceDefaults()
+	// 日志级别：settings 优先（热生效），否则 config.log_level（默认 warn）。
+	// 仅控制 stderr 输出；进程内环形缓冲始终全量，不影响运行日志页。
+	logLevel := st.Setting("log_level")
+	if logLevel == "" {
+		logLevel = cfg.LogLevel
+	}
+	applog.SetMinLevel(logLevel)
 	if err := st.EnsureAdmin(cfg.Admin.User, cfg.Admin.Password); err != nil {
 		log.Fatalf("初始化管理员账号失败: %v", err)
 	}
@@ -105,11 +113,34 @@ func main() {
 		}
 	}
 
+	// 先同步绑定监听端口：端口被占用等问题能在此处立即以清晰信息报错（而非在 goroutine 里静默 fatal），
+	// 只有绑定成功后才对外打印访问 URL，避免“报了地址却连不上”。
+	var httpLn, httpsLn net.Listener
 	if httpOn {
-		httpSrv := &http.Server{Addr: cfg.Listen, Handler: handler, ErrorLog: applog.NewServerErrorLogger()}
+		ln, err := net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "HTTP 监听 %s 失败（端口可能被占用，或已有实例在运行）: %v\n", cfg.Listen, err)
+			os.Exit(1)
+		}
+		httpLn = ln
+	}
+	if cfg.HTTPSEnabled {
+		ln, err := net.Listen("tcp", cfg.HTTPSListen)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "HTTPS 监听 %s 失败（端口可能被占用，或已有实例在运行）: %v\n", cfg.HTTPSListen, err)
+			os.Exit(1)
+		}
+		httpsLn = ln
+	}
+
+	// 启动横幅：无视日志级别，直接打 stdout，确保用户总能看到可访问的 URL。
+	printAccessBanner(cfg, httpOn)
+
+	if httpOn {
+		httpSrv := &http.Server{Handler: handler, ErrorLog: applog.NewServerErrorLogger()}
 		go func() {
-			applog.Infof("%s HTTP 启动: http://%s", cfg.AppName, cfg.Listen)
-			if err := httpSrv.ListenAndServe(); err != nil {
+			applog.Infof("%s HTTP 服务已启动: http://%s", cfg.AppName, cfg.Listen)
+			if err := httpSrv.Serve(httpLn); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("HTTP 服务退出: %v", err)
 			}
 		}()
@@ -119,7 +150,6 @@ func main() {
 		// ErrorLog 降噪：客户端不信任自签名证书/端口扫描导致的握手失败不再当 error 刷屏。
 		loader := cert.NewLoader(cfg.TLSCert, cfg.TLSKey)
 		httpsSrv := &http.Server{
-			Addr:     cfg.HTTPSListen,
 			Handler:  handler,
 			ErrorLog: applog.NewServerErrorLogger(),
 			TLSConfig: &tls.Config{
@@ -128,8 +158,8 @@ func main() {
 			},
 		}
 		go func() {
-			applog.Infof("%s HTTPS 启动: https://%s（首次登录用 config.json 里的管理员账号，登录后请到“系统管理-账号”修改；自签名证书浏览器会提示不安全，属正常）", cfg.AppName, cfg.HTTPSListen)
-			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil {
+			applog.Infof("%s HTTPS 服务已启动: https://%s（首次登录用 config.json 里的管理员账号，登录后请到“系统管理-账号”修改；自签名证书浏览器会提示不安全，属正常）", cfg.AppName, cfg.HTTPSListen)
+			if err := httpsSrv.ServeTLS(httpsLn, "", ""); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("HTTPS 服务退出: %v", err)
 			}
 		}()
@@ -140,4 +170,32 @@ func main() {
 	<-quit
 	applog.Infof("收到退出信号，关闭中...")
 	sc.Shutdown()
+}
+
+// printAccessBanner 打印可直接访问的 URL 横幅到 stdout，不受日志级别（默认 warn）过滤影响，
+// 确保启动后用户总能在终端看到入口地址（解决“启动后看不到 info 日志”的困惑）。
+func printAccessBanner(cfg *config.Config, httpOn bool) {
+	fmt.Printf("\n%s %s 已启动，可通过以下地址访问：\n", cfg.AppName, buildinfo.Version)
+	if httpOn {
+		fmt.Printf("  ➜ HTTP : %s\n", displayURL("http", cfg.Listen))
+	}
+	if cfg.HTTPSEnabled {
+		fmt.Printf("  ➜ HTTPS: %s  (自签名证书，浏览器提示不安全属正常)\n", displayURL("https", cfg.HTTPSListen))
+	}
+	fmt.Printf("  首次登录账号：%s（密码见 config.json 的 admin.password，登录后请尽快修改）\n\n", cfg.Admin.User)
+}
+
+// displayURL 把监听地址（0.0.0.0:8443 / :8443 / 127.0.0.1:8443）转成便于点击的访问 URL；
+// 全网卡监听时用 localhost 展示，并附注实际绑定地址。
+func displayURL(scheme, addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return scheme + "://" + addr
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return fmt.Sprintf("%s://localhost:%s  (监听 %s)", scheme, port, addr)
+	default:
+		return fmt.Sprintf("%s://%s", scheme, addr)
+	}
 }

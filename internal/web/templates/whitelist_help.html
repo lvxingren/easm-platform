@@ -16,12 +16,27 @@
 
 <div class="panel">
   <div class="panel-title">二、批量导入格式</div>
+  <h4>2.1 文本行</h4>
   <p class="hint">每行一条；IP 与端口之间可用空格、逗号或冒号分隔，多端口用逗号；行尾可写 <code>tcp</code>/<code>udp</code> 指定协议（默认 tcp）。</p>
   <pre class="codeblock">1.2.3.4 22,80,443
 10.0.0.5:3306
 10.0.0.0/24 1000-2000 udp
 * 443</pre>
-  <div class="row" style="margin-top:12px"><a class="btn small ghost" href="/api/sample/whitelist.txt">下载样例文件</a><a class="btn small ghost" href="/whitelist">返回白名单</a></div>
+  <h4 style="margin-top:14px">2.2 Excel / CSV 模板</h4>
+  <p class="hint">模板固定四列 <code>IP/网段、端口、服务、备注</code>，一行一条规则；首行为表头，系统按列名自动识别。需要区分 UDP 或补充维护信息时，可自行加表头列 <code>协议</code>（tcp/udp/*）、<code>负责人</code>、<code>业务</code>。删掉表头则按模板列序（IP、端口、服务、备注）解析。</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>列名</th><th>必填</th><th>写法</th><th>示例</th></tr></thead>
+    <tbody>
+      <tr><td>IP/网段</td><td>是</td><td>单 IP / CIDR / *，也可写成 <code>IP:端口</code></td><td><code>1.2.3.4</code>　<code>10.0.0.0/24</code></td></tr>
+      <tr><td>端口</td><td>否</td><td>单端口 / 范围 / 逗号分隔 / *；留空且勾选「自动匹配已识别端口」则取该 IP 历史开放端口</td><td><code>22,80,443</code>　<code>1000-2000</code></td></tr>
+      <tr><td>服务</td><td>否</td><td>服务名备注，不参与匹配</td><td><code>MySQL</code></td></tr>
+      <tr><td>备注</td><td>否</td><td>放行依据、工单号等；导入后可在列表行内直接编辑</td><td><code>工单 #1024</code></td></tr>
+    </tbody>
+  </table></div>
+  <p class="hint" style="margin-top:10px">解析逐行容错：非法 IP/端口、非法协议或端口留空（未勾选自动匹配）的行会被跳过，并回显逐条原因；同一批里 IP+端口+协议 完全相同的规则只算一条，与库中已有规则完全相同的条目会被标记为「已在白名单」，因此线下维护的整表可反复导入而不会产生重复规则。未填备注的条目可用「批量备注」兜底写入。</p>
+  <h4 style="margin-top:14px">2.3 导入流程：先预览、再确认</h4>
+  <p class="hint">页面导入固定两步：点「解析预览」只解析不写库，得到可逐条勾选的候选清单（含自动匹配已展开的具体端口、批内去重结果与跳过原因）；取消勾选即可剔除，确认无误后点「确认导入」写库。预览阶段就已存在的规则默认不勾选，即使误勾选，写入时仍会再次去重。因此一份整表可安全地多次提交，也只写入新增部分。<br>脚本对接可直接 POST <code>/api/whitelist/import</code>（一步式写入，去重与容错规则相同）；预览与确认接口分别为 <code>/api/whitelist/import/preview</code> 与 <code>/api/whitelist/import/apply</code>。</p>
+  <div class="row" style="margin-top:12px"><a class="btn small ghost" href="/api/sample/whitelist.xlsx">下载 Excel 模板</a><a class="btn small ghost" href="/api/sample/whitelist.csv">下载 CSV 模板</a><a class="btn small ghost" href="/api/sample/whitelist.txt">下载样例文件</a><a class="btn small ghost" href="/whitelist">返回白名单</a></div>
 </div>
 
 <div class="panel">
@@ -38,7 +53,7 @@
   <div class="panel-title">四、最佳实践</div>
   <p class="hint">
     · 首次使用：先跑一次全端口扫描，再在「扫描记录」页点「生成白名单基线」，把现有暴露面一次性入白，之后只关注<b>新增</b>端口；<br>
-    · 按业务分组维护白名单，填写「负责人 / 备注」便于追溯；<br>
+    · 按业务分组维护白名单，填写「负责人 / 备注」便于追溯；Excel 模板天然带备注列，建议直接在线下维护后整表导入；<br>
     · 定期复核白名单，避免把风险端口长期放行。
   </p>
 </div>

@@ -41,7 +41,7 @@
   <tbody>
   {{range .Alerts}}
   <tr>
-    <td>{{.IP}}:{{.Port}}</td><td>{{.Proto}}</td>
+    <td>{{if eq .Kind "unreachable"}}{{.IP}} <span class="pill err">网络不可达</span>{{else}}{{.IP}}:{{.Port}}{{end}}</td><td>{{if eq .Kind "unreachable"}}<span class="pill mute">—</span>{{else}}{{.Proto}}{{end}}</td>
     <td>{{if .InScope}}<span class="pill info">范围内</span>{{else}}<span class="pill mute">范围外</span>{{end}}</td>
     <td>{{if eq .Status "new"}}<span class="pill err">待处理</span>{{else if eq .Status "acked"}}<span class="pill run">跟进中</span>{{else}}<span class="pill mute">{{alertStatusName .Status}}</span>{{end}}</td>
     <td>{{fmtTime .LastSeenAt}}</td>

@@ -63,13 +63,16 @@ async function updateUser(id) {
   else { toast(res.json.error || '更新失败', 'err'); setTimeout(()=>location.reload(), 900); }
 }
 async function resetPw(id, name) {
-  const pw = prompt('为 ' + name + ' 设置新密码（至少 6 位）：');
+  const pw = await appPrompt('为 ' + name + ' 设置新密码：', {
+    title: '重置密码', label: '新密码', type: 'password', autocomplete: 'new-password',
+    minLength: 6, minLengthMessage: '新密码至少 6 位', placeholder: '至少 6 位'
+  });
   if (pw === null) return;
   const res = await postForm('/api/users/' + id + '/password', { password: pw });
   if (res.ok) toast('密码已重置', 'ok'); else toast(res.json.error || '失败', 'err');
 }
 async function delUser(id, name) {
-  if (!confirm('删除账号 ' + name + ' ？')) return;
+  if (!(await appConfirm('删除账号 ' + name + ' ？', {title: '删除账号', danger: true, okText: '删除'}))) return;
   const res = await postEmpty('/api/users/' + id, 'DELETE');
   if (res.ok) { toast('已删除', 'ok'); setTimeout(()=>location.reload(), 600); } else toast(res.json.error || '失败', 'err');
 }

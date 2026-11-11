@@ -334,9 +334,19 @@ func min64(a, b int64) int64 {
 
 // planScanCapacity 读取当前设置与平台预算，按真实 specs 计算本次执行的容量计划。
 func (r *Runner) planScanCapacity(settings NaabuSettings, mode, customPorts string, specs []store.TargetSpec) (capacityPlan, error) {
-	ports, err := modePortCount(mode, customPorts, settings.ExcludePorts)
-	if err != nil {
-		return capacityPlan{}, err
+	// top+UDP（非仅 UDP）时 args 会改用显式 -p top1000TCP（条件与 udpSpec 一致），预检同步拿实际下发数。
+	// 仅 UDP 模式不下发任何 TCP 端口，因此 TCP 部分计 0，只统计 UDP 端口。
+	ports := 0
+	if !settings.UDPOnly {
+		p, err := modePortCount(mode, customPorts, settings.ExcludePorts, settings.UDP && settings.ScanType == "s")
+		if err != nil {
+			return capacityPlan{}, err
+		}
+		ports = p
+	}
+	// 启用 UDP 时把 UDP 端口数计入容量估算（TCP+UDP 同批扫描，或仅 UDP）。
+	if settings.UDP {
+		ports += udpPortCount(settings.UDPPorts)
 	}
 	work, capped := batchWorkload(specs)
 	workers, _ := strconv.Atoi(settings.Workers)
@@ -508,9 +518,12 @@ func parsePortBitmap(value string) (portBitmap, error) {
 	return bitmap, nil
 }
 
-// modePortCount 返回本次扫描单目标探测的端口数（精确差集）；不修改目标端口范围。
+// modePortCount 返回本次扫描单目标探测的端口数；不修改目标端口范围。
 // 自定义端口与排除端口都先构造去重集合，再求差集；差集为空时直接报错。
-func modePortCount(mode, customPorts, excludePorts string) (int, error) {
+// topExplicitPorts 表示 top 模式实际下发的是显式 -p 列表（top+UDP 组合，见 NaabuSettings.args）：
+// 此时事件与估算都能按平台自己的 top1000TCP 列表与排除集合求精确差集；
+// 否则用 -top-ports，实际集合由 naabu 内置列表决定，平台只能按排除量保守扣减。
+func modePortCount(mode, customPorts, excludePorts string, topExplicitPorts bool) (int, error) {
 	excluded, err := parsePortBitmap(excludePorts)
 	if err != nil {
 		return 0, fmt.Errorf("容量预检无法解析排除端口：%v", err)
@@ -533,6 +546,18 @@ func modePortCount(mode, customPorts, excludePorts string) (int, error) {
 		}
 		return remaining, nil
 	default:
+		if topExplicitPorts {
+			// 显式下发 top1000TCP：事件记录的就是实际下发端口数（精确差集，与 custom 同款语义）。
+			tcp, err := parsePortBitmap(top1000TCP)
+			if err != nil {
+				return 0, fmt.Errorf("容量预检无法解析 top 模式显式端口列表：%v", err)
+			}
+			remaining := tcp.minus(&excluded)
+			if remaining < 1 {
+				return 0, fmt.Errorf("容量预检未通过：top 模式实际下发的常用端口在排除端口 %q 后为空，没有可扫描的端口", strings.TrimSpace(excludePorts))
+			}
+			return remaining, nil
+		}
 		// 常用端口由 naabu 内置 top-1000 列表决定，平台无法精确枚举；
 		// 这里只按排除集合大小做保守扣减，并拒绝“排除量已达 1000”的必然空集。
 		excludedCount := excluded.count()

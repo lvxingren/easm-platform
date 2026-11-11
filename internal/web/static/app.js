@@ -96,14 +96,17 @@ function toggleNavGroup(id) {
   try { localStorage.setItem('easm-nav-' + id, collapsed ? '0' : '1'); } catch (e) {}
 }
 (function () {
-  const sec = document.getElementById('sec-ops');
-  if (!sec) return;
-  let collapsed = false;
-  try { collapsed = localStorage.getItem('easm-nav-sec-ops') === '0'; } catch (e) {}
-  if (sec.querySelector('.nav-sec-body .nav-item.active')) collapsed = false;
-  sec.classList.toggle('collapsed', collapsed);
-  const btn = sec.querySelector('.nav-sec-toggle');
-  if (btn) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  // 安全运营与系统管理两个分组共用折叠逻辑；当前页在组内时强制展开。
+  ['sec-ops', 'sec-admin'].forEach(function (id) {
+    const sec = document.getElementById(id);
+    if (!sec) return;
+    let collapsed = false;
+    try { collapsed = localStorage.getItem('easm-nav-' + id) === '0'; } catch (e) {}
+    if (sec.querySelector('.nav-sec-body .nav-item.active')) collapsed = false;
+    sec.classList.toggle('collapsed', collapsed);
+    const btn = sec.querySelector('.nav-sec-toggle');
+    if (btn) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  });
 })();
 
 // 通用模态：显示/隐藏 .modal-mask 容器（复用改密弹窗样式）
@@ -111,6 +114,194 @@ function openModal(id) { const m = document.getElementById(id); if (m) m.style.d
 function closeModal(id) { const m = document.getElementById(id); if (m) m.style.display = 'none'; }
 // 点击遮罩空白处关闭（onclick="modalBackdrop(event,'id')"）
 function modalBackdrop(ev, id) { if (ev.target === ev.currentTarget) closeModal(id); }
+
+// ---------- 应用内确认 / 输入弹窗（替代浏览器原生 confirm / prompt） ----------
+// 原生弹窗在 Chrome 中会显示成「127.0.0.1:8443 显示」，样式无法与平台统一，
+// 部分内嵌环境还会直接拦截；这里复用 .modal 结构动态渲染，返回 Promise。
+// 返回值：appFormDialog 确认为字段对象、取消为 null；appConfirm 为布尔；appPrompt 为字符串或 null。
+function appFormDialog(options) {
+  const opt = Object.assign({
+    title: '请确认', message: '', okText: '确定', cancelText: '取消', danger: false, fields: []
+  }, options || {});
+  return new Promise(resolve => {
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.dataset.appDialog = '1';
+    mask.style.display = 'flex';
+
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+
+    const head = document.createElement('div');
+    head.className = 'modal-head';
+    const title = document.createElement('h3');
+    title.textContent = opt.title;
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'modal-close';
+    close.setAttribute('aria-label', '关闭');
+    close.textContent = '×';
+    head.append(title, close);
+
+    const body = document.createElement('div');
+    body.className = 'modal-body';
+    const stack = document.createElement('div');
+    stack.className = 'stack';
+    if (opt.message) {
+      const msg = document.createElement('p');
+      msg.className = 'hint';
+      msg.style.margin = '0';
+      msg.style.whiteSpace = 'pre-line';
+      msg.textContent = opt.message;
+      stack.appendChild(msg);
+    }
+    const controls = {};
+    (opt.fields || []).forEach(field => {
+      const label = document.createElement('label');
+      label.className = 'field';
+      const caption = document.createElement('span');
+      caption.textContent = field.label || '';
+      const input = field.multiline ? document.createElement('textarea') : document.createElement('input');
+      if (field.multiline) input.rows = field.rows || 3;
+      else input.type = field.type || 'text';
+      input.value = field.value || '';
+      input.placeholder = field.placeholder || '';
+      input.autocomplete = field.autocomplete || 'off';
+      label.append(caption, input);
+      if (field.help) {
+        const help = document.createElement('span');
+        help.className = 'field-help';
+        help.textContent = field.help;
+        label.appendChild(help);
+      }
+      if (field.name) controls[field.name] = input;
+      stack.appendChild(label);
+    });
+    const error = document.createElement('p');
+    error.className = 'field-help';
+    error.style.cssText = 'display:none;color:var(--danger-text);margin:0';
+    stack.appendChild(error);
+    body.appendChild(stack);
+
+    const foot = document.createElement('div');
+    foot.className = 'modal-foot';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn ghost';
+    cancelBtn.textContent = opt.cancelText;
+    const okBtn = document.createElement('button');
+    okBtn.type = 'button';
+    okBtn.className = 'btn ' + (opt.danger ? 'danger' : 'primary');
+    okBtn.textContent = opt.okText;
+    foot.append(cancelBtn, okBtn);
+
+    modal.append(head, body, foot);
+    mask.appendChild(modal);
+    document.body.appendChild(mask);
+
+    let done = false;
+    const restoreFocus = document.activeElement;
+    const finish = value => {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey, true);
+      if (mask.parentNode) mask.parentNode.removeChild(mask);
+      if (restoreFocus && restoreFocus.focus) { try { restoreFocus.focus(); } catch (e) {} }
+      resolve(value);
+    };
+    const showError = (input, text) => {
+      error.textContent = text;
+      error.style.display = 'block';
+      if (input) input.focus();
+    };
+    const submit = () => {
+      const values = {};
+      for (const field of (opt.fields || [])) {
+        const input = controls[field.name];
+        if (!input) continue;
+        const value = input.value.trim();
+        values[field.name] = value;
+        if (field.required && !value) {
+          showError(input, field.label ? field.label.replace(/（.*?）|\(.*?\)/g, '') + '不能为空' : '该项不能为空');
+          return;
+        }
+        if (field.minLength && value.length < field.minLength) {
+          showError(input, field.minLengthMessage || ('至少输入 ' + field.minLength + ' 个字符'));
+          return;
+        }
+      }
+      finish(values);
+    };
+    const onKey = ev => {
+      if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); finish(null); }
+    };
+    close.addEventListener('click', () => finish(null));
+    cancelBtn.addEventListener('click', () => finish(null));
+    okBtn.addEventListener('click', submit);
+    mask.addEventListener('click', ev => { if (ev.target === mask) finish(null); });
+    document.addEventListener('keydown', onKey, true);
+    Object.values(controls).forEach(input => {
+      input.addEventListener('input', () => { error.style.display = 'none'; });
+      input.addEventListener('keydown', ev => {
+        if (ev.key === 'Enter' && input.tagName !== 'TEXTAREA') { ev.preventDefault(); submit(); }
+      });
+    });
+    const first = Object.values(controls)[0];
+    if (first) { first.focus(); if (first.select && !first.value) first.select(); }
+    else okBtn.focus();
+  });
+}
+
+// 应用内确认框：返回 true（确定）/ false（取消、Esc、点遮罩）。
+function appConfirm(message, options) {
+  return appFormDialog(Object.assign({ title: '请确认', message: message, okText: '确定' }, options || {})).then(v => v !== null);
+}
+
+// 应用内输入框：返回去空格后的字符串，取消返回 null。
+function appPrompt(message, options) {
+  const opt = Object.assign({
+    title: '请输入', label: '', placeholder: '', value: '', required: true, type: 'text', minLength: 0, help: ''
+  }, options || {});
+  return appFormDialog({
+    title: opt.title,
+    message: message,
+    okText: opt.okText || '确定',
+    fields: [{
+      name: 'value', label: opt.label, placeholder: opt.placeholder, value: opt.value,
+      required: opt.required, type: opt.type, minLength: opt.minLength, help: opt.help,
+      minLengthMessage: opt.minLengthMessage, autocomplete: opt.autocomplete
+    }]
+  }).then(v => v === null ? null : v.value);
+}
+
+// 加白弹窗：统一收集必填原因与可选备注，返回 {reason, remark} 或 null。
+function appWhitelistDialog(target, options) {
+  const opt = Object.assign({ defaultReason: '', defaultRemark: '' }, options || {});
+  return appFormDialog({
+    title: '加入白名单',
+    message: (target ? '将 ' + target + ' 加入白名单。' : '') + '加白原因为必填项，备注可留空。',
+    okText: '确认加白',
+    fields: [
+      { name: 'reason', label: '加白原因（必填）', value: opt.defaultReason, required: true, multiline: true, rows: 2, placeholder: '如：业务官方服务 / 已确认合规 / 工单 #1024' },
+      { name: 'remark', label: '备注（可选）', value: opt.defaultRemark, placeholder: '补充说明，可留空' }
+    ]
+  });
+}
+
+// 静态模态统一支持 Esc 关闭；有动态确认框时交给它自己处理，避免连带关闭下层的静态弹窗。
+if (document.addEventListener) {
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Escape') return;
+    const visible = Array.from(document.querySelectorAll('.modal-mask'))
+      .filter(m => m.style.display !== 'none');
+    if (visible.some(m => m.dataset && m.dataset.appDialog === '1')) return;
+    const masks = visible.filter(m => !(m.dataset && m.dataset.appDialog === '1'));
+    if (!masks.length) return;
+    masks[masks.length - 1].style.display = 'none';
+  });
+}
 
 // 批量选择辅助：全选/反选与收集选中值
 function toggleAllChecks(master, cls) {
